@@ -1,0 +1,12 @@
+/target
+/dist/*.pdb
+/dist/*.exe
+/dist/Beautiful-Alpha/
+/logs/
+**/.cursor/
+**/node_modules
+**/*.rs.bk
+Cargo.lock
+*.beautiful
+.DS_Store
+Thumbs.db

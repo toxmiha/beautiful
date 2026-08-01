@@ -1,0 +1,41 @@
+[package]
+name = "beautiful-app"
+description = "Beautiful — lightweight digital painting app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "beautiful"
+path = "src/main.rs"
+
+[dependencies]
+beautiful-core = { workspace = true }
+egui = { workspace = true }
+eframe = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { version = "1", features = ["derive"] }
+env_logger = "0.11"
+log = "0.4"
+image = { workspace = true }
+rfd = "0.15"
+arboard = "3"
+rayon = "1.10"
+serde_json = "1"
+serde = { workspace = true }
+# MCP control plane replies (localhost JSON).
+rhai = "1.21"
+zip = "2"
+window-vibrancy = "0.6"
+raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_UI_WindowsAndMessaging",
+] }
+clipboard-win = "5"
