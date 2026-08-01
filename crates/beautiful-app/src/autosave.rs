@@ -1,4 +1,9 @@
 //! Blender-like autosave + crash recovery.
+//!
+//! Layout under `%APPDATA%/Beautiful/autosave/`:
+//! - `session.lock` — present while the app runs; leftover ⇒ previous crash
+//! - `session_index.json` + `auto_*.txmh` — snapshots for the *current* run
+//! - `crash_recover.json` — promoted crash leftovers until the user opens/dismisses them
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::settings::AppSettings;
 
 const SESSION_LOCK: &str = "session.lock";
-const INDEX_FILE: &str = "recover_index.json";
+const SESSION_INDEX: &str = "session_index.json";
+const CRASH_INDEX: &str = "crash_recover.json";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecoverEntry {
@@ -31,7 +37,7 @@ pub struct AutosaveState {
     /// Dirty edit gen we last wrote for the focused doc.
     last_saved_gen: u64,
     session_id: u64,
-    /// Crash leftovers presented on the gallery.
+    /// Crash leftovers presented on the gallery (persisted in crash_recover.json).
     pub pending_recover: Vec<RecoverEntry>,
 }
 
@@ -60,31 +66,55 @@ pub fn autosave_dir(_settings: &AppSettings) -> PathBuf {
 }
 
 impl AutosaveState {
-    /// Call once at startup: if a previous session left a lock, offer recover files.
+    /// Call once at startup: if a previous session left a lock, promote its
+    /// snapshots into crash recovery. Never wipe crash leftovers on boot.
     pub fn boot(&mut self, settings: &AppSettings) {
         let dir = autosave_dir(settings);
         let _ = fs::create_dir_all(&dir);
         let lock = dir.join(SESSION_LOCK);
+
+        let mut crash = load_index(&dir, CRASH_INDEX);
         if lock.exists() {
-            self.pending_recover = load_index(&dir)
-                .entries
-                .into_iter()
-                .filter(|e| e.path.is_file())
-                .collect();
-        } else {
-            // Clean leftover autosaves from a prior clean quit.
-            clear_autosave_files(&dir);
+            // Previous run did not clean-quit — promote its session snapshots.
+            let session = load_index(&dir, SESSION_INDEX);
+            for e in session.entries {
+                if e.path.is_file() && !crash.entries.iter().any(|c| c.path == e.path) {
+                    crash.entries.push(e);
+                }
+            }
+            save_index(&dir, CRASH_INDEX, &crash);
         }
+
+        self.pending_recover = crash
+            .entries
+            .into_iter()
+            .filter(|e| e.path.is_file())
+            .collect();
+        // Persist pruned list (drop missing files) but keep recover until dismiss.
+        save_index(
+            &dir,
+            CRASH_INDEX,
+            &RecoverIndex {
+                entries: self.pending_recover.clone(),
+            },
+        );
+
+        // Fresh session index for this run.
+        save_index(&dir, SESSION_INDEX, &RecoverIndex::default());
         let _ = fs::write(&lock, format!("{}\n", self.session_id));
-        save_index(&dir, &RecoverIndex::default());
     }
 
-    /// Clean quit: drop lock + autosave blobs so next launch isn't a recovery.
+    /// Clean quit: drop lock + *this session's* autosaves only.
+    /// Crash-recover leftovers stay until the user opens or dismisses them.
     pub fn shutdown_clean(&mut self, settings: &AppSettings) {
         let dir = autosave_dir(settings);
-        clear_autosave_files(&dir);
+        let session = load_index(&dir, SESSION_INDEX);
+        for e in session.entries {
+            let _ = fs::remove_file(&e.path);
+        }
+        save_index(&dir, SESSION_INDEX, &RecoverIndex::default());
         let _ = fs::remove_file(dir.join(SESSION_LOCK));
-        self.pending_recover.clear();
+        // Keep pending_recover / crash_recover.json intact.
     }
 
     pub fn dismiss_recover(&mut self, settings: &AppSettings) {
@@ -92,16 +122,22 @@ impl AutosaveState {
         for e in self.pending_recover.drain(..) {
             let _ = fs::remove_file(&e.path);
         }
-        // Keep writing new autosaves under a fresh index.
-        save_index(&dir, &RecoverIndex::default());
+        save_index(&dir, CRASH_INDEX, &RecoverIndex::default());
     }
 
-    pub fn take_recover(&mut self, path: &Path) -> Option<RecoverEntry> {
-        if let Some(i) = self.pending_recover.iter().position(|e| e.path == path) {
-            Some(self.pending_recover.remove(i))
-        } else {
-            None
-        }
+    pub fn take_recover(&mut self, path: &Path, settings: &AppSettings) -> Option<RecoverEntry> {
+        let i = self.pending_recover.iter().position(|e| e.path == path)?;
+        let entry = self.pending_recover.remove(i);
+        let dir = autosave_dir(settings);
+        save_index(
+            &dir,
+            CRASH_INDEX,
+            &RecoverIndex {
+                entries: self.pending_recover.clone(),
+            },
+        );
+        // Snapshot file is kept until the user saves elsewhere / dismisses leftovers.
+        Some(entry)
     }
 
     /// Periodic tick from the editor update loop.
@@ -146,14 +182,13 @@ impl AutosaveState {
         save_txmh(&path, document).map_err(|e| e.to_string())?;
         self.last_saved_gen = edit_gen;
 
-        let mut index = load_index(&dir);
+        let mut index = load_index(&dir, SESSION_INDEX);
         index.entries.push(RecoverEntry {
             path: path.clone(),
             title: title.to_string(),
             saved_at: stamp,
             original: original.map(|p| p.to_path_buf()),
         });
-        // Keep newest N versions.
         let keep = settings.autosave_keep_versions.max(1);
         if index.entries.len() > keep {
             let drop_n = index.entries.len() - keep;
@@ -161,36 +196,23 @@ impl AutosaveState {
                 let _ = fs::remove_file(&old.path);
             }
         }
-        save_index(&dir, &index);
+        save_index(&dir, SESSION_INDEX, &index);
         crate::action_log::log("autosave", &format!("wrote {}", path.display()));
         Ok(())
     }
 }
 
-fn load_index(dir: &Path) -> RecoverIndex {
-    let path = dir.join(INDEX_FILE);
+fn load_index(dir: &Path, name: &str) -> RecoverIndex {
+    let path = dir.join(name);
     fs::read(&path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
-fn save_index(dir: &Path, index: &RecoverIndex) {
-    let path = dir.join(INDEX_FILE);
+fn save_index(dir: &Path, name: &str, index: &RecoverIndex) {
+    let path = dir.join(name);
     if let Ok(bytes) = serde_json::to_vec_pretty(index) {
         let _ = fs::write(path, bytes);
-    }
-}
-
-fn clear_autosave_files(dir: &Path) {
-    let Ok(rd) = fs::read_dir(dir) else {
-        return;
-    };
-    for ent in rd.flatten() {
-        let p = ent.path();
-        if p.file_name().and_then(|n| n.to_str()) == Some(SESSION_LOCK) {
-            continue;
-        }
-        let _ = fs::remove_file(&p);
     }
 }

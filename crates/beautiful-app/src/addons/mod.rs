@@ -642,9 +642,13 @@ fn draw_panel() {
         do_invert();
     }
     let size = ui_slider("brush", "Brush size", 20.0, 1.0, 200.0);
-    set_brush_size(size);
+    if ui_button("apply_size", "Apply brush size") {
+        set_brush_size(size);
+    }
     let c = ui_color("fg", "FG color", 255, 140, 66);
-    set_fg_color(c.r, c.g, c.b);
+    if ui_button("apply_fg", "Apply FG color") {
+        set_fg_color(c.r, c.g, c.b);
+    }
 }
 "#;
     let _ = fs::write(dir.join("manifest.json"), manifest);

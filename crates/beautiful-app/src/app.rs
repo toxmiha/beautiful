@@ -479,6 +479,106 @@ impl BeautifulApp {
         self.sync_active_canvas_meta();
     }
 
+    /// Open a crash-recovery snapshot without binding Save to the autosave path.
+    fn open_recovered_canvas(&mut self, entry: &crate::autosave::RecoverEntry) {
+        match crate::file::FileState::load_path_document(&entry.path) {
+            Ok(mut doc) => {
+                doc.ensure_active_paintable();
+                if self.open_canvases.active().parked.is_none()
+                    && self.screen == AppScreen::Editor
+                    && self.open_canvases.can_open_more()
+                {
+                    self.park_active_canvas();
+                } else if !self.open_canvases.can_open_more()
+                    && !(self.open_canvases.len() == 1 && self.open_canvases.active().path.is_none())
+                {
+                    self.file.set_status(
+                        format!("Too many open canvases (max {MAX_OPEN_CANVASES}) — close a tab"),
+                        true,
+                    );
+                    return;
+                }
+
+                let title = if entry.title.is_empty() {
+                    "Recovered".to_string()
+                } else {
+                    format!("{} (recovered)", entry.title)
+                };
+                let edit_gen = doc.edit_generation();
+                // Prefer original path as the save target if it still exists; else untitled.
+                let bind_path = entry
+                    .original
+                    .as_ref()
+                    .filter(|p| p.is_file())
+                    .cloned();
+
+                if self.open_canvases.len() == 1
+                    && self.open_canvases.active().path.is_none()
+                    && self.screen != AppScreen::Editor
+                {
+                    self.document = doc;
+                    self.canvas.on_document_replaced();
+                    self.workspace = Workspace::new_with_primary(
+                        &title,
+                        self.document.width,
+                        self.document.height,
+                    );
+                    self.file.path = bind_path.clone();
+                    // Force dirty so Save As is obvious if original missing.
+                    if bind_path.is_none() {
+                        self.file.set_saved_edit_gen(edit_gen.wrapping_sub(1));
+                    } else {
+                        self.file.mark_clean(&self.document);
+                    }
+                    self.open_canvases.sync_active_meta(
+                        bind_path,
+                        title,
+                        self.document.edit_generation(),
+                        self.file.saved_edit_gen(),
+                    );
+                } else {
+                    if let Err(msg) = self.open_canvases.push_active_new(
+                        title.clone(),
+                        bind_path.clone(),
+                        edit_gen,
+                        if bind_path.is_some() {
+                            edit_gen
+                        } else {
+                            edit_gen.wrapping_sub(1)
+                        },
+                    ) {
+                        self.file.set_status(msg.to_string(), true);
+                        return;
+                    }
+                    self.document = doc;
+                    self.canvas.on_document_replaced();
+                    self.workspace = Workspace::new_with_primary(
+                        &title,
+                        self.document.width,
+                        self.document.height,
+                    );
+                    self.file.path = bind_path;
+                    if self.file.path.is_none() {
+                        self.file.set_saved_edit_gen(edit_gen.wrapping_sub(1));
+                    } else {
+                        self.file.mark_clean(&self.document);
+                    }
+                }
+                self.file.set_status(
+                    format!("Recovered “{}” — save to keep", entry.title),
+                    false,
+                );
+                self.screen = AppScreen::Editor;
+                self.canvas.mark_dirty();
+                self.spam_repaint_left = self.spam_repaint_left.max(2);
+            }
+            Err(e) => {
+                self.file
+                    .set_status(format!("Recover failed: {e}"), true);
+            }
+        }
+    }
+
     /// Open a file as a new holst tab (or focus if already open).
     fn open_as_new_canvas(&mut self, path: &std::path::Path) {
         if let Some(existing) = self.open_canvases.find_path(path) {
@@ -1391,8 +1491,9 @@ impl eframe::App for BeautifulApp {
                     self.autosave.dismiss_recover(&self.settings);
                 }
                 if let Some(path) = open_recover {
-                    let _ = self.autosave.take_recover(&path);
-                    self.open_as_new_canvas(&path);
+                    if let Some(entry) = self.autosave.take_recover(&path, &self.settings) {
+                        self.open_recovered_canvas(&entry);
+                    }
                 }
             }
             let mut request_new_sheet = false;

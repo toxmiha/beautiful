@@ -3,6 +3,7 @@
 /dist/*.exe
 /dist/Beautiful-Alpha/
 /logs/
+/backup/
 **/.cursor/
 **/node_modules
 **/*.rs.bk

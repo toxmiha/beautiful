@@ -3242,7 +3242,8 @@ impl Document {
             None
         };
 
-        for y in dirty.y0..dirty.y1 {
+        let row_bytes = rw * 4;
+        let raster_row = |y: u32, row: &mut [u8]| {
             for x in dirty.x0..dirty.x1 {
                 let px = x as f32 + 0.5;
                 let py = y as f32 + 0.5;
@@ -3350,15 +3351,29 @@ impl Document {
                 };
                 if let Some(src) = color {
                     let alpha = src.a as f32 / 255.0 * select_a;
-                    let i = ((y - dirty.y0) as usize * rw + (x - dirty.x0) as usize) * 4;
+                    let i = (x - dirty.x0) as usize * 4;
                     let inv = 1.0 - alpha;
-                    pixels[i] = (src.r as f32 * alpha + pixels[i] as f32 * inv).round() as u8;
-                    pixels[i + 1] =
-                        (src.g as f32 * alpha + pixels[i + 1] as f32 * inv).round() as u8;
-                    pixels[i + 2] =
-                        (src.b as f32 * alpha + pixels[i + 2] as f32 * inv).round() as u8;
-                    pixels[i + 3] = (255.0 * alpha + pixels[i + 3] as f32 * inv).round() as u8;
+                    row[i] = (src.r as f32 * alpha + row[i] as f32 * inv).round() as u8;
+                    row[i + 1] = (src.g as f32 * alpha + row[i + 1] as f32 * inv).round() as u8;
+                    row[i + 2] = (src.b as f32 * alpha + row[i + 2] as f32 * inv).round() as u8;
+                    row[i + 3] = (255.0 * alpha + row[i + 3] as f32 * inv).round() as u8;
                 }
+            }
+        };
+        let area = (dirty.width() as usize).saturating_mul(dirty.height() as usize);
+        if area >= 48 * 48 {
+            use rayon::prelude::*;
+            pixels
+                .par_chunks_mut(row_bytes)
+                .enumerate()
+                .for_each(|(row_i, row)| {
+                    let y = dirty.y0 + row_i as u32;
+                    raster_row(y, row);
+                });
+        } else {
+            for (row_i, row) in pixels.chunks_exact_mut(row_bytes).enumerate() {
+                let y = dirty.y0 + row_i as u32;
+                raster_row(y, row);
             }
         }
         self.layers[idx].tiles.write_region(dirty, &pixels);

@@ -406,18 +406,18 @@ fn downsample_box_region(
     my1: u32,
 ) {
     let f = factor.max(1);
-    for my in my0..my1 {
-        for mx in mx0..mx1 {
-            let x0 = mx * f;
-            let y0 = my * f;
-            let x1 = (x0 + f).min(doc_w);
-            let y1 = (y0 + f).min(doc_h);
-            let mut sum = [0u32; 4];
-            let mut n = 0u32;
-            for y in y0..y1 {
-                let row = (y * doc_w) as usize * 4;
-                for x in x0..x1 {
-                    let i = row + x as usize * 4;
+    let fill_cell = |my: u32, mx: u32, dst: &mut [u8]| {
+        let x0 = mx * f;
+        let y0 = my * f;
+        let x1 = (x0 + f).min(doc_w);
+        let y1 = (y0 + f).min(doc_h);
+        let mut sum = [0u32; 4];
+        let mut n = 0u32;
+        for y in y0..y1 {
+            let row = (y * doc_w) as usize * 4;
+            for x in x0..x1 {
+                let i = row + x as usize * 4;
+                if i + 4 <= src.len() {
                     sum[0] += src[i] as u32;
                     sum[1] += src[i + 1] as u32;
                     sum[2] += src[i + 2] as u32;
@@ -425,15 +425,63 @@ fn downsample_box_region(
                     n += 1;
                 }
             }
-            let di = (my * dst_w + mx) as usize * 4;
-            if n == 0 || di + 3 >= dst.len() {
-                continue;
+        }
+        let di = (my * dst_w + mx) as usize * 4;
+        if n == 0 || di + 3 >= dst.len() {
+            return;
+        }
+        let inv = 1.0 / n as f32;
+        dst[di] = (sum[0] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+        dst[di + 1] = (sum[1] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+        dst[di + 2] = (sum[2] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+        dst[di + 3] = (sum[3] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+    };
+
+    let cells = (mx1 - mx0).saturating_mul(my1 - my0) as usize;
+    if cells >= 64 * 64 {
+        use rayon::prelude::*;
+        let stride = dst_w as usize * 4;
+        dst.par_chunks_mut(stride).enumerate().for_each(|(my, row)| {
+            let my = my as u32;
+            if my < my0 || my >= my1 {
+                return;
             }
-            let inv = 1.0 / n as f32;
-            dst[di] = (sum[0] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-            dst[di + 1] = (sum[1] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-            dst[di + 2] = (sum[2] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-            dst[di + 3] = (sum[3] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+            for mx in mx0..mx1 {
+                let x0 = mx * f;
+                let y0 = my * f;
+                let x1 = (x0 + f).min(doc_w);
+                let y1 = (y0 + f).min(doc_h);
+                let mut sum = [0u32; 4];
+                let mut n = 0u32;
+                for y in y0..y1 {
+                    let srow = (y * doc_w) as usize * 4;
+                    for x in x0..x1 {
+                        let i = srow + x as usize * 4;
+                        if i + 4 <= src.len() {
+                            sum[0] += src[i] as u32;
+                            sum[1] += src[i + 1] as u32;
+                            sum[2] += src[i + 2] as u32;
+                            sum[3] += src[i + 3] as u32;
+                            n += 1;
+                        }
+                    }
+                }
+                let di = mx as usize * 4;
+                if n == 0 || di + 3 >= row.len() {
+                    continue;
+                }
+                let inv = 1.0 / n as f32;
+                row[di] = (sum[0] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+                row[di + 1] = (sum[1] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+                row[di + 2] = (sum[2] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+                row[di + 3] = (sum[3] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+            }
+        });
+    } else {
+        for my in my0..my1 {
+            for mx in mx0..mx1 {
+                fill_cell(my, mx, dst);
+            }
         }
     }
 }
@@ -494,9 +542,11 @@ pub fn build_navigator_thumb(
     let h = ((doc_h as f32) / scale).round().max(1.0) as u32;
     let mut pixels = vec![0u8; (w as usize) * (h as usize) * 4];
     let src_stride = doc_w as usize * 4;
-    for y in 0..h {
+    let fill_row = |y: u32, row: &mut [u8]| {
         let y0 = ((y as u64 * doc_h as u64) / h as u64) as u32;
-        let y1 = ((((y as u64 + 1) * doc_h as u64) / h as u64) as u32).max(y0 + 1).min(doc_h);
+        let y1 = ((((y as u64 + 1) * doc_h as u64) / h as u64) as u32)
+            .max(y0 + 1)
+            .min(doc_h);
         for x in 0..w {
             let x0 = ((x as u64 * doc_w as u64) / w as u64) as u32;
             let x1 = ((((x as u64 + 1) * doc_w as u64) / w as u64) as u32)
@@ -505,9 +555,9 @@ pub fn build_navigator_thumb(
             let mut sum = [0u32; 4];
             let mut n = 0u32;
             for sy in y0..y1 {
-                let row = sy as usize * src_stride;
+                let srow = sy as usize * src_stride;
                 for sx in x0..x1 {
-                    let si = row + sx as usize * 4;
+                    let si = srow + sx as usize * 4;
                     if si + 4 <= src.len() {
                         sum[0] += src[si] as u32;
                         sum[1] += src[si + 1] as u32;
@@ -517,15 +567,27 @@ pub fn build_navigator_thumb(
                     }
                 }
             }
-            let di = ((y * w + x) * 4) as usize;
+            let di = (x * 4) as usize;
             if n == 0 {
                 continue;
             }
             let inv = 1.0 / n as f32;
-            pixels[di] = (sum[0] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-            pixels[di + 1] = (sum[1] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-            pixels[di + 2] = (sum[2] as f32 * inv).round().clamp(0.0, 255.0) as u8;
-            pixels[di + 3] = (sum[3] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+            row[di] = (sum[0] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+            row[di + 1] = (sum[1] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+            row[di + 2] = (sum[2] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+            row[di + 3] = (sum[3] as f32 * inv).round().clamp(0.0, 255.0) as u8;
+        }
+    };
+    let row_bytes = (w as usize) * 4;
+    if (w as usize) * (h as usize) >= 64 * 64 {
+        use rayon::prelude::*;
+        pixels
+            .par_chunks_mut(row_bytes)
+            .enumerate()
+            .for_each(|(y, row)| fill_row(y as u32, row));
+    } else {
+        for (y, row) in pixels.chunks_exact_mut(row_bytes).enumerate() {
+            fill_row(y as u32, row);
         }
     }
     (w, h, pixels)

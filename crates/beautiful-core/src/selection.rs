@@ -133,38 +133,39 @@ impl SelectionMask {
         let src = self.alpha.clone();
         let mut tmp = vec![0u8; w * h];
         let rf = r as f32;
-        // Horizontal
-        for y in 0..h {
-            for x in 0..w {
-                let mut sum = 0.0;
-                let mut n = 0.0;
-                for dx in -r..=r {
-                    let xx = x as i32 + dx;
-                    if xx >= 0 && xx < w as i32 {
-                        let wgt = 1.0 - (dx.abs() as f32) / (rf + 1.0);
-                        sum += src[y * w + xx as usize] as f32 * wgt;
-                        n += wgt;
+        let pass = |from: &[u8], to: &mut [u8], horizontal: bool| {
+            let apply_row = |y: usize, row: &mut [u8]| {
+                for x in 0..w {
+                    let mut sum = 0.0;
+                    let mut n = 0.0;
+                    for d in -r..=r {
+                        let (xx, yy) = if horizontal {
+                            (x as i32 + d, y as i32)
+                        } else {
+                            (x as i32, y as i32 + d)
+                        };
+                        if xx >= 0 && yy >= 0 && xx < w as i32 && yy < h as i32 {
+                            let wgt = 1.0 - (d.abs() as f32) / (rf + 1.0);
+                            sum += from[yy as usize * w + xx as usize] as f32 * wgt;
+                            n += wgt;
+                        }
                     }
+                    row[x] = (sum / n.max(0.001)).round().clamp(0.0, 255.0) as u8;
                 }
-                tmp[y * w + x] = (sum / n.max(0.001)).round().clamp(0.0, 255.0) as u8;
-            }
-        }
-        // Vertical
-        for y in 0..h {
-            for x in 0..w {
-                let mut sum = 0.0;
-                let mut n = 0.0;
-                for dy in -r..=r {
-                    let yy = y as i32 + dy;
-                    if yy >= 0 && yy < h as i32 {
-                        let wgt = 1.0 - (dy.abs() as f32) / (rf + 1.0);
-                        sum += tmp[yy as usize * w + x] as f32 * wgt;
-                        n += wgt;
-                    }
+            };
+            if w * h >= 48 * 48 {
+                use rayon::prelude::*;
+                to.par_chunks_mut(w)
+                    .enumerate()
+                    .for_each(|(y, row)| apply_row(y, row));
+            } else {
+                for (y, row) in to.chunks_exact_mut(w).enumerate() {
+                    apply_row(y, row);
                 }
-                self.alpha[y * w + x] = (sum / n.max(0.001)).round().clamp(0.0, 255.0) as u8;
             }
-        }
+        };
+        pass(&src, &mut tmp, true);
+        pass(&tmp, &mut self.alpha, false);
     }
 
     pub fn rect(&self) -> SelectionRect {

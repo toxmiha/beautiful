@@ -4963,8 +4963,16 @@ pub fn apply_addon_host_command(
         HostCommand::TouchDisplay => {
             document.touch_active_layer_display();
         }
-        HostCommand::NewLayer(_name) => {
-            let _ = document.add_layer();
+        HostCommand::NewLayer(name) => {
+            if document.add_layer() {
+                let name = name.trim();
+                if !name.is_empty() {
+                    let idx = document.active_layer;
+                    if let Some(layer) = document.layers.get_mut(idx) {
+                        layer.name = name.to_string();
+                    }
+                }
+            }
         }
         HostCommand::SetBrushSize(size) => {
             document.brush.size = size.clamp(1.0, 512.0);

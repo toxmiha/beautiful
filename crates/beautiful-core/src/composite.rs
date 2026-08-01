@@ -1610,22 +1610,51 @@ fn composite_display_mip_region_with_adjustments(
         if opacity <= 0.0 {
             continue;
         }
-        for row_i in 0..rh {
-            let my = my0 + row_i;
-            let y = ((my as u32)
-                .saturating_mul(factor)
-                .saturating_add(factor / 2))
-            .min(doc_h.saturating_sub(1)) as i32;
-            for col in 0..rw {
-                let mx = mx0 + col;
-                let x = ((mx as u32)
+        let row_bytes = rw * 4;
+        if rh >= 32 && rw * rh >= 48 * 48 {
+            use rayon::prelude::*;
+            buf.par_chunks_mut(row_bytes)
+                .enumerate()
+                .for_each(|(row_i, row)| {
+                    let my = my0 + row_i;
+                    let y = ((my as u32)
+                        .saturating_mul(factor)
+                        .saturating_add(factor / 2))
+                    .min(doc_h.saturating_sub(1)) as i32;
+                    for col in 0..rw {
+                        let mx = mx0 + col;
+                        let x = ((mx as u32)
+                            .saturating_mul(factor)
+                            .saturating_add(factor / 2))
+                        .min(doc_w.saturating_sub(1)) as i32;
+                        let i = col * 4;
+                        let mut px = [row[i], row[i + 1], row[i + 2], row[i + 3]];
+                        composite_point_paint_layer(
+                            &mut px, x, y, layers, li, layer, opacity, floating,
+                        );
+                        row[i..i + 4].copy_from_slice(&px);
+                    }
+                });
+        } else {
+            for row_i in 0..rh {
+                let my = my0 + row_i;
+                let y = ((my as u32)
                     .saturating_mul(factor)
                     .saturating_add(factor / 2))
-                .min(doc_w.saturating_sub(1)) as i32;
-                let i = (row_i * rw + col) * 4;
-                let mut px = [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]];
-                composite_point_paint_layer(&mut px, x, y, layers, li, layer, opacity, floating);
-                buf[i..i + 4].copy_from_slice(&px);
+                .min(doc_h.saturating_sub(1)) as i32;
+                for col in 0..rw {
+                    let mx = mx0 + col;
+                    let x = ((mx as u32)
+                        .saturating_mul(factor)
+                        .saturating_add(factor / 2))
+                    .min(doc_w.saturating_sub(1)) as i32;
+                    let i = (row_i * rw + col) * 4;
+                    let mut px = [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]];
+                    composite_point_paint_layer(
+                        &mut px, x, y, layers, li, layer, opacity, floating,
+                    );
+                    buf[i..i + 4].copy_from_slice(&px);
+                }
             }
         }
     }
