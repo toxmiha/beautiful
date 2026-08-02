@@ -900,7 +900,9 @@ impl CanvasState {
     }
 
     /// After the last wheel notch, wait this long before allowing a coarser mip.
-    const COARSEN_HOLD: std::time::Duration = std::time::Duration::from_millis(550);
+    /// Hybrid viewport fill made coarsen cheap; keep a short settle so trackpad
+    /// inertia does not thrash LOD, without the old 550ms full-rebuild hang.
+    const COARSEN_HOLD: std::time::Duration = std::time::Duration::from_millis(180);
 
     fn note_zoom_gesture(&mut self) {
         self.coarsen_hold_until = Some(std::time::Instant::now() + Self::COARSEN_HOLD);
@@ -1221,7 +1223,12 @@ impl CanvasState {
             texture_filter_bucket(self.zoom) != texture_filter_bucket(self.filter_zoom);
 
         // Hot path: idle hover / cursor move — zero GPU texture work.
-        if !self.dirty && !filter_changed && !lod_changed && self.texture.is_some() {
+        // At lod>1 also require viewport mip coverage (pan can expand without dirty).
+        let view_probe = self.view_dirty_rect(document);
+        let cover_probe = view_probe.padded(128, document.width, document.height);
+        let mip_ready = self.display_lod <= 1
+            || (self.display_mip_tex.is_some() && self.display_mip.covers_doc(cover_probe));
+        if !self.dirty && !filter_changed && !lod_changed && self.texture.is_some() && mip_ready {
             return;
         }
 
@@ -1353,31 +1360,40 @@ impl CanvasState {
                 let _ = document.composite.take_gpu_dirty();
             }
         } else {
-            // Zoomed-out: incremental mip when possible (never full rebuild for ROI partial).
+            // Zoomed-out: hybrid viewport mip (same policy as canvas_gpu).
             let mip_opts = TextureOptions {
                 magnification: TextureFilter::Linear,
                 minification: TextureFilter::Linear,
                 ..TextureOptions::LINEAR
             };
-            if lod_changed || self.display_mip.factor != lod || self.display_mip_tex.is_none() {
+            let cover = view.padded(VIEW_PAD, document.width, document.height);
+            let mip_size_ok = self.display_mip.factor == lod
+                && self.display_mip.width == ((document.width + lod - 1) / lod).max(1)
+                && self.display_mip.height == ((document.height + lod - 1) / lod).max(1);
+            if lod_changed || !mip_size_ok || self.display_mip_tex.is_none() {
+                self.display_mip.invalidate_coverage();
+                self.display_mip.ensure_size(document.width, document.height, lod);
                 let floating = document.floating_blit();
-                self.display_mip.rebuild_from_layers(
+                let _ = self.display_mip.ensure_view_from_layers(
                     document.background,
                     &document.layers,
                     floating,
                     document.width,
                     document.height,
                     lod,
+                    cover,
                 );
             } else if sync.full_upload {
+                self.display_mip.invalidate_coverage();
                 let floating = document.floating_blit();
-                self.display_mip.rebuild_from_layers(
+                let _ = self.display_mip.ensure_view_from_layers(
                     document.background,
                     &document.layers,
                     floating,
                     document.width,
                     document.height,
                     lod,
+                    cover,
                 );
             } else {
                 let rects: Vec<DirtyRect> = if !sync.partials.is_empty() {
@@ -1416,6 +1432,18 @@ impl CanvasState {
                             );
                         }
                     }
+                }
+                if !self.display_mip.covers_doc(cover) {
+                    let floating = document.floating_blit();
+                    let _ = self.display_mip.ensure_view_from_layers(
+                        document.background,
+                        &document.layers,
+                        floating,
+                        document.width,
+                        document.height,
+                        lod,
+                        cover,
+                    );
                 }
             }
             let image = ColorImage::from_rgba_unmultiplied(

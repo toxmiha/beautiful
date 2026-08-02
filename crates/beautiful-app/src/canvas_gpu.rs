@@ -581,19 +581,55 @@ pub fn invalidate(rs: &egui_wgpu::RenderState) {
         .write_buffer(&gpu.vertex_buffer, 0, bytemuck::cast_slice(&zero));
 }
 
-fn timed_rebuild_from_layers(display_mip: &mut DisplayMip, document: &Document, lod: u32) {
-    let _s = crate::perf::Scope::new(crate::perf::Category::Composite, "gpu.rebuild_from_layers");
+/// Viewport-local mip fill (hybrid display tiles). Returns doc-space rect composited.
+fn timed_ensure_view_mip(
+    display_mip: &mut DisplayMip,
+    document: &Document,
+    lod: u32,
+    cover: DirtyRect,
+) -> DirtyRect {
+    let _s = crate::perf::Scope::new(crate::perf::Category::Composite, "gpu.mip_view");
     let floating = document.floating_blit();
-    display_mip.rebuild_from_layers(
+    let filled = display_mip.ensure_view_from_layers(
         document.background,
         &document.layers,
         floating,
         document.width,
         document.height,
         lod,
+        cover,
     );
-    crate::perf::bump("count.rebuild_from_layers");
-    crate::perf::drain_core_probes();
+    if !filled.is_empty() {
+        crate::perf::bump("count.mip_view");
+        crate::perf::drain_core_probes();
+    }
+    filled
+}
+
+/// Upload after a view fill. Full-doc fills use `upload_full`; gaps use partial.
+fn timed_upload_after_mip_fill(
+    gpu: &mut CanvasGpuResources,
+    rs: &egui_wgpu::RenderState,
+    display_mip: &DisplayMip,
+    document: &Document,
+    cover: DirtyRect,
+    filled: DirtyRect,
+) {
+    if filled.is_empty() {
+        return;
+    }
+    let doc_full = DirtyRect::full(document.width, document.height);
+    let doc_area = (document.width as u64).saturating_mul(document.height as u64).max(1);
+    let fill_area = (filled.width() as u64).saturating_mul(filled.height() as u64);
+    if filled.contains_rect(doc_full) || fill_area.saturating_mul(2) > doc_area {
+        timed_upload_full_mip(gpu, rs, display_mip);
+        return;
+    }
+    let mut upload = cover;
+    if upload.is_empty() {
+        upload = filled;
+    }
+    timed_upload_mip_rect(gpu, rs, display_mip, upload);
 }
 
 fn timed_upload_full_mip(
@@ -721,10 +757,14 @@ pub fn sync_from_document(
     let linear = zoom < 0.999;
 
     // Gesture + no LOD change + clean plate: sampler only.
+    // At lod>1 also require viewport coverage (pan can expand without composite dirty).
+    let view_cover = view.padded(VIEW_PAD, document.width, document.height);
+    let mip_covers_view = raw_lod <= 1 || display_mip.covers_doc(view_cover);
     if !allow_coarsen
         && !lod_changed
         && !stroke_active
         && !document.composite.has_pending_work()
+        && mip_covers_view
     {
         let mut renderer = rs.renderer.write();
         if let Some(gpu) = renderer.callback_resources.get_mut::<CanvasGpuResources>() {
@@ -736,7 +776,7 @@ pub fn sync_from_document(
     }
 
     // Idle: skip work when LOD already matches and plate is clean.
-    if !lod_changed && !document.composite.has_pending_work() {
+    if !lod_changed && !document.composite.has_pending_work() && mip_covers_view {
         let _lock = crate::perf::Scope::new(crate::perf::Category::Upload, "frame.sync_lock");
         let mut renderer = rs.renderer.write();
         let Some(gpu) = renderer.callback_resources.get_mut::<CanvasGpuResources>() else {
@@ -759,21 +799,34 @@ pub fn sync_from_document(
     }
 
     // Never full-doc sync just for LOD — mip is built from layers directly.
+    // At lod>1 with a clean plate, skip projection sync (coverage-only / LOD-only frames).
     let sync = {
-        let _p = crate::perf::Scope::new(crate::perf::Category::Composite, "proj.sync_view");
-        let _p2 = crate::perf::Scope::new(crate::perf::Category::Composite, "pipe.projection");
-        // Leaving mip LOD: force viewport reproject even if composite had no new dirty bits
-        // (zoom alone only sets canvas.dirty — otherwise LOD1 stays soft until a click).
-        // Never call ensure_dense() here — on Roi that allocates a full-doc buffer
-        // via Deref and stalls weak PCs without helping the upload path.
-        if lod_changed && lod <= 1 {
-            let cover = view.padded(VIEW_PAD, document.width, document.height);
-            document.composite.invalidate_rect(cover);
-            document.composite.ensure_for_view(view, VIEW_PAD);
+        let skip_proj = lod > 1
+            && !stroke_active
+            && !document.composite.has_pending_work()
+            && !(lod_changed && lod <= 1);
+        if skip_proj {
+            beautiful_core::SyncResult {
+                full_upload: false,
+                partial: None,
+                partials: Vec::new(),
+            }
+        } else {
+            let _p = crate::perf::Scope::new(crate::perf::Category::Composite, "proj.sync_view");
+            let _p2 = crate::perf::Scope::new(crate::perf::Category::Composite, "pipe.projection");
+            // Leaving mip LOD: force viewport reproject even if composite had no new dirty bits
+            // (zoom alone only sets canvas.dirty — otherwise LOD1 stays soft until a click).
+            // Never call ensure_dense() here — on Roi that allocates a full-doc buffer
+            // via Deref and stalls weak PCs without helping the upload path.
+            if lod_changed && lod <= 1 {
+                let cover = view.padded(VIEW_PAD, document.width, document.height);
+                document.composite.invalidate_rect(cover);
+                document.composite.ensure_for_view(view, VIEW_PAD);
+            }
+            let r = document.sync_display_view(view, VIEW_PAD);
+            crate::perf::drain_core_probes();
+            r
         }
-        let r = document.sync_display_view(view, VIEW_PAD);
-        crate::perf::drain_core_probes();
-        r
     };
     if lod_changed {
         crate::action_log::log(
@@ -906,17 +959,20 @@ pub fn sync_from_document(
             crate::perf::bump("count.upload_partial");
         }
     } else {
-        // Zoomed-out LOD path.
+        // Zoomed-out LOD path — hybrid: fill padded viewport, not always full mip.
         let expect_w = ((document.width + lod - 1) / lod).max(1);
         let expect_h = ((document.height + lod - 1) / lod).max(1);
         let mip_size_ok = display_mip.factor == lod
             && display_mip.width == expect_w
             && display_mip.height == expect_h;
         let tex_size_ok = gpu.tex_w == expect_w && gpu.tex_h == expect_h;
-        let need_full = lod_changed || !mip_size_ok || gpu.texture.is_none() || !tex_size_ok;
+        let cover = view.padded(VIEW_PAD, document.width, document.height);
+        let need_seed = lod_changed || !mip_size_ok || gpu.texture.is_none() || !tex_size_ok;
+        let need_cover = !display_mip.covers_doc(cover);
+        let has_dirty = sync.full_upload || sync.partial.is_some() || !sync.partials.is_empty();
 
-        if need_full {
-            // Mid-stroke: prefer cheap partial mip update when dimensions already match.
+        if need_seed {
+            // Mid-stroke on matching dims: keep cheap partial path.
             if stroke_active
                 && !lod_changed
                 && mip_size_ok
@@ -928,35 +984,58 @@ pub fn sync_from_document(
                     update_mip_partial(display_mip, document, lod, rect);
                     timed_upload_mip_rect(gpu, rs, display_mip, rect);
                 } else {
-                    timed_rebuild_from_layers(display_mip, document, lod);
-                    timed_upload_full_mip(gpu, rs, display_mip);
+                    let filled = timed_ensure_view_mip(display_mip, document, lod, cover);
+                    timed_upload_after_mip_fill(gpu, rs, display_mip, document, cover, filled);
                 }
             } else {
-                timed_rebuild_from_layers(display_mip, document, lod);
-                timed_upload_full_mip(gpu, rs, display_mip);
-            }
-        } else if sync.full_upload || sync.partial.is_some() || !sync.partials.is_empty() {
-            // Eye / opacity / stroke dirty while LOD unchanged — incremental only.
-            if sync.full_upload {
-                timed_rebuild_from_layers(display_mip, document, lod);
-                timed_upload_full_mip(gpu, rs, display_mip);
-            } else {
-                let rects: Vec<DirtyRect> = if !sync.partials.is_empty() {
-                    sync.partials.clone()
-                } else if let Some(r) = sync.partial {
-                    vec![r]
+                // LOD/size change: drop stale coverage, fill view only.
+                if lod_changed || !mip_size_ok {
+                    display_mip.invalidate_coverage();
+                }
+                display_mip.ensure_size(document.width, document.height, lod);
+                gpu.ensure_texture(&rs.device, expect_w, expect_h, linear);
+                if gpu.filter_linear != linear {
+                    gpu.rebuild_bind_group(&rs.device, linear);
+                }
+                let filled = timed_ensure_view_mip(display_mip, document, lod, cover);
+                // Always upload cover after seed so new GPU tex isn't undefined in view.
+                if filled.is_empty() {
+                    if !cover.is_empty() {
+                        timed_upload_mip_rect(gpu, rs, display_mip, cover);
+                    }
                 } else {
-                    Vec::new()
-                };
-                let mut union = DirtyRect::empty();
-                for rect in rects {
-                    update_mip_partial(display_mip, document, lod, rect);
-                    union.union(rect);
-                }
-                if !union.is_empty() {
-                    timed_upload_mip_rect(gpu, rs, display_mip, union);
+                    timed_upload_after_mip_fill(gpu, rs, display_mip, document, cover, filled);
                 }
             }
+        } else if sync.full_upload {
+            // Global invalidate (eye/opacity/structure): refresh coverage for the view.
+            display_mip.invalidate_coverage();
+            let filled = timed_ensure_view_mip(display_mip, document, lod, cover);
+            timed_upload_after_mip_fill(gpu, rs, display_mip, document, cover, filled);
+        } else if has_dirty {
+            let rects: Vec<DirtyRect> = if !sync.partials.is_empty() {
+                sync.partials.clone()
+            } else if let Some(r) = sync.partial {
+                vec![r]
+            } else {
+                Vec::new()
+            };
+            let mut union = DirtyRect::empty();
+            for rect in rects {
+                update_mip_partial(display_mip, document, lod, rect);
+                union.union(rect);
+            }
+            if !union.is_empty() {
+                timed_upload_mip_rect(gpu, rs, display_mip, union);
+            }
+            // Pan into uncovered mip while a stroke dirty also arrived.
+            if need_cover {
+                let filled = timed_ensure_view_mip(display_mip, document, lod, cover);
+                timed_upload_after_mip_fill(gpu, rs, display_mip, document, cover, filled);
+            }
+        } else if need_cover {
+            let filled = timed_ensure_view_mip(display_mip, document, lod, cover);
+            timed_upload_after_mip_fill(gpu, rs, display_mip, document, cover, filled);
         } else if gpu.filter_linear != linear {
             gpu.rebuild_bind_group(&rs.device, linear);
             let _ = document.composite.take_gpu_dirty();

@@ -5,8 +5,159 @@
 
 use crate::composite::{composite_display_mip, DirtyRect};
 use crate::layer::Layer;
-use crate::tiles::TileBuffer;
+use crate::tiles::{TileBuffer, TILE_SIZE};
 use crate::Rgba;
+
+/// Exact hybrid-mip coverage in document tile space (not a single AABB).
+///
+/// An AABB falsely reports “covered” after two disjoint pans leave a hole between
+/// them; this bitset tracks each [`TILE_SIZE`] cell independently.
+#[derive(Debug, Clone, Default)]
+struct CoverageMask {
+    tiles_x: u32,
+    tiles_y: u32,
+    bits: Vec<u64>,
+}
+
+impl CoverageMask {
+    fn ensure_dims(&mut self, doc_w: u32, doc_h: u32) {
+        let tx = ((doc_w.max(1) + TILE_SIZE - 1) / TILE_SIZE).max(1);
+        let ty = ((doc_h.max(1) + TILE_SIZE - 1) / TILE_SIZE).max(1);
+        if self.tiles_x != tx || self.tiles_y != ty {
+            self.tiles_x = tx;
+            self.tiles_y = ty;
+            let n = (tx as usize).saturating_mul(ty as usize);
+            self.bits = vec![0u64; n.div_ceil(64)];
+        }
+    }
+
+    fn clear(&mut self) {
+        for w in &mut self.bits {
+            *w = 0;
+        }
+    }
+
+    fn mark_all(&mut self) {
+        let n = (self.tiles_x as usize).saturating_mul(self.tiles_y as usize);
+        if n == 0 {
+            return;
+        }
+        for w in &mut self.bits {
+            *w = !0;
+        }
+        let rem = n % 64;
+        if rem != 0 {
+            if let Some(last) = self.bits.last_mut() {
+                *last &= (1u64 << rem) - 1;
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bits.iter().all(|&w| w == 0)
+    }
+
+    fn bit_index(&self, tx: u32, ty: u32) -> Option<usize> {
+        if tx >= self.tiles_x || ty >= self.tiles_y {
+            return None;
+        }
+        Some((ty as usize) * (self.tiles_x as usize) + (tx as usize))
+    }
+
+    fn get(&self, tx: u32, ty: u32) -> bool {
+        let Some(i) = self.bit_index(tx, ty) else {
+            return false;
+        };
+        (self.bits[i / 64] >> (i % 64)) & 1 != 0
+    }
+
+    fn set_bit(&mut self, tx: u32, ty: u32) {
+        let Some(i) = self.bit_index(tx, ty) else {
+            return;
+        };
+        self.bits[i / 64] |= 1u64 << (i % 64);
+    }
+
+    fn tile_range(rect: DirtyRect) -> (u32, u32, u32, u32) {
+        if rect.is_empty() {
+            return (0, 0, 0, 0);
+        }
+        (
+            rect.x0 / TILE_SIZE,
+            rect.y0 / TILE_SIZE,
+            (rect.x1 + TILE_SIZE - 1) / TILE_SIZE,
+            (rect.y1 + TILE_SIZE - 1) / TILE_SIZE,
+        )
+    }
+
+    fn mark_rect(&mut self, rect: DirtyRect) {
+        let (tx0, ty0, tx1, ty1) = Self::tile_range(rect);
+        for ty in ty0..ty1.min(self.tiles_y) {
+            for tx in tx0..tx1.min(self.tiles_x) {
+                self.set_bit(tx, ty);
+            }
+        }
+    }
+
+    fn covers_rect(&self, rect: DirtyRect) -> bool {
+        if rect.is_empty() {
+            return true;
+        }
+        if self.bits.is_empty() {
+            return false;
+        }
+        let (tx0, ty0, tx1, ty1) = Self::tile_range(rect);
+        for ty in ty0..ty1.min(self.tiles_y) {
+            for tx in tx0..tx1.min(self.tiles_x) {
+                if !self.get(tx, ty) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Tile-aligned uncovered runs inside `cover` (document space).
+    fn uncovered_rects(&self, cover: DirtyRect, doc_w: u32, doc_h: u32) -> Vec<DirtyRect> {
+        let mut out = Vec::new();
+        if cover.is_empty() || self.tiles_x == 0 {
+            return out;
+        }
+        let (tx0, ty0, tx1, ty1) = Self::tile_range(cover);
+        for ty in ty0..ty1.min(self.tiles_y) {
+            let tx_end = tx1.min(self.tiles_x);
+            let mut tx = tx0.min(tx_end);
+            while tx < tx_end {
+                if self.get(tx, ty) {
+                    tx += 1;
+                    continue;
+                }
+                let start = tx;
+                while tx < tx_end && !self.get(tx, ty) {
+                    tx += 1;
+                }
+                let mut r = DirtyRect {
+                    x0: start * TILE_SIZE,
+                    y0: ty * TILE_SIZE,
+                    x1: (tx * TILE_SIZE).min(doc_w),
+                    y1: ((ty + 1) * TILE_SIZE).min(doc_h),
+                };
+                r = r.intersect(cover);
+                if !r.is_empty() {
+                    // Fill whole tiles that touch the hole (stable mip cells + mark).
+                    let aligned = DirtyRect {
+                        x0: start * TILE_SIZE,
+                        y0: ty * TILE_SIZE,
+                        x1: (tx * TILE_SIZE).min(doc_w),
+                        y1: ((ty + 1) * TILE_SIZE).min(doc_h),
+                    };
+                    out.push(aligned);
+                }
+            }
+        }
+        out
+    }
+}
 
 /// Hard cap for document width/height (pixels). Beyond this, expand/crop refuse.
 pub const MAX_DOC_SIDE: u32 = 16384;
@@ -159,12 +310,20 @@ pub fn resolve_display_lod(current: u32, want: u32, allow_coarsen: bool) -> u32 
 }
 
 /// One mip level: box-filtered RGBA from the full composite.
+///
+/// Hybrid display cache: buffer is still full-doc sized (stable GPU UV), but
+/// only document tiles marked in [`CoverageMask`] are guaranteed composed.
+/// Zoom / pan fill the padded viewport instead of recompositing the entire mip.
 #[derive(Debug, Clone, Default)]
 pub struct DisplayMip {
     pub factor: u32,
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    coverage: CoverageMask,
+    /// Last document size used for coverage dims (track resize).
+    cov_doc_w: u32,
+    cov_doc_h: u32,
 }
 
 impl DisplayMip {
@@ -172,15 +331,44 @@ impl DisplayMip {
         Self::default()
     }
 
+    /// Drop coverage tracking (pixels may still hold stale data).
+    pub fn invalidate_coverage(&mut self) {
+        self.coverage.clear();
+    }
+
+    /// True if every tile overlapping `need` (document space) is already composed.
+    pub fn covers_doc(&self, need: DirtyRect) -> bool {
+        self.coverage.covers_rect(need)
+    }
+
+    fn mark_coverage(&mut self, rect: DirtyRect) {
+        self.coverage.mark_rect(rect);
+    }
+
+    fn mark_coverage_full(&mut self, doc_w: u32, doc_h: u32) {
+        self.coverage.ensure_dims(doc_w, doc_h);
+        self.cov_doc_w = doc_w;
+        self.cov_doc_h = doc_h;
+        self.coverage.mark_all();
+    }
+
     pub fn ensure_size(&mut self, doc_w: u32, doc_h: u32, factor: u32) {
         let factor = factor.max(1);
         let w = ((doc_w + factor - 1) / factor).max(1);
         let h = ((doc_h + factor - 1) / factor).max(1);
-        if self.factor != factor || self.width != w || self.height != h {
+        let dims_changed = self.factor != factor || self.width != w || self.height != h;
+        let doc_changed = self.cov_doc_w != doc_w || self.cov_doc_h != doc_h;
+        if dims_changed {
             self.factor = factor;
             self.width = w;
             self.height = h;
             self.pixels = vec![0u8; (w as usize) * (h as usize) * 4];
+        }
+        if dims_changed || doc_changed {
+            self.coverage.ensure_dims(doc_w, doc_h);
+            self.cov_doc_w = doc_w;
+            self.cov_doc_h = doc_h;
+            self.coverage.clear();
         }
     }
 
@@ -192,6 +380,7 @@ impl DisplayMip {
             self.width = doc_w;
             self.height = doc_h;
             self.factor = 1;
+            self.mark_coverage_full(doc_w, doc_h);
             return;
         }
         downsample_box(
@@ -203,6 +392,7 @@ impl DisplayMip {
             self.width,
             self.height,
         );
+        self.mark_coverage_full(doc_w, doc_h);
     }
 
     /// Rebuild mip by compositing layers at mip density (no full-res composite).
@@ -231,6 +421,91 @@ impl DisplayMip {
             layers,
             floating,
         );
+        self.mark_coverage_full(doc_w, doc_h);
+    }
+
+    /// Compose only the parts of `cover` (document space) missing from coverage.
+    ///
+    /// Returns the union of regions that were (re)composited — empty if already covered.
+    /// Prefer this over [`rebuild_from_layers`] when the viewport is a fraction of a
+    /// large document (zoom LOD without full-mip CPU spike).
+    pub fn ensure_view_from_layers(
+        &mut self,
+        background: Rgba,
+        layers: &[Layer],
+        floating: Option<crate::composite::FloatingBlit<'_>>,
+        doc_w: u32,
+        doc_h: u32,
+        factor: u32,
+        cover: DirtyRect,
+    ) -> DirtyRect {
+        let mut cover = cover;
+        cover.clamp_to(doc_w, doc_h);
+        if cover.is_empty() || factor <= 1 {
+            return DirtyRect::empty();
+        }
+        self.ensure_size(doc_w, doc_h, factor);
+        if self.coverage.covers_rect(cover) {
+            return DirtyRect::empty();
+        }
+
+        let cover_area = (cover.width() as u64).saturating_mul(cover.height() as u64);
+        let doc_area = (doc_w as u64).saturating_mul(doc_h as u64).max(1);
+        let missing = self.coverage.uncovered_rects(cover, doc_w, doc_h);
+        let mut miss_area = 0u64;
+        for p in &missing {
+            miss_area = miss_area
+                .saturating_add((p.width() as u64).saturating_mul(p.height() as u64));
+        }
+        if miss_area == 0 {
+            // Bitset already claims cover (race with tile rounding) — trust covers.
+            return DirtyRect::empty();
+        }
+        // Near-full document: one full rebuild is cheaper than many tile runs.
+        if (self.coverage.is_empty()
+            && cover_area.saturating_mul(10) >= doc_area.saturating_mul(8))
+            || miss_area.saturating_mul(10) >= doc_area.saturating_mul(8)
+        {
+            self.rebuild_from_layers(background, layers, floating, doc_w, doc_h, factor);
+            return DirtyRect::full(doc_w, doc_h);
+        }
+
+        let mut filled = DirtyRect::empty();
+        for piece in missing {
+            let f = factor.max(1);
+            let aligned = DirtyRect {
+                x0: (piece.x0 / f) * f,
+                y0: (piece.y0 / f) * f,
+                x1: ((piece.x1 + f - 1) / f * f).min(doc_w),
+                y1: ((piece.y1 + f - 1) / f * f).min(doc_h),
+            };
+            if aligned.is_empty() {
+                continue;
+            }
+            // Compose without mark (we mark after), via region path.
+            let mx0 = aligned.x0 / f;
+            let my0 = aligned.y0 / f;
+            let mx1 = ((aligned.x1 + f - 1) / f).min(self.width);
+            let my1 = ((aligned.y1 + f - 1) / f).min(self.height);
+            crate::composite::composite_display_mip_region(
+                &mut self.pixels,
+                self.width,
+                self.height,
+                f,
+                doc_w,
+                doc_h,
+                background,
+                layers,
+                floating,
+                mx0,
+                my0,
+                mx1,
+                my1,
+            );
+            self.mark_coverage(aligned);
+            filled.union(aligned);
+        }
+        filled
     }
 
     /// Update only the mip texels covering `dirty` (document-space).
@@ -267,6 +542,7 @@ impl DisplayMip {
             mx1,
             my1,
         );
+        self.mark_coverage(dirty);
     }
 
     /// Mip-space rect covering a document dirty region (for partial GPU upload).
@@ -357,6 +633,7 @@ impl DisplayMip {
                 self.pixels[di + 3] = (sum[3] as f32 * inv).round().clamp(0.0, 255.0) as u8;
             }
         }
+        self.mark_coverage(rect);
     }
 
     /// Roi / no dense buffer: recomposite only mip cells covering `dirty`.
@@ -397,6 +674,7 @@ impl DisplayMip {
             mx1,
             my1,
         );
+        self.mark_coverage(dirty);
     }
 }
 
@@ -692,6 +970,76 @@ mod tests {
         let zoom_2k = 1400.0 / 2048.0; // ~0.68
         let lod_2k = lod_factor_for_document(zoom_2k, 0, 2048, 2048);
         assert!(lod_2k <= 2, "2k stock lod={lod_2k}");
+    }
+
+    #[test]
+    fn ensure_view_fills_only_missing_coverage() {
+        use crate::layer::Layer;
+        // Doc larger than one coverage tile so a corner fill does not mark the whole doc.
+        let layers = vec![Layer::new("L", 256, 256)];
+        let bg = Rgba::WHITE;
+        let mut mip = DisplayMip::empty();
+        let cover = DirtyRect {
+            x0: 0,
+            y0: 0,
+            x1: 48,
+            y1: 48,
+        };
+        let filled = mip.ensure_view_from_layers(bg, &layers, None, 256, 256, 2, cover);
+        assert!(!filled.is_empty());
+        assert!(mip.covers_doc(cover));
+        assert!(!mip.covers_doc(DirtyRect::full(256, 256)));
+
+        // Second call: already covered → no work.
+        let again = mip.ensure_view_from_layers(bg, &layers, None, 256, 256, 2, cover);
+        assert!(again.is_empty());
+
+        // Expand coverage on pan into a neighboring tile.
+        let cover2 = DirtyRect {
+            x0: 0,
+            y0: 0,
+            x1: 96,
+            y1: 48,
+        };
+        let filled2 = mip.ensure_view_from_layers(bg, &layers, None, 256, 256, 2, cover2);
+        assert!(!filled2.is_empty());
+        assert!(mip.covers_doc(cover2));
+    }
+
+    #[test]
+    fn coverage_mask_keeps_disjoint_pans_honest() {
+        use crate::layer::Layer;
+        let layers = vec![Layer::new("L", 256, 64)];
+        let bg = Rgba::WHITE;
+        let mut mip = DisplayMip::empty();
+        let left = DirtyRect {
+            x0: 0,
+            y0: 0,
+            x1: 64,
+            y1: 64,
+        };
+        let right = DirtyRect {
+            x0: 192,
+            y0: 0,
+            x1: 256,
+            y1: 64,
+        };
+        let hole = DirtyRect {
+            x0: 96,
+            y0: 0,
+            x1: 160,
+            y1: 64,
+        };
+        assert!(!mip.ensure_view_from_layers(bg, &layers, None, 256, 64, 2, left).is_empty());
+        assert!(!mip.ensure_view_from_layers(bg, &layers, None, 256, 64, 2, right).is_empty());
+        assert!(mip.covers_doc(left));
+        assert!(mip.covers_doc(right));
+        // AABB would falsely cover the hole; tile mask must not.
+        assert!(!mip.covers_doc(hole));
+        assert!(!mip
+            .ensure_view_from_layers(bg, &layers, None, 256, 64, 2, hole)
+            .is_empty());
+        assert!(mip.covers_doc(hole));
     }
 
     #[test]
