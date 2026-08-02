@@ -139,6 +139,25 @@ pub fn lod_factor_for_document(zoom: f32, current: u32, doc_w: u32, doc_h: u32) 
     lod
 }
 
+/// Which LOD factor to show on screen.
+///
+/// Paint-app policy (not a timer hack):
+/// - **Sharper** (`want < current`): always take `want` in one jump — fast zoom-in
+///   must not stay on a soft mip until the wheel stops.
+/// - **Coarser** (`want > current`): only when `allow_coarsen` (zoom gesture idle),
+///   so wheel thrash does not rebuild 4K every notch.
+pub fn resolve_display_lod(current: u32, want: u32, allow_coarsen: bool) -> u32 {
+    let cur = current.max(1);
+    let want = want.max(1);
+    if want < cur {
+        want
+    } else if want > cur && allow_coarsen {
+        want
+    } else {
+        cur
+    }
+}
+
 /// One mip level: box-filtered RGBA from the full composite.
 #[derive(Debug, Clone, Default)]
 pub struct DisplayMip {
@@ -647,6 +666,15 @@ mod tests {
         assert_eq!(a, 1);
         let b = lod_factor_for_zoom_hysteresis(0.45, 1);
         assert_eq!(b, 2);
+    }
+
+    #[test]
+    fn resolve_display_lod_sharpens_always_coarsens_when_allowed() {
+        assert_eq!(resolve_display_lod(8, 2, false), 2);
+        assert_eq!(resolve_display_lod(8, 2, true), 2);
+        assert_eq!(resolve_display_lod(2, 8, false), 2);
+        assert_eq!(resolve_display_lod(2, 8, true), 8);
+        assert_eq!(resolve_display_lod(4, 4, false), 4);
     }
 
     #[test]

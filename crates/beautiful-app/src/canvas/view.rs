@@ -897,15 +897,15 @@ impl CanvasView {
                 if !skip_sync && !no_present {
                     let view = state.view_dirty_rect(document);
                     let live_paint = state.is_drawing;
-                    let freeze_lod = state.lod_held();
-                    // `pipe.present` historically wrapped sync; keep both for dashboards.
+                    // Sharpen anytime; coarsen only when the wheel gesture is idle.
+                    let allow_coarsen = !state.coarsen_held() && !zoom_applied;
                     let _present = crate::perf::Scope::new(
                         crate::perf::Category::Upload,
                         "pipe.present",
                     );
                     let _sync =
                         crate::perf::Scope::new(crate::perf::Category::Upload, "frame.sync");
-                    if crate::canvas_gpu::sync_from_document(
+                    let synced = crate::canvas_gpu::sync_from_document(
                         rs,
                         document,
                         state.zoom,
@@ -913,24 +913,28 @@ impl CanvasView {
                         &mut state.display_mip,
                         live_paint,
                         view,
-                        freeze_lod,
-                    ) {
-                        // Keep dirty while display LOD still lags the zoom target
-                        // (HQ upgrade must finish without waiting for a canvas click).
-                        let want = beautiful_core::lod_factor_for_document(
-                            state.zoom,
-                            state.display_lod,
-                            document.width,
-                            document.height,
-                        );
-                        if want != state.display_lod {
+                        allow_coarsen,
+                    );
+                    let want = beautiful_core::lod_factor_for_document(
+                        state.zoom,
+                        state.display_lod,
+                        document.width,
+                        document.height,
+                    );
+                    if want != state.display_lod {
+                        if want < state.display_lod.max(1) {
+                            // Sharpen should have applied this frame — retry if deferred.
                             state.dirty = true;
                             ui.ctx().request_repaint();
+                        } else if !allow_coarsen {
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
                         } else {
-                            state.dirty = false;
+                            state.dirty = true;
+                            ui.ctx().request_repaint();
                         }
+                    } else if synced {
+                        state.dirty = false;
                     } else if state.dirty {
-                        // LOD upgrade may need another frame (dense/roi not ready yet).
                         ui.ctx().request_repaint();
                     }
                 }
@@ -1629,12 +1633,22 @@ impl CanvasView {
             );
         }
 
-        // Repaint while drawing / panning / zooming, or while a canvas update
-        // (LOD HQ upgrade, eye composite) is still pending — do not wait for a click.
+        // Repaint while drawing / panning / zooming, or while LOD factor still lags zoom.
         if panning || primary_down || zoom_applied || state.is_drawing || state.dirty {
             ctx.request_repaint();
-        } else if state.lod_held() {
+        } else if state.coarsen_held() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        } else {
+            let want = beautiful_core::lod_factor_for_document(
+                state.zoom,
+                state.display_lod,
+                document.width,
+                document.height,
+            );
+            if want != state.display_lod {
+                state.dirty = true;
+                ctx.request_repaint();
+            }
         }
     }
 }

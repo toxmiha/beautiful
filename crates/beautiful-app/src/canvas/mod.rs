@@ -26,8 +26,9 @@ pub struct CanvasState {
     pub last_viewport: egui::Rect,
     /// Last placed canvas rect before rotation (axis-aligned), screen coords.
     pub last_canvas_rect: egui::Rect,
-    /// Freeze display LOD while zooming so mip swaps don't shake the view.
-    lod_hold_until: Option<std::time::Instant>,
+    /// Hold *coarser* LOD applies until the wheel gesture goes idle.
+    /// Sharper LOD is never held (see `resolve_display_lod`).
+    coarsen_hold_until: Option<std::time::Instant>,
     /// Last screen-space zoom pivot (fallback when hover is briefly missing).
     zoom_screen_pivot: Option<egui::Pos2>,
     /// Ignore opposite-sign wheel briefly (trackpad inertia reverse).
@@ -150,7 +151,7 @@ impl Default for CanvasState {
             rotation_deg: 0.0,
             last_viewport: egui::Rect::NOTHING,
             last_canvas_rect: egui::Rect::NOTHING,
-            lod_hold_until: None,
+            coarsen_hold_until: None,
             zoom_screen_pivot: None,
             zoom_dir_until: None,
             wheel_accum: 0.0,
@@ -891,10 +892,18 @@ impl CanvasState {
         )
     }
 
-    pub fn lod_held(&self) -> bool {
-        self.lod_hold_until
+    /// True while coarser display LOD is deferred (zoom gesture still live).
+    pub fn coarsen_held(&self) -> bool {
+        self.coarsen_hold_until
             .map(|t| std::time::Instant::now() < t)
             .unwrap_or(false)
+    }
+
+    /// After the last wheel notch, wait this long before allowing a coarser mip.
+    const COARSEN_HOLD: std::time::Duration = std::time::Duration::from_millis(550);
+
+    fn note_zoom_gesture(&mut self) {
+        self.coarsen_hold_until = Some(std::time::Instant::now() + Self::COARSEN_HOLD);
     }
 
     /// Resolve zoom pivot for this notch: use live cursor (PS/SAI), fall back to
@@ -998,8 +1007,7 @@ impl CanvasState {
             self.zoom = new;
             // Hold display LOD across the gesture so wheel notches don't thrash
             // full mip rebuilds (dump: lod 1↔2 on the same timestamp as zoom).
-            self.lod_hold_until =
-                Some(std::time::Instant::now() + std::time::Duration::from_millis(140));
+            self.note_zoom_gesture();
             // View-only: do not mark_dirty (avoids composite/upload hitch on wheel).
             return;
         };
@@ -1014,8 +1022,7 @@ impl CanvasState {
         let pan_before = self.pan;
         self.zoom = new;
         self.pan = (cursor - view_center) - rot * (doc_offset * new);
-        self.lod_hold_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(140));
+        self.note_zoom_gesture();
         // View-only transform — never mark_dirty here. Pairing a post-zoom pan with a
         // forced texture rebuild was a major source of "wheel zoom shake".
 
@@ -1184,16 +1191,17 @@ impl CanvasState {
             self.nav_thumb_rev = u64::MAX; // rebuild navigator thumb
         }
 
-        let lod = if self.lod_held() {
-            self.display_lod.max(1)
-        } else {
-            beautiful_core::lod_factor_for_document(
-                self.zoom,
-                self.display_lod,
-                document.width,
-                document.height,
-            )
-        };
+        let want = beautiful_core::lod_factor_for_document(
+            self.zoom,
+            self.display_lod,
+            document.width,
+            document.height,
+        );
+        let lod = beautiful_core::resolve_display_lod(
+            self.display_lod,
+            want,
+            !self.coarsen_held(),
+        );
         let lod_changed = lod != self.display_lod;
         if lod_changed {
             crate::action_log::log(

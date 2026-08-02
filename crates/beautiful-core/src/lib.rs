@@ -44,7 +44,8 @@ pub use display_lod::{
     build_navigator_thumb, build_navigator_thumb_box, build_navigator_thumb_from_layers,
     build_navigator_thumb_from_tiles,
     document_peak_bytes, document_size_allowed, lod_factor_for_document, lod_factor_for_zoom,
-    lod_factor_for_zoom_hysteresis, size_adjusted_zoom, DisplayMip, MAX_DOC_SIDE, MAX_GPU_TEX_SIDE,
+    lod_factor_for_zoom_hysteresis, resolve_display_lod, size_adjusted_zoom, DisplayMip,
+    MAX_DOC_SIDE, MAX_GPU_TEX_SIDE,
     MAX_LAYER_PIXEL_BYTES, SOFT_COMFORT_BYTES,
 };
 pub use doc_op::{DocOp, DocOpJournal, DocOpKind};

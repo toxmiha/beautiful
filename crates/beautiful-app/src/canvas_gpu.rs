@@ -7,7 +7,9 @@
 use eframe::egui_wgpu::{self, wgpu};
 use egui::PaintCallbackInfo;
 
-use beautiful_core::{lod_factor_for_document, DirtyRect, DisplayMip, Document, MAX_GPU_TEX_SIDE};
+use beautiful_core::{
+    lod_factor_for_document, resolve_display_lod, DirtyRect, DisplayMip, Document, MAX_GPU_TEX_SIDE,
+};
 
 /// wgpu `write_texture` requires `bytes_per_row` multiple of 256 when height > 1.
 fn align_bytes_per_row(width_px: u32) -> u32 {
@@ -293,7 +295,9 @@ impl CanvasGpuResources {
     fn ensure_texture(&mut self, device: &wgpu::Device, w: u32, h: u32, linear: bool) {
         if self.texture.is_some() && self.tex_w == w && self.tex_h == h && self.bind_group.is_some()
         {
-            let _ = linear;
+            if self.filter_linear != linear {
+                self.rebuild_bind_group(device, linear);
+            }
             return;
         }
         // Refuse absurd allocations — caller should have capped via LOD.
@@ -688,10 +692,10 @@ fn update_mip_partial(
 
 /// Sync document pixels to the wgpu texture (call once per frame before paint).
 ///
-/// Uses CPU display LOD when zoomed out (hysteresis) — uploads a box-filtered
-/// mip instead of the full document so minify stays cheap and status shows LOD n.
-/// When `stroke_active`, skips full mip rebuilds (partial update only).
-/// `view` clips CPU composite to the visible document rect (+ pad inside sync).
+/// Display LOD policy ([`resolve_display_lod`](beautiful_core::resolve_display_lod)):
+/// sharpen anytime; coarsen only when `allow_coarsen`. Zoom itself is view+sampler;
+/// mip/composite rebuilds happen only when the resolved factor changes (or pixels dirty).
+/// When `stroke_active`, prefers partial mip updates. `view` clips CPU work to the viewport.
 pub fn sync_from_document(
     rs: &egui_wgpu::RenderState,
     document: &mut Document,
@@ -700,7 +704,7 @@ pub fn sync_from_document(
     display_mip: &mut DisplayMip,
     stroke_active: bool,
     view: DirtyRect,
-    freeze_lod: bool,
+    allow_coarsen: bool,
 ) -> bool {
     const VIEW_PAD: u32 = 128;
     {
@@ -708,16 +712,30 @@ pub fn sync_from_document(
         document.expose_view(view);
         crate::perf::bump("count.expose_view");
     }
-    let raw_lod = *display_lod;
-    let lod = if freeze_lod && raw_lod >= 1 {
-        // Keep current mip while zooming — switching 1↔2 mid-gesture shakes the view.
-        raw_lod
-    } else {
-        lod_factor_for_document(zoom, raw_lod, document.width, document.height)
-    };
-    let lod_changed = lod != *display_lod;
+    let raw_lod = (*display_lod).max(1);
+    let want = lod_factor_for_document(zoom, raw_lod, document.width, document.height);
+    let lod = resolve_display_lod(raw_lod, want, allow_coarsen);
+    let lod_changed = lod != raw_lod;
 
-    // Gate: skip CPU/GPU work when nothing is pending (stops idle sticky burn).
+    // Nearest when zoomed in (≥100%). Always update even on early-outs.
+    let linear = zoom < 0.999;
+
+    // Gesture + no LOD change + clean plate: sampler only.
+    if !allow_coarsen
+        && !lod_changed
+        && !stroke_active
+        && !document.composite.has_pending_work()
+    {
+        let mut renderer = rs.renderer.write();
+        if let Some(gpu) = renderer.callback_resources.get_mut::<CanvasGpuResources>() {
+            if gpu.texture.is_some() && gpu.filter_linear != linear {
+                gpu.rebuild_bind_group(&rs.device, linear);
+            }
+        }
+        return false;
+    }
+
+    // Idle: skip work when LOD already matches and plate is clean.
     if !lod_changed && !document.composite.has_pending_work() {
         let _lock = crate::perf::Scope::new(crate::perf::Category::Upload, "frame.sync_lock");
         let mut renderer = rs.renderer.write();
@@ -732,6 +750,10 @@ pub fn sync_from_document(
             gpu.tex_w == expect_w && gpu.tex_h == expect_h
         };
         if gpu.texture.is_some() && size_ok {
+            if gpu.filter_linear != linear {
+                gpu.rebuild_bind_group(&rs.device, linear);
+                return true;
+            }
             return false;
         }
     }
@@ -766,10 +788,6 @@ pub fn sync_from_document(
     let prev_lod = *display_lod;
     *display_lod = lod.max(1);
 
-    // Nearest when zoomed in (≥100%) so a coarse mip still looks crisp until
-    // the HQ upload lands; linear only when minifying on screen.
-    let linear = zoom < 1.0;
-
     let mut renderer = rs.renderer.write();
     let Some(gpu) = renderer.callback_resources.get_mut::<CanvasGpuResources>() else {
         return false;
@@ -779,7 +797,9 @@ pub fn sync_from_document(
         let needs_pixels =
             sync.full_upload || sync.partial.is_some() || !sync.partials.is_empty();
         let size_ok = gpu.tex_w == document.width && gpu.tex_h == document.height;
-        if !needs_pixels && gpu.texture.is_some() && size_ok {
+        // CRITICAL: never take this exit on lod_changed — that marked display LOD as
+        // HQ while skipping upload (paint then blank/soft until a click invalidated).
+        if !lod_changed && !needs_pixels && gpu.texture.is_some() && size_ok {
             if gpu.filter_linear != linear {
                 gpu.rebuild_bind_group(&rs.device, linear);
             }
