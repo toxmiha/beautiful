@@ -839,7 +839,7 @@ fn composite_region_with_adjustments(
 
     let mut scratch = vec![0u8; rw * 4];
     for (li, layer) in layers.iter().enumerate() {
-        if !layer.visible {
+        if !layer.visible || crate::omit_above::is_omitted(li) {
             continue;
         }
         if let Some(kind) = layer.adjustment {
@@ -1134,7 +1134,7 @@ fn composite_adjustment_rect_packed(
     }
     let mut scratch = vec![0u8; rw * 4];
     for (li, layer) in layers.iter().enumerate() {
-        if !layer.visible {
+        if !layer.visible || crate::omit_above::is_omitted(li) {
             continue;
         }
         if let Some(kind) = layer.adjustment {
@@ -1261,7 +1261,7 @@ fn composite_row_into_skip(
         if skip_layer == Some(li) {
             continue;
         }
-        if !layer.visible {
+        if !layer.visible || crate::omit_above::is_omitted(li) {
             continue;
         }
         if layer.is_folder {
@@ -1337,7 +1337,7 @@ fn composite_row_into_skip(
 }
 
 /// Source-over floating onto a horizontal span of layer pixels (document x0..x1 at y).
-fn blit_floating_into_span(span: &mut [u8], x0: usize, x1: usize, y: usize, f: FloatingBlit<'_>) {
+pub(crate) fn blit_floating_into_span(span: &mut [u8], x0: usize, x1: usize, y: usize, f: FloatingBlit<'_>) {
     let y0 = f.y.floor() as i32;
     let y1 = (f.y + f.height as f32).ceil() as i32;
     if (y as i32) < y0 || (y as i32) >= y1 {
@@ -1557,7 +1557,7 @@ fn composite_display_mip_region_with_adjustments(
     }
 
     for (li, layer) in layers.iter().enumerate() {
-        if !layer.visible || layer.is_folder {
+        if !layer.visible || crate::omit_above::is_omitted(li) || layer.is_folder {
             continue;
         }
         if let Some(kind) = layer.adjustment {
@@ -1736,7 +1736,7 @@ fn composite_point_rgba(
     out[3] = background.a;
 
     for (li, layer) in layers.iter().enumerate() {
-        if !layer.visible || layer.is_folder {
+        if !layer.visible || crate::omit_above::is_omitted(li) || layer.is_folder {
             continue;
         }
         let opacity = (layer.opacity.clamp(0.0, 1.0) * ancestor_folder_opacity(layers, li)).clamp(0.0, 1.0);

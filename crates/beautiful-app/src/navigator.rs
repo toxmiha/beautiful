@@ -2,7 +2,8 @@
 //!
 //! ## Model (same idea as Krita Overview docker)
 //! - Thumb shows the **entire document**, letterboxed into the widget.
-//! - White rectangle = current canvas view in document space.
+//! - White rectangle = current **viewport** in document space (may overhang the
+//!   thumb like Photoshop's red Navigator box — never collapsed to an edge).
 //! - **Click / drag on thumb** → pan: center the view on that document point
 //!   (Krita: `canvasController()->pan(...)` from overview → canvas transform).
 //! - **Zoom slider / ±** → change zoom around the **viewport center**
@@ -59,15 +60,19 @@ pub fn navigator_ui(
         egui::StrokeKind::Outside,
     );
 
-    // View rectangle in overview space.
-    let visible = canvas.visible_doc_rect(doc_w, doc_h, document.view_flip_h);
-    let view = map_doc_rect(visible, &map).intersect(content);
-    ui.painter().rect_stroke(
-        view,
-        0.0,
-        egui::Stroke::new(1.5_f32, Color32::WHITE),
-        egui::StrokeKind::Outside,
-    );
+    // View rectangle = full viewport footprint (Photoshop Navigator), not doc∩view.
+    // Clamping / intersecting with the document first collapsed the box into a
+    // line/point when the camera hung off an edge; we only clip to the widget.
+    let visible = canvas.visible_doc_rect_unbounded(doc_w, doc_h, document.view_flip_h);
+    let view = map_doc_rect(visible, &map).intersect(thumb_rect);
+    if view.width() >= 1.0 && view.height() >= 1.0 {
+        ui.painter().rect_stroke(
+            view,
+            0.0,
+            egui::Stroke::new(1.5_f32, Color32::WHITE),
+            egui::StrokeKind::Outside,
+        );
+    }
 
     // Pan: click or drag sets view center (Krita overview behavior).
     let pan_input =

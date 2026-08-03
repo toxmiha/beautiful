@@ -95,6 +95,7 @@ pub(crate) fn drag_warp_point(
     let ddy = ly - ply;
 
     let mut moved = false;
+    let mut just_began = false;
     if state.warp_drag.is_none() {
         let mut best_pt: Option<(usize, f32)> = None;
         if let Some(pts) = &state.warp_controls {
@@ -141,11 +142,13 @@ pub(crate) fn drag_warp_point(
                 state.warp_selected = vec![i];
             }
             state.warp_drag = Some(WarpDragTarget::Point(i));
+            just_began = true;
         } else if let Some((node, dir, _)) = pick_whisker {
             state.warp_drag = Some(WarpDragTarget::Whisker { node, dir });
             if !shift_on_press {
                 state.warp_selected = vec![node];
             }
+            just_began = true;
         } else if let (Some(pts), Some(hs)) = (
             state.warp_controls.as_ref(),
             state.warp_node_handles.as_ref(),
@@ -159,11 +162,20 @@ pub(crate) fn drag_warp_point(
                     b: edge.b,
                     t: edge.t,
                 });
+                just_began = true;
             } else {
+                // Empty interior: Distort = move object; Mesh = soft patch pull.
                 let (u, v) = beautiful_core::estimate_warp_uv(pts, n, Some(hs.as_slice()), lx, ly);
                 state.warp_drag = Some(WarpDragTarget::Interior { u, v });
+                just_began = true;
             }
         }
+    }
+
+    // Never apply delta on the press frame — `drag_doc_last` can be a stale
+    // pointer from before this grab (looked like a huge accidental warp).
+    if just_began {
+        return;
     }
 
     match state.warp_drag {
@@ -185,6 +197,7 @@ pub(crate) fn drag_warp_point(
                                 != beautiful_core::WarpAnchorKind::Corner
                         });
                     beautiful_core::apply_warp_whisker_drag(hs, n, node, dir, new_off, unison);
+                    state.warp_lattice_edited = true;
                     moved = true;
                 }
             }
@@ -212,19 +225,31 @@ pub(crate) fn drag_warp_point(
                         ddx * 0.35,
                         ddy * 0.35,
                     );
+                    state.warp_lattice_edited = true;
                     moved = true;
                 }
             }
         }
         Some(WarpDragTarget::Interior { u, v }) => {
             if ddx.abs() > 0.01 || ddy.abs() > 0.01 {
-                if let (Some(pts), Some(hs)) = (
+                if matches!(state.transform_mode, TransformMode::Distort) {
+                    // Ordinary Distort: empty drag moves the whole floating object.
+                    if let Some(pts) = state.warp_controls.as_mut() {
+                        for p in pts.iter_mut() {
+                            p.0 += ddx;
+                            p.1 += ddy;
+                        }
+                        // Pure translate keeps identity topology — no Coons needed.
+                        moved = true;
+                    }
+                } else if let (Some(pts), Some(hs)) = (
                     state.warp_controls.as_mut(),
                     state.warp_node_handles.as_mut(),
                 ) {
+                    // Mesh: soft interior pull (PS-style). Keep user's whiskers —
+                    // Catmull refit was overshooting and "exploding" the lattice.
                     beautiful_core::pull_warp_patch_at_uv(pts, hs, n, u, v, ddx, ddy);
-                    // Keep lattice curves smooth after moving cell corners.
-                    beautiful_core::refit_warp_handles_smooth(pts, hs, n);
+                    state.warp_lattice_edited = true;
                     moved = true;
                 }
             }
@@ -250,9 +275,10 @@ pub(crate) fn drag_warp_point(
                                 pts[i].1 += ndy;
                             }
                         }
-                        if let Some(hs) = state.warp_node_handles.as_mut() {
-                            beautiful_core::refit_warp_handles_near(pts, hs, n, &group);
-                        }
+                        // Keep relative whiskers as-is. Catmull `refit_warp_handles_near`
+                        // was rewriting handles on corner drag → wild overshoot; whisker
+                        // drags never hit that path so they looked fine.
+                        state.warp_lattice_edited = true;
                         moved = true;
                     }
                 }
@@ -262,10 +288,18 @@ pub(crate) fn drag_warp_point(
     }
     if moved {
         refresh_warp_preview(state, document);
+        // Overlay live: pose is GPU mesh — keep repainting without CPU bake.
+        if document.selection.floating_overlay_only {
+            // caller / view already request_repaint via input path
+        }
     }
 }
 
 pub(crate) fn refresh_warp_preview(state: &mut CanvasState, document: &mut Document) {
+    // Overlay live path: GPU textured mesh samples baseline — no CPU raster.
+    if document.selection.floating_overlay_only {
+        return;
+    }
     let now = instant_secs();
     // ~30 fps cap while dragging — still feels live, far less CPU.
     if now - state.last_warp_preview_at < 0.033 {
@@ -276,7 +310,7 @@ pub(crate) fn refresh_warp_preview(state: &mut CanvasState, document: &mut Docum
     refresh_warp_preview_impl(state, document, true);
 }
 
-/// Full-resolution warp (pointer release). Still skips mask contour until confirm.
+/// Full-resolution warp (pointer release / mode switch bake).
 pub(crate) fn refresh_warp_preview_full(state: &mut CanvasState, document: &mut Document) {
     state.last_warp_preview_at = 0.0;
     refresh_warp_preview_impl(state, document, false);
@@ -309,14 +343,11 @@ pub(crate) fn refresh_warp_preview_impl(
         return;
     }
     let old_footprint = document.floating_selection_dirty_rect();
-    let subdiv = if dragging { 6 } else { 12 };
-    // Mesh = bilinear FFD (no Coons handles). Distort keeps whisker handles.
-    // Passing Mesh handles into Coons path after Ctrl-split could panic / explode.
-    let handles = if state.transform_mode == TransformMode::Mesh {
-        None
-    } else {
-        state.warp_node_handles.as_ref().map(|v| v.as_slice())
-    };
+    // Both Mesh and Distort: Coons/Bezier with whiskers (pixel-adaptive tessellation).
+    let subdiv = beautiful_core::warp_bake_cell_subdiv(w, h, n, !dragging);
+    // Always pass node handles — Mesh used to force None (bilinear FFD), which
+    // made whiskers visible/draggable but ignored by the surface (felt broken).
+    let handles = state.warp_node_handles.as_ref().map(|v| v.as_slice());
     // Clone only the control list — warp reads baseline by reference via a temp borrow.
     let pts = pts.clone();
     let pix = state
@@ -329,7 +360,11 @@ pub(crate) fn refresh_warp_preview_impl(
     document
         .selection
         .mesh_warp_floating_from_ex(pix, w, h, ox, oy, n, &pts, handles, false, false, subdiv);
-    document.invalidate_floating_change(old_footprint);
+    if document.selection.floating_overlay_only {
+        // Silent CPU bake for Apply/mode-switch; live display is GPU mesh.
+    } else {
+        document.invalidate_floating_change(old_footprint);
+    }
 }
 
 pub(crate) fn try_split_warp_crosswise(
@@ -364,12 +399,8 @@ pub(crate) fn try_split_warp_crosswise(
     if pts.len() != n * n || hs.len() != n * n {
         return false;
     }
-    // Mesh lattice uses FFD UV estimate (no Bezier handles).
-    let handle_ref = if state.transform_mode == TransformMode::Mesh {
-        None
-    } else {
-        Some(hs.as_slice())
-    };
+    // UV estimate with whiskers so Ctrl-split lands on the curved surface.
+    let handle_ref = Some(hs.as_slice());
     let (u, v) = beautiful_core::estimate_warp_uv(pts, n, handle_ref, lx, ly);
     if !u.is_finite() || !v.is_finite() {
         return false;
@@ -415,9 +446,10 @@ pub(crate) fn ensure_warp_grid(state: &mut CanvasState, document: &Document) {
         state.warp_handle_unison = None;
         return;
     };
-    // Mesh warp:
-    // - Distort = 2x2 Coons (4 corners + whiskers)
-    // - Mesh = bilinear FFD lattice. Default 4x4 nodes = 3x3 cells (PS Warp Grid 3x3).
+    // Warp lattice:
+    // - Distort = 2×2 Coons (4 corners + whiskers)
+    // - Mesh = N×N Coons lattice with per-node whiskers (PS Warp Grid).
+    //   Default 4×4 nodes = 3×3 cells.
     if state.warp_controls.is_none() {
         state.mesh_grid_n = if state.transform_mode == TransformMode::Mesh {
             4
@@ -470,5 +502,6 @@ pub(crate) fn ensure_warp_grid(state: &mut CanvasState, document: &Document) {
         bw as f32, bh as f32, n,
     ));
     state.warp_handle_unison = Some(beautiful_core::default_warp_handle_unison(n));
+    state.warp_lattice_edited = false;
     state.warp_selected.clear();
 }

@@ -46,6 +46,10 @@ impl TileBuffer {
         self.tiles.len()
     }
 
+    pub fn keys(&self) -> impl Iterator<Item = TileKey> + '_ {
+        self.tiles.keys().copied()
+    }
+
     /// Axis-aligned bounds covering all painted tiles (document space), if any.
     pub fn content_bounds(&self) -> Option<DirtyRect> {
         if self.tiles.is_empty() {
@@ -66,6 +70,41 @@ impl TileBuffer {
             None
         } else {
             rect.clamp_to(self.width, self.height);
+            Some(rect)
+        }
+    }
+
+    /// Union of tiles that actually intersect `roi` (not the global AABB).
+    /// Soft Light with sparse tiles must not expand work to the full canvas AABB.
+    pub fn content_bounds_intersecting(&self, roi: DirtyRect) -> Option<DirtyRect> {
+        let mut roi = roi;
+        roi.clamp_to(self.width, self.height);
+        if self.tiles.is_empty() || roi.is_empty() {
+            return None;
+        }
+        let ts = TILE_SIZE as i32;
+        let mut rect = DirtyRect::empty();
+        for (tx, ty) in Self::tiles_covering_rect(
+            roi.x0 as i32,
+            roi.y0 as i32,
+            roi.x1 as i32,
+            roi.y1 as i32,
+        ) {
+            if !self.tiles.contains_key(&(tx, ty)) {
+                continue;
+            }
+            let x0 = (tx * ts).max(0) as u32;
+            let y0 = (ty * ts).max(0) as u32;
+            let x1 = ((tx + 1) * ts).clamp(0, self.width as i32) as u32;
+            let y1 = ((ty + 1) * ts).clamp(0, self.height as i32) as u32;
+            let hit = DirtyRect { x0, y0, x1, y1 }.intersect(roi);
+            if !hit.is_empty() {
+                rect.union(hit);
+            }
+        }
+        if rect.is_empty() {
+            None
+        } else {
             Some(rect)
         }
     }

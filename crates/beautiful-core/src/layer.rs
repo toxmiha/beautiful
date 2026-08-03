@@ -693,25 +693,8 @@ pub fn blend_channel(mode: BlendMode, s: f32, d: f32) -> f32 {
                 (1.0 - (1.0 - d) / s).max(0.0)
             }
         }
-        BlendMode::SoftLight => {
-            if s < 0.5 {
-                d - (1.0 - 2.0 * s) * d * (1.0 - d)
-            } else {
-                let g = if d <= 0.25 {
-                    ((16.0 * d - 12.0) * d + 4.0) * d
-                } else {
-                    d.sqrt()
-                };
-                d + (2.0 * s - 1.0) * (g - d)
-            }
-        }
-        BlendMode::HardLight => {
-            if s < 0.5 {
-                2.0 * s * d
-            } else {
-                1.0 - 2.0 * (1.0 - s) * (1.0 - d)
-            }
-        }
+        BlendMode::SoftLight => soft_light_channel(s, d),
+        BlendMode::HardLight => hard_light_channel(s, d),
         BlendMode::Difference => (d - s).abs(),
         BlendMode::Exclusion => d + s - 2.0 * d * s,
         BlendMode::LinearDodge => (s + d).min(1.0),
@@ -743,13 +726,10 @@ pub fn blend_channel(mode: BlendMode, s: f32, d: f32) -> f32 {
                 0.0
             } else if v > 1.0 {
                 1.0
+            } else if v < 0.5 {
+                0.0
             } else {
-                // Photoshop hard-mix thresholds toward 0/1.
-                if v < 0.5 {
-                    0.0
-                } else {
-                    1.0
-                }
+                1.0
             }
         }
         BlendMode::Subtract => (d - s).max(0.0),
@@ -763,12 +743,59 @@ pub fn blend_channel(mode: BlendMode, s: f32, d: f32) -> f32 {
     }
 }
 
+#[inline]
+fn soft_light_channel(s: f32, d: f32) -> f32 {
+    if s < 0.5 {
+        d - (1.0 - 2.0 * s) * d * (1.0 - d)
+    } else {
+        let g = if d <= 0.25 {
+            ((16.0 * d - 12.0) * d + 4.0) * d
+        } else {
+            d.sqrt()
+        };
+        d + (2.0 * s - 1.0) * (g - d)
+    }
+}
+
+#[inline]
+fn hard_light_channel(s: f32, d: f32) -> f32 {
+    if s < 0.5 {
+        2.0 * s * d
+    } else {
+        1.0 - 2.0 * (1.0 - s) * (1.0 - d)
+    }
+}
+
+/// Soft Light `g(d)` — unused; Soft/Hard Light hot path uses 8-bit LUTs below.
+#[allow(dead_code)]
+#[inline]
+fn soft_light_g(d: f32) -> f32 {
+    if d <= 0.25 {
+        ((16.0 * d - 12.0) * d + 4.0) * d
+    } else {
+        d.sqrt()
+    }
+}
+
 /// Source-over composite of `src` onto `dst` with blend mode (both RGBA8).
 #[inline]
 pub fn blend_over(dst: &mut [u8], src: &[u8], src_a: f32, mode: BlendMode) {
     let dst_a = dst[3] as f32 / 255.0;
     let out_a = src_a + dst_a * (1.0 - src_a);
     if out_a <= 0.0 {
+        return;
+    }
+    // Fast path: Soft/Hard Light via 8-bit LUTs (CSP/PS-style channel tables).
+    if matches!(mode, BlendMode::SoftLight | BlendMode::HardLight) && src_a >= 0.999 && dst_a >= 0.999
+    {
+        let table = match mode {
+            BlendMode::SoftLight => soft_light_lut(),
+            _ => hard_light_lut(),
+        };
+        for c in 0..3 {
+            dst[c] = table[src[c] as usize][dst[c] as usize];
+        }
+        dst[3] = 255;
         return;
     }
     let sr = src[0] as f32 / 255.0;
@@ -779,6 +806,18 @@ pub fn blend_over(dst: &mut [u8], src: &[u8], src_a: f32, mode: BlendMode) {
     let db = dst[2] as f32 / 255.0;
     let bm = if mode == BlendMode::Normal {
         [sr, sg, sb]
+    } else if mode == BlendMode::SoftLight {
+        [
+            soft_light_lut()[src[0] as usize][dst[0] as usize] as f32 / 255.0,
+            soft_light_lut()[src[1] as usize][dst[1] as usize] as f32 / 255.0,
+            soft_light_lut()[src[2] as usize][dst[2] as usize] as f32 / 255.0,
+        ]
+    } else if mode == BlendMode::HardLight {
+        [
+            hard_light_lut()[src[0] as usize][dst[0] as usize] as f32 / 255.0,
+            hard_light_lut()[src[1] as usize][dst[1] as usize] as f32 / 255.0,
+            hard_light_lut()[src[2] as usize][dst[2] as usize] as f32 / 255.0,
+        ]
     } else {
         blend_rgb(mode, sr, sg, sb, dr, dg, db)
     };
@@ -788,6 +827,38 @@ pub fn blend_over(dst: &mut [u8], src: &[u8], src_a: f32, mode: BlendMode) {
         dst[c] = (v * 255.0).round().clamp(0.0, 255.0) as u8;
     }
     dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+}
+
+fn soft_light_lut() -> &'static [[u8; 256]; 256] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[[u8; 256]; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [[0u8; 256]; 256];
+        for s in 0..256 {
+            let sf = s as f32 / 255.0;
+            for d in 0..256 {
+                let df = d as f32 / 255.0;
+                t[s][d] = (soft_light_channel(sf, df) * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        t
+    })
+}
+
+fn hard_light_lut() -> &'static [[u8; 256]; 256] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<[[u8; 256]; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [[0u8; 256]; 256];
+        for s in 0..256 {
+            let sf = s as f32 / 255.0;
+            for d in 0..256 {
+                let df = d as f32 / 255.0;
+                t[s][d] = (hard_light_channel(sf, df) * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        t
+    })
 }
 
 /// Full-pixel blend (needed for Hue/Saturation/Color/Luminosity).

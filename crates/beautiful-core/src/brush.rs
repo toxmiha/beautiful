@@ -278,6 +278,30 @@ impl BrushSettings {
         brush
     }
 
+    /// Hard 1px square tip — pixel art / nearest paint.
+    pub fn preset_pixel() -> Self {
+        let mut brush = Self::preset_pencil();
+        brush.size = 1.0;
+        brush.min_size_pct = 1.0;
+        brush.hardness = 1.0;
+        brush.density = 1.0;
+        brush.min_density = 1.0;
+        brush.blending = 0.0;
+        brush.dilution = 0.0;
+        brush.persistence = 0.0;
+        brush.pressure_size = false;
+        brush.pressure_density = false;
+        brush.pressure_blending = false;
+        brush.pressure_dilution = false;
+        brush.spacing = 0.35;
+        brush.shape = BrushShape::Square;
+        brush.shape_sharpen = 1.0;
+        brush.hair = 0.0;
+        brush.randomize = 0.0;
+        brush.texture = BrushTexture::None;
+        brush
+    }
+
     pub fn preset_airbrush() -> Self {
         let mut brush = Self::preset_brush();
         brush.kind = BrushKind::Airbrush;

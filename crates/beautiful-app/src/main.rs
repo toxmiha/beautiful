@@ -7,6 +7,7 @@ mod canvas;
 mod canvas_gpu;
 mod clipboard_image;
 mod debug_flags;
+mod discord_rpc;
 mod dock;
 mod file;
 mod file_browser;
@@ -37,7 +38,12 @@ use eframe::egui_wgpu::{wgpu, WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
 
 fn main() -> eframe::Result {
     env_logger::init();
+    action_log::install_panic_hook();
     action_log::log("boot", "beautiful starting");
+    action_log::log(
+        "boot",
+        &format!("action_log={}", action_log::path_string()),
+    );
     debug_flags::log_active_flags();
 
     let args: Vec<String> = std::env::args().collect();

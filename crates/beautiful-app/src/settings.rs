@@ -194,6 +194,13 @@ pub struct AppSettings {
     /// How many autosave versions to keep per session.
     #[serde(default = "default_autosave_keep")]
     pub autosave_keep_versions: usize,
+    /// Discord Rich Presence (requires Discord desktop + Application Client ID).
+    #[serde(default)]
+    pub discord_rpc_enabled: bool,
+    /// Discord Application Client ID from https://discord.com/developers/applications
+    /// (or set env `BEAUTIFUL_DISCORD_CLIENT_ID`).
+    #[serde(default)]
+    pub discord_client_id: String,
 }
 
 impl Default for AppSettings {
@@ -230,6 +237,8 @@ impl Default for AppSettings {
             autosave_enabled: true,
             autosave_interval_mins: default_autosave_mins(),
             autosave_keep_versions: default_autosave_keep(),
+            discord_rpc_enabled: false,
+            discord_client_id: String::new(),
         }
     }
 }

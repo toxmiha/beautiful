@@ -2,6 +2,31 @@
 
 use crate::resample::{sample_bicubic, sample_bilinear, sample_nearest};
 
+/// Industry-style tessellation density (Photoshop Smart Object warp uses ~25px
+/// between subdivision lines when converting BezierSurface → Mesh).
+///
+/// Returns total samples across the full lattice (not per cell).
+pub fn warp_live_tess_steps(src_w: u32, src_h: u32, grid_n: usize) -> usize {
+    let n = grid_n.max(2);
+    let long = src_w.max(src_h).max(1) as f32;
+    // ~12 doc-px per segment for live preview (smoother than PS's 25 apply default;
+    // still cheap enough for egui Mesh).
+    const PX_PER_SEG: f32 = 12.0;
+    let steps = (long / PX_PER_SEG).ceil() as usize;
+    let min_steps = (16 * (n - 1)).max(32);
+    steps.clamp(min_steps, 192)
+}
+
+/// Per-cell subdiv for Distort Coons forward raster (Mesh FFD ignores this —
+/// it uses per-pixel inverse mapping).
+pub fn warp_bake_cell_subdiv(src_w: u32, src_h: u32, grid_n: usize, high_quality: bool) -> u32 {
+    let n = grid_n.max(2);
+    let cell = src_w.max(src_h).max(1) as f32 / (n - 1) as f32;
+    let px = if high_quality { 8.0 } else { 14.0 };
+    let s = (cell / px).ceil() as u32;
+    s.clamp(6, 48)
+}
+
 /// Warp `src` so source-grid vertices land on `controls` (destination, local space).
 /// Uses a Catmull-Rom / Coons-Bezier surface (smooth patches) tessellated
 /// into `subdiv×subdiv` quads per grid cell, rasterized in parallel.
@@ -19,10 +44,13 @@ pub fn mesh_warp_rgba(
     mesh_warp_rgba_ex(src, sw, sh, grid_n, controls, None, nearest, 6)
 }
 
-/// Same as [`mesh_warp_rgba`] with explicit tessellation density (`subdiv` 2..=12).
+/// Same as [`mesh_warp_rgba`] with explicit tessellation density (`subdiv` 2..=48).
 ///
 /// - `node_handles = None` → **bilinear FFD** + inverse-map raster + bicubic (Mesh).
 /// - `Some(...)` → Coons Bezier forward tessellation (Distort).
+///
+/// Prefer [`warp_bake_cell_subdiv`] over a fixed constant — industry warps
+/// densify by source pixel size, not a magic "12".
 pub fn mesh_warp_rgba_ex(
     src: &[u8],
     sw: u32,
@@ -85,7 +113,7 @@ pub fn mesh_warp_rgba_ex(
 
     use rayon::prelude::*;
     let ffd = node_handles.is_none();
-    let subdiv = subdiv.clamp(2, 12) as usize;
+    let subdiv = subdiv.clamp(2, 48) as usize;
     let patches: Vec<(Vec<u8>, u32, u32, i32, i32)> = if ffd {
         // Stage 4–5: each cell independently, inverse map + bicubic.
         cells

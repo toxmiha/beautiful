@@ -349,41 +349,12 @@ pub fn apply_settings_colors(settings: &crate::settings::AppSettings) {
     }
 }
 
-/// Back-compat wrapper used by older call sites.
-pub fn apply_settings_colors_legacy(
-    accent_rgb: [u8; 3],
-    app_rgb: [u8; 3],
-    acrylic_on: bool,
-    acrylic_strength: f32,
-    ui_transparency: bool,
-) {
-    if let Ok(mut t) = THEME_LIVE.write() {
-        t.accent = Color32::from_rgb(accent_rgb[0], accent_rgb[1], accent_rgb[2]);
-        t.accent_dim = Color32::from_rgb(
-            (accent_rgb[0] as f32 * 0.78) as u8,
-            (accent_rgb[1] as f32 * 0.78) as u8,
-            (accent_rgb[2] as f32 * 0.78) as u8,
-        );
-        t.app_color = Color32::from_rgb(app_rgb[0], app_rgb[1], app_rgb[2]);
-        t.acrylic_enabled = acrylic_on;
-        t.acrylic_strength = acrylic_strength.clamp(0.0, 1.0);
-        t.ui_transparency = ui_transparency;
-        if !acrylic_on {
-            t.material = crate::settings::UiMaterial::Solid;
-        }
-    }
-}
-
 pub fn label(text: impl Into<String>) -> RichText {
     RichText::new(text).color(TEXT).size(13.0)
 }
 
 pub fn label_dim(text: impl Into<String>) -> RichText {
     RichText::new(text).color(TEXT_DIM).size(13.0)
-}
-
-pub fn label_on_accent(text: impl Into<String>) -> RichText {
-    RichText::new(text).color(TEXT_ON_ACCENT).size(13.0)
 }
 
 pub fn heading(text: impl Into<String>) -> RichText {

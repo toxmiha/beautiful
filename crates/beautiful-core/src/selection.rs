@@ -28,6 +28,10 @@ pub struct Selection {
     /// In-progress lasso polygon (UI); not persisted.
     #[serde(skip)]
     pub lasso_points: Vec<(f32, f32)>,
+    /// Floating exists but is drawn by the UI/GPU overlay (live transform).
+    /// Underlay composites the holed layer only — no per-frame float bake.
+    #[serde(skip)]
+    pub floating_overlay_only: bool,
 }
 
 /// How a new selection shape merges with the current one.
@@ -119,6 +123,37 @@ impl SelectionMask {
             width: w,
             height: h,
             alpha: vec![255; (w * h) as usize],
+        }
+    }
+
+    /// Axis-aligned ellipse filling the bounding rect (soft edge = hard inside).
+    pub fn from_ellipse(rect: SelectionRect) -> Self {
+        let x0 = rect.x0.floor().max(0.0) as u32;
+        let y0 = rect.y0.floor().max(0.0) as u32;
+        let x1 = rect.x1.ceil().max(0.0) as u32;
+        let y1 = rect.y1.ceil().max(0.0) as u32;
+        let w = (x1 - x0).max(1);
+        let h = (y1 - y0).max(1);
+        let cx = (rect.x0 + rect.x1) * 0.5;
+        let cy = (rect.y0 + rect.y1) * 0.5;
+        let rx = ((rect.x1 - rect.x0) * 0.5).abs().max(0.5);
+        let ry = ((rect.y1 - rect.y0) * 0.5).abs().max(0.5);
+        let mut alpha = vec![0u8; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let px = x0 as f32 + x as f32 + 0.5;
+                let py = y0 as f32 + y as f32 + 0.5;
+                if crate::ellipse_sdf(px, py, cx, cy, rx, ry) <= 0.0 {
+                    alpha[(y * w + x) as usize] = 255;
+                }
+            }
+        }
+        Self {
+            x: x0 as f32,
+            y: y0 as f32,
+            width: w,
+            height: h,
+            alpha,
         }
     }
 
@@ -267,6 +302,7 @@ impl Default for Selection {
             floating: None,
             floating_layer: None,
             lasso_points: Vec::new(),
+            floating_overlay_only: false,
         }
     }
 }
@@ -278,12 +314,14 @@ impl Selection {
         self.outline.clear();
         self.floating = None;
         self.floating_layer = None;
+        self.floating_overlay_only = false;
         self.lasso_points.clear();
     }
 
     pub fn clear_floating(&mut self) {
         self.floating = None;
         self.floating_layer = None;
+        self.floating_overlay_only = false;
     }
 
     pub fn set_rect(&mut self, rect: SelectionRect) {

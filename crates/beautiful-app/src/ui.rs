@@ -1,6 +1,7 @@
-use beautiful_core::{BrushKind, BrushShape, BrushTexture, Document, HairDirection};
+use beautiful_core::{BrushKind, BrushSettings, BrushShape, BrushTexture, Document, HairDirection};
 use eframe::egui::{self, Sense};
-use std::path::Path;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 use crate::addons::{AddonManager, AddonUiNode, HostCommand};
 use crate::canvas::CanvasState;
@@ -100,6 +101,13 @@ pub struct FilterUiState {
     ripple_amount: f32,
     ripple_wavelength: f32,
     twist_amount: f32,
+    vignette_amount: f32,
+    vignette_softness: f32,
+    vignette_color: [u8; 3],
+    glow_radius: f32,
+    glow_intensity: f32,
+    glow_color: [u8; 3],
+    glow_tint: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,6 +133,8 @@ enum FilterDialog {
     SphericalLens,
     Ripple,
     Twist,
+    Vignette,
+    Glow,
 }
 
 impl Default for FilterUiState {
@@ -170,6 +180,13 @@ impl Default for FilterUiState {
             ripple_amount: 8.0,
             ripple_wavelength: 32.0,
             twist_amount: 1.0,
+            vignette_amount: 55.0,
+            vignette_softness: 55.0,
+            vignette_color: [0, 0, 0],
+            glow_radius: 12.0,
+            glow_intensity: 60.0,
+            glow_color: [255, 220, 160],
+            glow_tint: false,
         }
     }
 }
@@ -231,6 +248,17 @@ impl FilterUiState {
                 self.ripple_wavelength.to_bits().hash(&mut h);
             }
             FilterDialog::Twist => self.twist_amount.to_bits().hash(&mut h),
+            FilterDialog::Vignette => {
+                self.vignette_amount.to_bits().hash(&mut h);
+                self.vignette_softness.to_bits().hash(&mut h);
+                self.vignette_color.hash(&mut h);
+            }
+            FilterDialog::Glow => {
+                self.glow_radius.to_bits().hash(&mut h);
+                self.glow_intensity.to_bits().hash(&mut h);
+                self.glow_color.hash(&mut h);
+                self.glow_tint.hash(&mut h);
+            }
         }
         h.finish()
     }
@@ -345,6 +373,27 @@ impl FilterUiState {
             FilterDialog::Twist => {
                 beautiful_core::filters::twist(&mut mini, self.twist_amount);
             }
+            FilterDialog::Vignette => {
+                beautiful_core::filters::vignette(
+                    &mut mini,
+                    self.vignette_amount,
+                    self.vignette_softness,
+                    self.vignette_color,
+                );
+            }
+            FilterDialog::Glow => {
+                let tint = if self.glow_tint {
+                    Some(self.glow_color)
+                } else {
+                    None
+                };
+                beautiful_core::filters::glow(
+                    &mut mini,
+                    (self.glow_radius / lod).min(28.0),
+                    self.glow_intensity,
+                    tint,
+                );
+            }
         }
         let up = beautiful_core::filters::upscale_bilinear(
             &mini.pixels_dense(),
@@ -405,6 +454,13 @@ impl FilterUiState {
             ripple_amount: self.ripple_amount,
             ripple_wavelength: self.ripple_wavelength,
             twist_amount: self.twist_amount,
+            vignette_amount: self.vignette_amount,
+            vignette_softness: self.vignette_softness,
+            vignette_color: self.vignette_color,
+            glow_radius: self.glow_radius,
+            glow_intensity: self.glow_intensity,
+            glow_color: self.glow_color,
+            glow_tint: self.glow_tint,
         };
         let (tx, rx) = std::sync::mpsc::channel();
         self.preview_rx = Some(rx);
@@ -553,14 +609,40 @@ impl FilterUiState {
                     beautiful_core::filters::twist(layer, self.twist_amount)
                 });
             }
+            FilterDialog::Vignette => {
+                document.apply_active_layer_filter(|layer| {
+                    beautiful_core::filters::vignette(
+                        layer,
+                        self.vignette_amount,
+                        self.vignette_softness,
+                        self.vignette_color,
+                    )
+                });
+            }
+            FilterDialog::Glow => {
+                let tint = if self.glow_tint {
+                    Some(self.glow_color)
+                } else {
+                    None
+                };
+                document.apply_active_layer_filter(|layer| {
+                    beautiful_core::filters::glow(
+                        layer,
+                        self.glow_radius,
+                        self.glow_intensity,
+                        tint,
+                    )
+                });
+            }
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkspaceTool {
     Brush,
     Pencil,
+    PixelBrush,
     Airbrush,
     Mixer,
     Eraser,
@@ -577,6 +659,7 @@ pub enum WorkspaceTool {
     Zoom,
     Eyedropper,
     SelectRect,
+    SelectEllipse,
     #[allow(dead_code)]
     Move,
     Transform,
@@ -585,12 +668,41 @@ pub enum WorkspaceTool {
 }
 
 impl WorkspaceTool {
+    fn all() -> &'static [Self] {
+        &[
+            Self::Brush,
+            Self::Pencil,
+            Self::PixelBrush,
+            Self::Airbrush,
+            Self::Mixer,
+            Self::Eraser,
+            Self::Smudge,
+            Self::SelectionBrush,
+            Self::SelectionEraser,
+            Self::Fill,
+            Self::Gradient,
+            Self::Shape,
+            Self::CloneStamp,
+            Self::Wand,
+            Self::Lasso,
+            Self::SelectRect,
+            Self::SelectEllipse,
+            Self::Transform,
+            Self::Warp,
+            Self::Crop,
+            Self::Hand,
+            Self::Zoom,
+            Self::Eyedropper,
+        ]
+    }
+
     fn icon(self) -> ToolIcon {
         match self {
             Self::Brush => ToolIcon::Brush,
             Self::Smudge => ToolIcon::Smudge,
             Self::Mixer => ToolIcon::Mixer,
             Self::Pencil => ToolIcon::Pencil,
+            Self::PixelBrush => ToolIcon::PixelBrush,
             Self::Airbrush => ToolIcon::Airbrush,
             Self::Eraser => ToolIcon::Eraser,
             Self::SelectionBrush => ToolIcon::SelectionBrush,
@@ -603,6 +715,7 @@ impl WorkspaceTool {
             Self::Eyedropper => ToolIcon::Eyedropper,
             Self::Lasso => ToolIcon::Lasso,
             Self::SelectRect => ToolIcon::SelectRect,
+            Self::SelectEllipse => ToolIcon::SelectEllipse,
             Self::Move => ToolIcon::Move,
             Self::Transform => ToolIcon::Transform,
             Self::Warp => ToolIcon::Warp,
@@ -616,6 +729,7 @@ impl WorkspaceTool {
         match self {
             Self::Brush => "Brush (B)",
             Self::Pencil => "Pencil (P)",
+            Self::PixelBrush => "Pixel Brush",
             Self::Airbrush => "Airbrush (A)",
             Self::Mixer => "Mixer (U)",
             Self::Eraser => "Eraser (E)",
@@ -628,7 +742,8 @@ impl WorkspaceTool {
             Self::CloneStamp => "Clone Stamp (Shift+C; Alt-click source)",
             Self::Wand => "Magic Wand (W)",
             Self::Lasso => "Lasso (L)",
-            Self::SelectRect => "Rect select (R)",
+            Self::SelectRect => "Rect select (R) — hold for ellipse",
+            Self::SelectEllipse => "Ellipse select — hold for rect",
             Self::Move => "Move selection (removed — use Transform)",
             Self::Transform => "Free Transform (T / V)",
             Self::Warp => "Mesh Warp",
@@ -638,40 +753,96 @@ impl WorkspaceTool {
             Self::Eyedropper => "Eyedropper (I)",
         }
     }
+
+    fn long_press_group(self) -> Option<&'static [Self]> {
+        match self {
+            Self::SelectRect | Self::SelectEllipse => {
+                Some(&[Self::SelectRect, Self::SelectEllipse])
+            }
+            _ => None,
+        }
+    }
+
+    fn apply_on_select(self, document: &mut Document) {
+        match self {
+            Self::Brush => {
+                document.brush.apply_preset(BrushKind::Brush);
+                document.warm_tip_cache();
+            }
+            Self::Pencil => {
+                document.brush.apply_preset(BrushKind::Pencil);
+                document.warm_tip_cache();
+            }
+            Self::PixelBrush => {
+                document.brush = BrushSettings::preset_pixel();
+                document.brush.kind = BrushKind::Pencil;
+                document.warm_tip_cache();
+            }
+            Self::Airbrush => {
+                document.brush.apply_preset(BrushKind::Airbrush);
+                document.warm_tip_cache();
+            }
+            Self::Mixer => {
+                document.brush.apply_preset(BrushKind::Mixer);
+                document.warm_tip_cache();
+            }
+            Self::Eraser => {
+                document.brush.apply_preset(BrushKind::Eraser);
+                document.warm_tip_cache();
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "tool")]
+pub enum ToolSlot {
+    Tool(WorkspaceTool),
+    Separator,
 }
 
 /// One page of the tool icon grid (pages with + to create).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolPage {
     pub name: String,
-    pub tools: Vec<WorkspaceTool>,
+    pub tools: Vec<ToolSlot>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolPages {
     pub pages: Vec<ToolPage>,
     pub active: usize,
-    /// RMB rearrange: drag then Cancel / Move / Duplicate menu.
+    #[serde(skip)]
     rmb: ToolRmbInteract,
+    #[serde(skip)]
+    long_press: ToolLongPress,
+    #[serde(skip)]
+    add_popup: Option<egui::Pos2>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ToolLongPress {
+    slot: Option<usize>,
+    started: f64,
+    open: bool,
+    anchor: egui::Pos2,
 }
 
 #[derive(Clone, Debug, Default)]
 enum ToolRmbInteract {
     #[default]
     Idle,
-    /// Holding RMB and dragging a tool slot.
     Dragging {
         from: usize,
-        tool: WorkspaceTool,
+        slot: ToolSlot,
         over: Option<usize>,
     },
-    /// RMB released — confirm action.
     Menu {
         from: usize,
         to: usize,
-        tool: WorkspaceTool,
+        slot: ToolSlot,
         pos: egui::Pos2,
-        /// Skip outside-click cancel on the open frame.
         born_frame: u64,
     },
 }
@@ -683,45 +854,78 @@ impl Default for ToolPages {
                 ToolPage {
                     name: "basic".into(),
                     tools: vec![
-                        WorkspaceTool::Brush,
-                        WorkspaceTool::Pencil,
-                        WorkspaceTool::Airbrush,
-                        WorkspaceTool::Mixer,
-                        WorkspaceTool::Eraser,
-                        WorkspaceTool::Smudge,
-                        WorkspaceTool::SelectionBrush,
-                        WorkspaceTool::SelectionEraser,
-                        WorkspaceTool::Fill,
-                        WorkspaceTool::Gradient,
-                        WorkspaceTool::Shape,
-                        WorkspaceTool::CloneStamp,
-                        WorkspaceTool::Wand,
-                        WorkspaceTool::Lasso,
-                        WorkspaceTool::SelectRect,
-                        WorkspaceTool::Crop,
-                        WorkspaceTool::Hand,
-                        WorkspaceTool::Zoom,
-                        WorkspaceTool::Eyedropper,
+                        ToolSlot::Tool(WorkspaceTool::Brush),
+                        ToolSlot::Tool(WorkspaceTool::Pencil),
+                        ToolSlot::Tool(WorkspaceTool::PixelBrush),
+                        ToolSlot::Tool(WorkspaceTool::Airbrush),
+                        ToolSlot::Tool(WorkspaceTool::Mixer),
+                        ToolSlot::Tool(WorkspaceTool::Eraser),
+                        ToolSlot::Tool(WorkspaceTool::Smudge),
+                        ToolSlot::Separator,
+                        ToolSlot::Tool(WorkspaceTool::SelectionBrush),
+                        ToolSlot::Tool(WorkspaceTool::SelectionEraser),
+                        ToolSlot::Tool(WorkspaceTool::Fill),
+                        ToolSlot::Tool(WorkspaceTool::Gradient),
+                        ToolSlot::Tool(WorkspaceTool::Shape),
+                        ToolSlot::Tool(WorkspaceTool::CloneStamp),
+                        ToolSlot::Tool(WorkspaceTool::Wand),
+                        ToolSlot::Tool(WorkspaceTool::Lasso),
+                        ToolSlot::Tool(WorkspaceTool::SelectRect),
+                        ToolSlot::Separator,
+                        ToolSlot::Tool(WorkspaceTool::Crop),
+                        ToolSlot::Tool(WorkspaceTool::Hand),
+                        ToolSlot::Tool(WorkspaceTool::Zoom),
+                        ToolSlot::Tool(WorkspaceTool::Eyedropper),
                     ],
                 },
                 ToolPage {
                     name: "second".into(),
                     tools: vec![
-                        WorkspaceTool::Brush,
-                        WorkspaceTool::Eraser,
-                        WorkspaceTool::Hand,
-                        WorkspaceTool::Zoom,
-                        WorkspaceTool::Eyedropper,
+                        ToolSlot::Tool(WorkspaceTool::Brush),
+                        ToolSlot::Tool(WorkspaceTool::Eraser),
+                        ToolSlot::Tool(WorkspaceTool::Hand),
+                        ToolSlot::Tool(WorkspaceTool::Zoom),
+                        ToolSlot::Tool(WorkspaceTool::Eyedropper),
                     ],
                 },
             ],
             active: 0,
             rmb: ToolRmbInteract::Idle,
+            long_press: ToolLongPress::default(),
+            add_popup: None,
         }
     }
 }
 
 impl ToolPages {
+    pub fn load() -> Self {
+        let path = tool_pages_path();
+        match std::fs::read_to_string(&path) {
+            Ok(s) => {
+                let mut d: Self = serde_json::from_str(&s).unwrap_or_default();
+                if d.pages.is_empty() {
+                    return Self::default();
+                }
+                d.active = d.active.min(d.pages.len().saturating_sub(1));
+                d.rmb = ToolRmbInteract::Idle;
+                d.long_press = ToolLongPress::default();
+                d.add_popup = None;
+                d
+            }
+            Err(_) => Self::default(),
+        }
+    }
+
+    pub fn save(&self) {
+        let path = tool_pages_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(s) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, s);
+        }
+    }
+
     fn active_mut(&mut self) -> &mut ToolPage {
         if self.pages.is_empty() {
             self.pages.push(ToolPage {
@@ -738,7 +942,10 @@ impl ToolPages {
         let n = self.pages.len() + 1;
         self.pages.push(ToolPage {
             name: format!("page {n}"),
-            tools: vec![WorkspaceTool::Brush, WorkspaceTool::Eraser],
+            tools: vec![
+                ToolSlot::Tool(WorkspaceTool::Brush),
+                ToolSlot::Tool(WorkspaceTool::Eraser),
+            ],
         });
         self.active = self.pages.len() - 1;
     }
@@ -748,10 +955,10 @@ impl ToolPages {
         if from >= page.tools.len() || to >= page.tools.len() || from == to {
             return;
         }
-        let tool = page.tools.remove(from);
+        let slot = page.tools.remove(from);
         let insert_at = if from < to { to - 1 } else { to };
         let insert_at = insert_at.min(page.tools.len());
-        page.tools.insert(insert_at, tool);
+        page.tools.insert(insert_at, slot);
     }
 
     fn apply_duplicate(&mut self, from: usize, to: usize) {
@@ -759,11 +966,27 @@ impl ToolPages {
         if from >= page.tools.len() {
             return;
         }
-        let tool = page.tools[from];
+        let slot = page.tools[from];
         let insert_at = to.min(page.tools.len());
-        // If dropping on a later slot after from, insert after `to`.
-        page.tools.insert(insert_at, tool);
+        page.tools.insert(insert_at, slot);
     }
+
+    fn apply_remove(&mut self, from: usize) {
+        let page = self.active_mut();
+        if from < page.tools.len() {
+            page.tools.remove(from);
+        }
+    }
+}
+
+fn tool_pages_path() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return PathBuf::from(appdata).join("Beautiful").join("tool_pages.json");
+        }
+    }
+    PathBuf::from("beautiful-tool-pages.json")
 }
 
 /// Blender-style Open Recent hover: canvas thumbnail to the right of the menu row.
@@ -922,10 +1145,10 @@ pub fn top_menu(
                             egui::Stroke::new(1.0_f32, theme::TEXT);
                         match label {
                         "File" => {
-                            if theme::btn(ui, theme::label("New Canvas…")).clicked() {
+                            if icons::menu_icon_btn(ui, ToolIcon::NewDoc, "New Canvas…").clicked() {
                                 *request_new_canvas = true;
                             }
-                            if theme::btn(ui, theme::label("Open…")).clicked() {
+                            if icons::menu_icon_btn(ui, ToolIcon::Open, "Open…").clicked() {
                                 // Open as additional canvas (file) tab.
                                 *request_open_canvas = true;
                             }
@@ -947,7 +1170,7 @@ pub fn top_menu(
                                 }
                             });
                             ui.separator();
-                            if theme::btn(ui, theme::label("Save")).clicked() {
+                            if icons::menu_icon_btn(ui, ToolIcon::Save, "Save").clicked() {
                                 file.save(document);
                             }
                             if theme::btn(ui, theme::label("Save As…")).clicked() {
@@ -1150,6 +1373,14 @@ pub fn top_menu(
                                 }
                                 if theme::btn(ui, theme::label("Glitch…")).clicked() {
                                     open_filter(filters, document, FilterDialog::Glitch, ui);
+                                }
+                                if icons::menu_icon_btn(ui, ToolIcon::Vignette, "Vignette…")
+                                    .clicked()
+                                {
+                                    open_filter(filters, document, FilterDialog::Vignette, ui);
+                                }
+                                if icons::menu_icon_btn(ui, ToolIcon::Glow, "Glow…").clicked() {
+                                    open_filter(filters, document, FilterDialog::Glow, ui);
                                 }
                             });
                             if !addons.filters.is_empty() || !addons.menus.is_empty() {
@@ -1445,6 +1676,8 @@ fn filter_dialog(
         FilterDialog::SphericalLens => "Spherical Lens",
         FilterDialog::Ripple => "Ripple",
         FilterDialog::Twist => "Twist",
+        FilterDialog::Vignette => "Vignette",
+        FilterDialog::Glow => "Glow",
     };
     let mut open = true;
     let mut apply = false;
@@ -1590,6 +1823,49 @@ fn filter_dialog(
                 FilterDialog::Twist => {
                     ui.add(egui::Slider::new(&mut filters.twist_amount, -3.0..=3.0).text("Amount"));
                 }
+                FilterDialog::Vignette => {
+                    ui.add(
+                        egui::Slider::new(&mut filters.vignette_amount, 0.0..=100.0).text("Amount"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut filters.vignette_softness, 5.0..=100.0)
+                            .text("Softness"),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Color");
+                        let mut c = egui::Color32::from_rgb(
+                            filters.vignette_color[0],
+                            filters.vignette_color[1],
+                            filters.vignette_color[2],
+                        );
+                        if ui.color_edit_button_srgba(&mut c).changed() {
+                            filters.vignette_color = [c.r(), c.g(), c.b()];
+                        }
+                    });
+                }
+                FilterDialog::Glow => {
+                    ui.add(
+                        egui::Slider::new(&mut filters.glow_radius, 0.5..=64.0).text("Radius"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut filters.glow_intensity, 0.0..=200.0)
+                            .text("Intensity"),
+                    );
+                    ui.checkbox(&mut filters.glow_tint, "Tint color");
+                    if filters.glow_tint {
+                        ui.horizontal(|ui| {
+                            ui.label("Color");
+                            let mut c = egui::Color32::from_rgb(
+                                filters.glow_color[0],
+                                filters.glow_color[1],
+                                filters.glow_color[2],
+                            );
+                            if ui.color_edit_button_srgba(&mut c).changed() {
+                                filters.glow_color = [c.r(), c.g(), c.b()];
+                            }
+                        });
+                    }
+                }
             }
             ui.label(
                 egui::RichText::new("Превью в реальном времени")
@@ -1709,7 +1985,10 @@ pub fn panel_brush(
         fill_settings_panel(ui, document);
     } else if matches!(*tool, WorkspaceTool::Shape) {
         shape_settings_panel(ui, document);
-    } else if matches!(*tool, WorkspaceTool::SelectRect) {
+    } else if matches!(
+        *tool,
+        WorkspaceTool::SelectRect | WorkspaceTool::SelectEllipse
+    ) {
         selection_settings_panel(ui, document, canvas, tool);
     } else if matches!(
         *tool,
@@ -1773,44 +2052,13 @@ pub fn render_panel_kind(
     }
 }
 
-#[allow(dead_code)]
-pub fn left_tools_panel(
-    ui: &mut egui::Ui,
-    document: &mut Document,
-    color_state: &mut ColorState,
-    tool: &mut WorkspaceTool,
-    tool_pages: &mut ToolPages,
-    brush_panel: &mut BrushPanelUi,
-    canvas: &mut CanvasState,
-) {
-    egui::ScrollArea::vertical()
-        .id_salt("left_panel_scroll")
-        .show(ui, |ui| {
-            panel_color(ui, document, color_state);
-            ui.add_space(6.0);
-            panel_tools(ui, document, tool, tool_pages, canvas);
-            ui.add_space(8.0);
-            panel_brush(ui, document, brush_panel, canvas, tool);
-        });
-}
-
-#[allow(dead_code)]
-pub fn right_panel(
-    ui: &mut egui::Ui,
-    document: &mut Document,
-    canvas: &mut CanvasState,
-    layer_ui: &mut LayerUiState,
-) {
-    panel_navigator(ui, document, canvas, crate::canvas::ZOOM_STEP);
-    ui.add_space(10.0);
-    ui.separator();
-    ui.add_space(6.0);
-    panel_layers(ui, document, canvas, layer_ui);
-}
-
 fn tool_page_tabs(ui: &mut egui::Ui, pages: &mut ToolPages) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
+        {
+            let (irect, _) = ui.allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::hover());
+            icons::paint(ui.painter(), irect, ToolIcon::Grip, theme::TEXT_DIM);
+        }
         for i in 0..pages.pages.len() {
             let name = pages.pages[i].name.clone();
             let selected = pages.active == i;
@@ -1855,18 +2103,23 @@ fn tool_icon_grid(
 ) {
     const COLS: usize = 5;
     const CELL: f32 = 36.0;
+    const ROW_H: f32 = 32.0;
+    const SEP_H: f32 = 10.0;
+    const LONG_PRESS_SEC: f64 = 0.45;
 
     let rmb_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
     let rmb_released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Secondary));
     let rmb_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary));
+    let lmb_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+    let lmb_released = ui.input(|i| i.pointer.button_released(egui::PointerButton::Primary));
     let pointer = ui.input(|i| i.pointer.interact_pos());
     let frame_nr = ui.ctx().cumulative_pass_nr();
+    let now = ui.input(|i| i.time);
 
-    // Finish drag → always open confirm menu (Move / Duplicate / Cancel).
     if rmb_released {
         if let ToolRmbInteract::Dragging {
             from,
-            tool: dragged,
+            slot,
             over,
         } = pages.rmb.clone()
         {
@@ -1875,7 +2128,7 @@ fn tool_icon_grid(
             pages.rmb = ToolRmbInteract::Menu {
                 from,
                 to,
-                tool: dragged,
+                slot,
                 pos,
                 born_frame: frame_nr,
             };
@@ -1883,157 +2136,413 @@ fn tool_icon_grid(
     }
 
     let menu_open = matches!(pages.rmb, ToolRmbInteract::Menu { .. });
+    let mut select_tool: Option<WorkspaceTool> = None;
+    let mut hovered_slot: Option<usize> = None;
+    let mut start_drag: Option<(usize, ToolSlot)> = None;
+    let mut long_press_slot: Option<(usize, egui::Pos2, WorkspaceTool)> = None;
+    let mut open_add_at: Option<egui::Pos2> = None;
 
-    // Single scroll comes from the dock panel (same as Color / Brush) — no nested ScrollArea.
-    {
-            let mut hovered_slot: Option<usize> = None;
-            let mut start_drag: Option<(usize, WorkspaceTool)> = None;
+    let slots_snapshot: Vec<ToolSlot> = pages.active_mut().tools.clone();
+    let drag_from = match &pages.rmb {
+        ToolRmbInteract::Dragging { from, .. } => Some(*from),
+        _ => None,
+    };
+    let drop_over = match &pages.rmb {
+        ToolRmbInteract::Dragging { over, .. } => *over,
+        _ => None,
+    };
 
-            egui::Grid::new("tool_icon_grid")
-                .num_columns(COLS)
-                .spacing([4.0, 4.0])
-                .min_col_width(CELL)
-                .show(ui, |ui| {
-                    let tools_snapshot: Vec<WorkspaceTool> = pages.active_mut().tools.clone();
-                    let drag_from = match &pages.rmb {
-                        ToolRmbInteract::Dragging { from, .. } => Some(*from),
-                        _ => None,
-                    };
-                    let drop_over = match &pages.rmb {
-                        ToolRmbInteract::Dragging { over, .. } => *over,
-                        _ => None,
-                    };
+    let avail_w = ui.available_width().max(CELL);
 
-                    for (idx, t) in tools_snapshot.iter().copied().enumerate() {
-                        let selected = *tool == t
-                            || (t == WorkspaceTool::SelectRect
-                                && matches!(*tool, WorkspaceTool::Transform | WorkspaceTool::Warp));
-                        let is_src = drag_from == Some(idx);
-                        let is_dst = drop_over == Some(idx) && drag_from != Some(idx);
+    let mut i = 0usize;
+    while i < slots_snapshot.len() {
+        // Collect one visual row: either a separator or up to COLS tools.
+        if matches!(slots_snapshot[i], ToolSlot::Separator) {
+            let idx = i;
+            let is_src = drag_from == Some(idx);
+            let is_dst = drop_over == Some(idx) && drag_from != Some(idx);
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(avail_w.min(COLS as f32 * (CELL + 4.0) - 4.0), SEP_H),
+                egui::Sense::click(),
+            );
+            let y = rect.center().y;
+            let inset = 8.0;
+            let col_line = if is_dst {
+                theme::ACCENT
+            } else if is_src {
+                theme::TEXT_DIM
+            } else {
+                theme::STROKE
+            };
+            ui.painter().line_segment(
+                [
+                    egui::pos2(rect.left() + inset, y),
+                    egui::pos2(rect.right() - inset, y),
+                ],
+                egui::Stroke::new(1.0_f32, col_line),
+            );
+            let _ = resp.clone().on_hover_text("Separator\nRMB-drag to rearrange");
+            let under_pointer = pointer.is_some_and(|p| rect.contains(p));
+            if under_pointer {
+                hovered_slot = Some(idx);
+            }
+            if !menu_open
+                && matches!(pages.rmb, ToolRmbInteract::Idle)
+                && rmb_pressed
+                && under_pointer
+            {
+                start_drag = Some((idx, ToolSlot::Separator));
+            }
+            i += 1;
+            continue;
+        }
 
-                        let (rect, resp) =
-                            ui.allocate_exact_size(egui::vec2(CELL, 32.0), egui::Sense::click());
-
-                        let bg = if is_dst {
-                            theme::ACCENT.gamma_multiply(0.35)
-                        } else if selected {
-                            theme::ACCENT.gamma_multiply(0.25)
-                        } else if resp.hovered() {
-                            theme::BG_HOVER
-                        } else {
-                            theme::BG_PANEL_2
-                        };
-                        let border = if is_dst || selected {
-                            theme::ACCENT
-                        } else {
-                            theme::STROKE
-                        };
-                        let fg = if is_src {
-                            theme::TEXT_DIM
-                        } else if selected {
-                            theme::ACCENT
-                        } else {
-                            theme::TEXT
-                        };
-                        ui.painter().rect_filled(rect, 6.0, bg);
-                        ui.painter().rect_stroke(
-                            rect,
-                            6.0,
-                            egui::Stroke::new(1.0_f32, border),
-                            egui::StrokeKind::Inside,
-                        );
-                        icons::paint(ui.painter(), rect.shrink(3.5), t.icon(), fg);
-                        // Nested transform tools live in the selection settings panel.
-                        let tip_text = format!("{}\nRMB-drag to rearrange", t.tip());
-                        let _ = resp.clone().on_hover_text(tip_text);
-
-                        let under_pointer = pointer.is_some_and(|p| rect.contains(p));
-                        if under_pointer {
-                            hovered_slot = Some(idx);
-                        }
-
-                        if resp.clicked() && !menu_open {
-                            *tool = t;
-                            match t {
-                                WorkspaceTool::Brush => {
-                                    document.brush.apply_preset(BrushKind::Brush);
-                                    document.warm_tip_cache();
-                                }
-                                WorkspaceTool::Pencil => {
-                                    document.brush.apply_preset(BrushKind::Pencil);
-                                    document.warm_tip_cache();
-                                }
-                                WorkspaceTool::Airbrush => {
-                                    document.brush.apply_preset(BrushKind::Airbrush);
-                                    document.warm_tip_cache();
-                                }
-                                WorkspaceTool::Mixer => {
-                                    document.brush.apply_preset(BrushKind::Mixer);
-                                    document.warm_tip_cache();
-                                }
-                                WorkspaceTool::Eraser => {
-                                    document.brush.apply_preset(BrushKind::Eraser);
-                                    document.warm_tip_cache();
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        // Start rearrange on RMB press over this cell (hit-test by rect).
-                        if !menu_open
-                            && matches!(pages.rmb, ToolRmbInteract::Idle)
-                            && rmb_pressed
-                            && under_pointer
-                        {
-                            start_drag = Some((idx, t));
-                        }
-
-                        if (idx + 1) % COLS == 0 {
-                            ui.end_row();
-                        }
-                    }
-                });
-
-            if let Some((idx, t)) = start_drag {
-                pages.rmb = ToolRmbInteract::Dragging {
-                    from: idx,
-                    tool: t,
-                    over: Some(idx),
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let mut placed = 0usize;
+            while i < slots_snapshot.len()
+                && placed < COLS
+                && !matches!(slots_snapshot[i], ToolSlot::Separator)
+            {
+                let idx = i;
+                let slot = slots_snapshot[idx];
+                let ToolSlot::Tool(t) = slot else {
+                    break;
                 };
-            }
+                let selected = *tool == t
+                    || (t == WorkspaceTool::SelectRect
+                        && matches!(*tool, WorkspaceTool::Transform | WorkspaceTool::Warp));
 
-            if let ToolRmbInteract::Dragging { over, .. } = &mut pages.rmb {
-                if rmb_down {
-                    *over = hovered_slot.or(*over);
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                let is_src = drag_from == Some(idx);
+                let is_dst = drop_over == Some(idx) && drag_from != Some(idx);
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(CELL, ROW_H), egui::Sense::click());
+
+                let bg = if is_dst {
+                    theme::ACCENT.gamma_multiply(0.35)
+                } else if selected {
+                    theme::ACCENT.gamma_multiply(0.25)
+                } else if resp.hovered() {
+                    theme::BG_HOVER
+                } else {
+                    theme::BG_PANEL_2
+                };
+                let border = if is_dst || selected {
+                    theme::ACCENT
+                } else {
+                    theme::STROKE
+                };
+                let fg = if is_src {
+                    theme::TEXT_DIM
+                } else if selected {
+                    theme::ACCENT
+                } else {
+                    theme::TEXT
+                };
+                ui.painter().rect_filled(rect, 6.0, bg);
+                ui.painter().rect_stroke(
+                    rect,
+                    6.0,
+                    egui::Stroke::new(1.0_f32, border),
+                    egui::StrokeKind::Inside,
+                );
+                icons::paint(ui.painter(), rect.shrink(3.5), t.icon(), fg);
+                let tip_text = format!("{}\nRMB-drag to rearrange", t.tip());
+                let _ = resp.clone().on_hover_text(tip_text);
+
+                let under_pointer = pointer.is_some_and(|p| rect.contains(p));
+                if under_pointer {
+                    hovered_slot = Some(idx);
+                }
+
+                if resp.clicked() && !menu_open && !pages.long_press.open {
+                    select_tool = Some(t);
+                }
+
+                // Long-press group (Select rect/ellipse).
+                if !menu_open && t.long_press_group().is_some() {
+                    if resp.is_pointer_button_down_on() && lmb_down {
+                        long_press_slot = Some((idx, rect.left_bottom(), t));
+                    }
+                }
+
+                if !menu_open
+                    && matches!(pages.rmb, ToolRmbInteract::Idle)
+                    && rmb_pressed
+                    && under_pointer
+                {
+                    start_drag = Some((idx, ToolSlot::Tool(t)));
+                }
+
+                i += 1;
+                placed += 1;
+            }
+        });
+    }
+
+    // Trailing empty add cell(s).
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let rem = {
+            let n_tools_tail = slots_snapshot
+                .iter()
+                .rev()
+                .take_while(|s| matches!(s, ToolSlot::Tool(_)))
+                .count();
+            let used = n_tools_tail % COLS;
+            if used == 0 {
+                1
+            } else {
+                COLS - used
+            }
+        };
+        for _ in 0..rem.max(1).min(COLS) {
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(CELL, ROW_H), egui::Sense::click());
+            let border = if resp.hovered() {
+                theme::ACCENT
+            } else {
+                theme::STROKE.gamma_multiply(0.7)
+            };
+            ui.painter().rect_stroke(
+                rect,
+                6.0,
+                egui::Stroke::new(1.0_f32, border),
+                egui::StrokeKind::Inside,
+            );
+            let fg = theme::TEXT_DIM;
+            let c = rect.center();
+            ui.painter().line_segment(
+                [c + egui::vec2(-6.0, 0.0), c + egui::vec2(6.0, 0.0)],
+                egui::Stroke::new(1.4_f32, fg),
+            );
+            ui.painter().line_segment(
+                [c + egui::vec2(0.0, -6.0), c + egui::vec2(0.0, 6.0)],
+                egui::Stroke::new(1.4_f32, fg),
+            );
+            let _ = resp.clone().on_hover_text("Add tool / separator");
+            if resp.clicked() && !menu_open {
+                open_add_at = Some(rect.left_bottom());
+            }
+        }
+    });
+
+    if let Some(t) = select_tool {
+        if !pages.long_press.open {
+            *tool = t;
+            t.apply_on_select(document);
+        }
+    }
+
+    if let Some((idx, anchor, t)) = long_press_slot {
+        if pages.long_press.slot != Some(idx) {
+            pages.long_press = ToolLongPress {
+                slot: Some(idx),
+                started: now,
+                open: false,
+                anchor,
+            };
+        } else if !pages.long_press.open && now - pages.long_press.started >= LONG_PRESS_SEC {
+            pages.long_press.open = true;
+            pages.long_press.anchor = anchor;
+            let _ = t;
+        }
+    } else if lmb_released || !lmb_down {
+        if !pages.long_press.open {
+            pages.long_press = ToolLongPress::default();
+        }
+    }
+
+    if let Some((idx, t)) = start_drag {
+        pages.rmb = ToolRmbInteract::Dragging {
+            from: idx,
+            slot: t,
+            over: Some(idx),
+        };
+        pages.long_press = ToolLongPress::default();
+    }
+
+    if let ToolRmbInteract::Dragging { over, .. } = &mut pages.rmb {
+        if rmb_down {
+            *over = hovered_slot.or(*over);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+    }
+
+    if let ToolRmbInteract::Dragging { slot, .. } = &pages.rmb {
+        if let Some(pos) = pointer {
+            let ghost = egui::Rect::from_center_size(pos, egui::vec2(CELL, ROW_H));
+            let layer = egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("tool_rmb_ghost"),
+            );
+            let painter = ui.ctx().layer_painter(layer);
+            painter.rect_filled(ghost, 6.0, theme::BG_PANEL_2.gamma_multiply(0.9));
+            painter.rect_stroke(
+                ghost,
+                6.0,
+                egui::Stroke::new(1.0_f32, theme::ACCENT),
+                egui::StrokeKind::Inside,
+            );
+            match slot {
+                ToolSlot::Tool(t) => {
+                    icons::paint(&painter, ghost.shrink(3.5), t.icon(), theme::ACCENT);
+                }
+                ToolSlot::Separator => {
+                    let y = ghost.center().y;
+                    painter.line_segment(
+                        [
+                            egui::pos2(ghost.left() + 6.0, y),
+                            egui::pos2(ghost.right() - 6.0, y),
+                        ],
+                        egui::Stroke::new(1.5_f32, theme::ACCENT),
+                    );
                 }
             }
+        }
+    }
 
-            if let ToolRmbInteract::Dragging { tool: dragged, .. } = &pages.rmb {
-                if let Some(pos) = pointer {
-                    let ghost = egui::Rect::from_center_size(pos, egui::vec2(CELL, 32.0));
-                    let layer = egui::LayerId::new(
-                        egui::Order::Foreground,
-                        egui::Id::new("tool_rmb_ghost"),
-                    );
-                    let painter = ui.ctx().layer_painter(layer);
-                    painter.rect_filled(ghost, 6.0, theme::BG_PANEL_2.gamma_multiply(0.9));
-                    painter.rect_stroke(
-                        ghost,
-                        6.0,
-                        egui::Stroke::new(1.0_f32, theme::ACCENT),
-                        egui::StrokeKind::Inside,
-                    );
-                    icons::paint(&painter, ghost.shrink(3.5), dragged.icon(), theme::ACCENT);
-                }
-            }
+    // Long-press sibling picker.
+    if pages.long_press.open {
+        let anchor = pages.long_press.anchor;
+        let group = slots_snapshot
+            .get(pages.long_press.slot.unwrap_or(0))
+            .and_then(|s| match s {
+                ToolSlot::Tool(t) => t.long_press_group(),
+                _ => None,
+            })
+            .unwrap_or(&[WorkspaceTool::SelectRect, WorkspaceTool::SelectEllipse]);
+        let mut picked: Option<WorkspaceTool> = None;
+        let mut dismiss = false;
+        egui::Area::new(egui::Id::new("tool_long_press_group"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(anchor)
+            .constrain(true)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(theme::BG_MENU)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(4))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for t in group.iter().copied() {
+                                if icons::icon_button(ui, t.icon(), *tool == t, t.tip()).clicked()
+                                {
+                                    picked = Some(t);
+                                }
+                            }
+                        });
+                    });
+            });
+        if let Some(t) = picked {
+            *tool = t;
+            t.apply_on_select(document);
+            dismiss = true;
+        }
+        if lmb_released || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            dismiss = true;
+        }
+        if dismiss {
+            pages.long_press = ToolLongPress::default();
+        }
+    }
+
+    if let Some(pos) = open_add_at {
+        pages.add_popup = Some(pos);
+    }
+
+    // Add tool / separator popup.
+    if let Some(pos) = pages.add_popup {
+        let mut close = false;
+        let mut add_tool: Option<WorkspaceTool> = None;
+        let mut add_sep = false;
+        egui::Area::new(egui::Id::new("tool_add_popup"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .constrain(true)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(egui::Color32::from_rgb(248, 248, 248))
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        egui::Color32::from_rgb(36, 36, 40),
+                    ))
+                    .corner_radius(3.0)
+                    .inner_margin(egui::Margin::symmetric(4, 3))
+                    .show(ui, |ui| {
+                        ui.set_min_width(160.0);
+                        ui.visuals_mut().override_text_color =
+                            Some(egui::Color32::from_rgb(16, 16, 16));
+                        if ui
+                            .add(
+                                egui::Button::new("Add separator")
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .min_size(egui::vec2(150.0, 22.0)),
+                            )
+                            .clicked()
+                        {
+                            add_sep = true;
+                        }
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .max_height(280.0)
+                            .show(ui, |ui| {
+                                for t in WorkspaceTool::all() {
+                                    ui.horizontal(|ui| {
+                                        let (irect, _) = ui.allocate_exact_size(
+                                            egui::vec2(16.0, 16.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        icons::paint(
+                                            ui.painter(),
+                                            irect,
+                                            t.icon(),
+                                            egui::Color32::from_rgb(16, 16, 16),
+                                        );
+                                        if ui
+                                            .add(
+                                                egui::Button::new(t.tip())
+                                                    .fill(egui::Color32::TRANSPARENT)
+                                                    .min_size(egui::vec2(130.0, 22.0)),
+                                            )
+                                            .clicked()
+                                        {
+                                            add_tool = Some(*t);
+                                        }
+                                    });
+                                }
+                            });
+                    });
+            });
+        if add_sep {
+            pages.active_mut().tools.push(ToolSlot::Separator);
+            pages.save();
+            close = true;
+        }
+        if let Some(t) = add_tool {
+            pages.active_mut().tools.push(ToolSlot::Tool(t));
+            pages.save();
+            close = true;
+        }
+        if close
+            || ui.input(|i| {
+                i.key_pressed(egui::Key::Escape)
+                    || (i.pointer.any_click()
+                        && i.pointer
+                            .interact_pos()
+                            .is_some_and(|p| (p - pos).length() > 220.0))
+            })
+        {
+            pages.add_popup = None;
+        }
     }
 
     // Confirm menu on a Foreground Area so buttons receive clicks over acrylic chrome.
     if let ToolRmbInteract::Menu {
         from,
         to,
-        tool: dragged,
+        slot,
         pos,
         born_frame,
     } = pages.rmb.clone()
@@ -2098,10 +2607,12 @@ fn tool_icon_grid(
                         if mov.clicked() {
                             picked = Some("move");
                         }
-                        if row(ui, "Duplicate").clicked() {
+                        if matches!(slot, ToolSlot::Tool(_)) && row(ui, "Duplicate").clicked() {
                             picked = Some("dup");
                         }
-                        let _ = dragged;
+                        if row(ui, "Remove").clicked() {
+                            picked = Some("remove");
+                        }
                     });
                 picked
             });
@@ -2115,11 +2626,13 @@ fn tool_icon_grid(
         if ui.input(|i| i.key_pressed(egui::Key::M)) && from != to {
             action = Some("move");
         }
-        if ui.input(|i| i.key_pressed(egui::Key::C)) {
+        if ui.input(|i| i.key_pressed(egui::Key::C)) && matches!(slot, ToolSlot::Tool(_)) {
             action = Some("dup");
         }
+        if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::R)) {
+            action = Some("remove");
+        }
 
-        // Outside click cancels only after the open frame (RMB release must not eat it).
         if frame_nr > born_frame
             && action.is_none()
             && ui.input(|i| {
@@ -2138,9 +2651,11 @@ fn tool_icon_grid(
             match a {
                 "move" => pages.apply_move(from, to),
                 "dup" => pages.apply_duplicate(from, to),
+                "remove" => pages.apply_remove(from),
                 _ => {}
             }
             pages.rmb = ToolRmbInteract::Idle;
+            pages.save();
         }
     }
 }
@@ -2171,31 +2686,38 @@ fn selection_settings_panel(
             crate::canvas::TransformMode::Free,
             "Свободная трансформация",
             "Scale / rotate / flip handles",
+            ToolIcon::Transform,
         ),
         (
             crate::canvas::TransformMode::Distort,
             "Деформация углов",
             "Corner distort (2×2)",
+            ToolIcon::Distort,
         ),
         (
             crate::canvas::TransformMode::Mesh,
             "Деформация по сетке",
             "Mesh warp (3×3 cells)",
+            ToolIcon::Warp,
         ),
     ];
     ui.add_enabled_ui(has_sel, |ui| {
-        for (mode, title, tip) in modes {
-            if ui
-                .add(
-                    egui::Button::new(theme::label(title))
-                        .min_size(egui::vec2(ui.available_width(), 28.0)),
-                )
-                .on_hover_text(tip)
-                .clicked()
-            {
-                let _ = canvas.begin_transform_session(document);
-                canvas.switch_transform_mode(document, tool, mode);
-            }
+        for (mode, title, tip, icon) in modes {
+            ui.horizontal(|ui| {
+                let (irect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                icons::paint(ui.painter(), irect, icon, theme::TEXT);
+                if ui
+                    .add(
+                        egui::Button::new(theme::label(title))
+                            .min_size(egui::vec2(ui.available_width(), 28.0)),
+                    )
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    let _ = canvas.begin_transform_session(document);
+                    canvas.switch_transform_mode(document, tool, mode);
+                }
+            });
         }
     });
     if !has_sel {
@@ -2214,14 +2736,14 @@ fn selection_settings_panel(
     );
     ui.add_enabled_ui(has_sel, |ui| {
         ui.horizontal(|ui| {
-            if theme::btn(ui, theme::label("Flip H"))
+            if icons::menu_icon_btn(ui, ToolIcon::FlipH, "Flip H")
                 .on_hover_text("Отразить по горизонтали")
                 .clicked()
             {
                 document.flip_selection_horizontal();
                 canvas.mark_dirty();
             }
-            if theme::btn(ui, theme::label("Flip V"))
+            if icons::menu_icon_btn(ui, ToolIcon::FlipV, "Flip V")
                 .on_hover_text("Отразить по вертикали")
                 .clicked()
             {
@@ -2629,7 +3151,7 @@ fn transform_settings_panel(
             "Контрольные точки сетки — локальная деформация.",
         ),
     ];
-    for (mode, t, title, hint) in modes {
+    for (mode, _t, title, hint) in modes {
         let on = canvas.transform_mode == mode;
         if ui
             .add(
@@ -2639,14 +3161,9 @@ fn transform_settings_panel(
             .on_hover_text(hint)
             .clicked()
         {
-            canvas.transform_mode = mode;
-            *tool = t;
-            if mode == crate::canvas::TransformMode::Distort {
-                canvas.mesh_grid_n = 2;
-            } else if mode == crate::canvas::TransformMode::Mesh && canvas.mesh_grid_n < 3 {
-                canvas.mesh_grid_n = 3;
-            }
-            canvas.clear_warp_controls();
+            // Must bake Free↔Mesh/Distort through switch — never assign mode raw
+            // (that discarded pose / warp and looked like a reset).
+            canvas.switch_transform_mode(document, tool, mode);
         }
         if on {
             ui.label(
@@ -2674,6 +3191,8 @@ fn transform_settings_panel(
                     ))
                     .clicked()
                 {
+                    // Bake current lattice before rebuilding a different density.
+                    canvas.commit_live_transform_to_baseline(document);
                     canvas.mesh_grid_n = n;
                     canvas.clear_warp_controls();
                 }
@@ -3402,51 +3921,6 @@ fn brush_size_grid(ui: &mut egui::Ui, document: &mut Document) {
         });
 }
 
-#[allow(dead_code)] // Also available from canvas chrome Stab dropdown.
-pub fn stabilizer_preset_ui(ui: &mut egui::Ui, stabilizer: &mut beautiful_core::Stabilizer) {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 3.0;
-        for preset in beautiful_core::StabilizerPreset::all() {
-            let selected = stabilizer.preset == preset;
-            let text = if selected {
-                theme::label(preset.label()).color(theme::ACCENT).strong()
-            } else if preset.is_slow() {
-                theme::label(preset.label()).color(theme::TEXT)
-            } else {
-                theme::label_dim(preset.label())
-            };
-            let size = if preset.is_slow() {
-                egui::vec2(28.0, 22.0)
-            } else {
-                egui::vec2(24.0, 22.0)
-            };
-            if ui
-                .add_sized(size, egui::Button::selectable(selected, text))
-                .on_hover_text(match preset {
-                    beautiful_core::StabilizerPreset::Off => "Stabilizer off".to_owned(),
-                    beautiful_core::StabilizerPreset::Level(n) => {
-                        format!("Stabilizer {n} — light smoothing")
-                    }
-                    beautiful_core::StabilizerPreset::Slow(n) => {
-                        format!("S{n} — slow / heavy smoothing")
-                    }
-                })
-                .clicked()
-            {
-                stabilizer.set_preset(preset);
-            }
-        }
-    });
-    ui.label(
-        theme::label_dim(format!(
-            "Active: {}  ({:.0}%)",
-            stabilizer.preset.label(),
-            stabilizer.preset.strength() * 100.0
-        ))
-        .small(),
-    );
-}
-
 pub fn options_bar(
     ctx: &egui::Context,
     document: &mut Document,
@@ -3463,11 +3937,11 @@ pub fn options_bar(
             }
             ui.horizontal(|ui| {
                 ui.label(theme::label_dim(match tool {
-                    WorkspaceTool::Brush | WorkspaceTool::Pencil | WorkspaceTool::Airbrush | WorkspaceTool::Mixer | WorkspaceTool::Eraser | WorkspaceTool::Smudge => "Brush",
+                    WorkspaceTool::Brush | WorkspaceTool::Pencil | WorkspaceTool::PixelBrush | WorkspaceTool::Airbrush | WorkspaceTool::Mixer | WorkspaceTool::Eraser | WorkspaceTool::Smudge => "Brush",
                     WorkspaceTool::Fill | WorkspaceTool::Wand => "Fill/Wand",
                     WorkspaceTool::Gradient => "Gradient",
                     WorkspaceTool::CloneStamp => "Clone Stamp",
-                    WorkspaceTool::Lasso | WorkspaceTool::SelectRect => "Selection",
+                    WorkspaceTool::Lasso | WorkspaceTool::SelectRect | WorkspaceTool::SelectEllipse => "Selection",
                     WorkspaceTool::Crop => "Crop / Frame",
                     WorkspaceTool::Transform | WorkspaceTool::Warp | WorkspaceTool::Move => {
                         "Transform"
@@ -3476,12 +3950,17 @@ pub fn options_bar(
                 }));
                 ui.separator();
                 match tool {
-                    WorkspaceTool::Brush | WorkspaceTool::Pencil | WorkspaceTool::Airbrush | WorkspaceTool::Mixer | WorkspaceTool::Eraser | WorkspaceTool::Smudge | WorkspaceTool::CloneStamp => {
+                    WorkspaceTool::Brush | WorkspaceTool::Pencil | WorkspaceTool::PixelBrush | WorkspaceTool::Airbrush | WorkspaceTool::Mixer | WorkspaceTool::Eraser | WorkspaceTool::Smudge | WorkspaceTool::CloneStamp => {
                         ui.label(theme::label_dim("Size"));
-                        ui.add(
+                        let size_resp = ui.add(
                             egui::Slider::new(&mut document.brush.size, 1.0..=256.0)
                                 .trailing_fill(true),
                         );
+                        if matches!(tool, WorkspaceTool::PixelBrush) && size_resp.changed() {
+                            document.brush.size = document.brush.size.round().max(1.0);
+                            document.brush.shape = BrushShape::Square;
+                            document.brush.hardness = 1.0;
+                        }
                         ui.label(theme::label_dim("Density"));
                         ui.add(
                             egui::Slider::new(&mut document.brush.density, 0.0..=1.0)
@@ -3579,6 +4058,7 @@ pub fn options_bar(
                     }
                     WorkspaceTool::Lasso
                     | WorkspaceTool::SelectRect
+                    | WorkspaceTool::SelectEllipse
                     | WorkspaceTool::Move
                     | WorkspaceTool::Transform
                     | WorkspaceTool::Warp => {
@@ -3721,6 +4201,20 @@ pub fn layers_panel(
         if layer_tool_btn(ui, ToolIcon::TransferDown, "Transfer down").clicked() {
             let _ = document.transfer_down();
             canvas.invalidate_layer_thumbs();
+        }
+        if layer_tool_btn(ui, ToolIcon::LayerUp, "Move layer up").clicked() {
+            let i = document.active_layer;
+            if i + 1 < document.layers.len() {
+                document.move_layer(i, i + 1);
+                canvas.invalidate_layer_thumbs();
+            }
+        }
+        if layer_tool_btn(ui, ToolIcon::LayerDown, "Move layer down").clicked() {
+            let i = document.active_layer;
+            if i > 0 {
+                document.move_layer(i, i - 1);
+                canvas.invalidate_layer_thumbs();
+            }
         }
         if layer_tool_btn(ui, ToolIcon::Clear, "Clear layer content").clicked() {
             document.clear_active_layer();

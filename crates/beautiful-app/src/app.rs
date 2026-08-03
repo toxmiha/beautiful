@@ -73,6 +73,10 @@ pub struct BeautifulApp {
     spam_repaint_left: u32,
     /// Blender-style autosave + crash recovery.
     autosave: AutosaveState,
+    /// Discord Rich Presence worker.
+    discord: crate::discord_rpc::DiscordRpc,
+    /// Seconds since last Discord activity push.
+    discord_tick: f32,
 }
 
 impl BeautifulApp {
@@ -100,6 +104,11 @@ impl BeautifulApp {
         let mut autosave = AutosaveState::default();
         autosave.boot(&settings);
 
+        let discord = crate::discord_rpc::DiscordRpc::start(
+            settings.discord_rpc_enabled,
+            settings.discord_client_id.clone(),
+        );
+
         let mut document = Document::new(2000, 1500);
         document.set_undo_max_steps(settings.undo_max_steps);
         let color_state = ColorState::from_rgba(document.brush.color);
@@ -117,7 +126,7 @@ impl BeautifulApp {
             dock: DockLayout::load(),
             dock_dirty: false,
             tool: WorkspaceTool::Brush,
-            tool_pages: ToolPages::default(),
+            tool_pages: ToolPages::load(),
             brush_panel: BrushPanelUi::default(),
             filters: FilterUiState::default(),
             resources: ResourceStats::default(),
@@ -141,6 +150,8 @@ impl BeautifulApp {
             perf_ui_open: false,
             spam_repaint_left: 0,
             autosave,
+            discord,
+            discord_tick: 0.0,
         }
     }
 
@@ -276,17 +287,15 @@ impl BeautifulApp {
     /// Open native Windows file dialog to pick file(s) as new canvas tabs.
     fn open_canvas_from_dialog(&mut self) {
         let start = self.file.path.as_deref();
-        for path in native_open_paths(&self.settings.formats_enabled, start, true) {
-            self.open_as_new_canvas(&path);
-        }
+        self.file_browser
+            .open_for_canvas(&self.settings.formats_enabled, start);
     }
 
-    /// Open native Windows file dialog to pick file(s) as sheets in the current canvas.
+    /// In-app file browser: pick file(s) as sheets in the current canvas.
     fn open_sheet_from_dialog(&mut self) {
         let start = self.file.path.as_deref();
-        for path in native_open_paths(&self.settings.formats_enabled, start, true) {
-            self.open_as_new_sheet(&path);
-        }
+        self.file_browser
+            .open_for_sheet(&self.settings.formats_enabled, start);
     }
 
     fn focus_sheet_index(&mut self, idx: usize) {
@@ -1447,6 +1456,25 @@ impl eframe::App for BeautifulApp {
         }
         if prefs_apply.close {
             let _ = self.settings.save();
+            self.discord.configure(
+                self.settings.discord_rpc_enabled,
+                self.settings.discord_client_id.clone(),
+            );
+        }
+
+        // Discord Rich Presence (throttled).
+        self.discord_tick += ctx.input(|i| i.unstable_dt);
+        if self.discord_tick >= 5.0 {
+            self.discord_tick = 0.0;
+            if self.settings.discord_rpc_enabled {
+                let w = self.document.width;
+                let h = self.document.height;
+                let layers = self.document.layers.len();
+                let title = self.open_canvases.active().title.clone();
+                let details = format!("{title} · {w}×{h}");
+                let state = format!("{:?} · {layers} layers", self.tool);
+                self.discord.set_activity(details, state);
+            }
         }
 
         if self.screen == AppScreen::Gallery {
@@ -1857,6 +1885,7 @@ impl eframe::App for BeautifulApp {
 
         if self.dock_dirty {
             self.dock.save();
+            self.tool_pages.save();
             self.dock_dirty = false;
         }
         crate::perf::set_frame_meta(crate::perf::FrameMeta {
@@ -1875,9 +1904,12 @@ impl BeautifulApp {
         let name = self.file.suggested_save_name();
         let fmt = self.file.save_as_format;
         self.file.show_save_as = false;
-        if let Some(path) = native_save_path(&self.settings.formats_enabled, start, &name, fmt) {
-            self.file.save_to(&path, &mut self.document, fmt);
-        }
+        self.file_browser.open_for_save(
+            &self.settings.formats_enabled,
+            start,
+            &name,
+            fmt,
+        );
     }
 
     fn consume_file_browser(&mut self, ctx: &egui::Context) {
@@ -2842,6 +2874,7 @@ impl BeautifulApp {
 impl Drop for BeautifulApp {
     fn drop(&mut self) {
         self.dock.save();
+        self.tool_pages.save();
         self.autosave.shutdown_clean(&self.settings);
     }
 }

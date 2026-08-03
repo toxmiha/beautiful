@@ -675,6 +675,95 @@ impl Projection {
         }
     }
 
+    /// Lod box-sample of `rect` without a full-res temporary when Dense is ready.
+    /// Returns `(pixels, lod_w, lod_h)` covering `rect` when stretched.
+    pub fn extract_lod(&self, rect: DirtyRect, lod: u32) -> (Vec<u8>, u32, u32) {
+        let mut rect = rect;
+        rect.clamp_to(self.dense.width, self.dense.height);
+        let lod = lod.max(1);
+        if rect.is_empty() {
+            return (Vec::new(), 0, 0);
+        }
+        if lod == 1 {
+            return (self.extract(rect), rect.width(), rect.height());
+        }
+        let pw = ((rect.width() + lod - 1) / lod).max(1);
+        let ph = ((rect.height() + lod - 1) / lod).max(1);
+        let mut out = vec![0u8; (pw as usize) * (ph as usize) * 4];
+        if let Some(pix) = self.dense_pixels() {
+            let dw = self.dense.width as usize;
+            let dh = self.dense.height as usize;
+            let lod_u = lod as usize;
+            for py in 0..ph as usize {
+                for px in 0..pw as usize {
+                    let x0 = rect.x0 as usize + px * lod_u;
+                    let y0 = rect.y0 as usize + py * lod_u;
+                    let x1 = (x0 + lod_u).min(rect.x1 as usize).min(dw);
+                    let y1 = (y0 + lod_u).min(rect.y1 as usize).min(dh);
+                    let mut sum = [0u32; 4];
+                    let mut n = 0u32;
+                    for y in y0..y1 {
+                        let row = y * dw * 4;
+                        for x in x0..x1 {
+                            let i = row + x * 4;
+                            if i + 4 <= pix.len() {
+                                sum[0] += pix[i] as u32;
+                                sum[1] += pix[i + 1] as u32;
+                                sum[2] += pix[i + 2] as u32;
+                                sum[3] += pix[i + 3] as u32;
+                                n += 1;
+                            }
+                        }
+                    }
+                    let di = (py * pw as usize + px) * 4;
+                    if n > 0 {
+                        out[di] = (sum[0] / n) as u8;
+                        out[di + 1] = (sum[1] / n) as u8;
+                        out[di + 2] = (sum[2] / n) as u8;
+                        out[di + 3] = (sum[3] / n) as u8;
+                    }
+                }
+            }
+            return (out, pw, ph);
+        }
+        // ROI / no dense: extract then box-downsample.
+        let full = self.extract(rect);
+        let sw = rect.width() as usize;
+        let sh = rect.height() as usize;
+        let lod_u = lod as usize;
+        for py in 0..ph as usize {
+            for px in 0..pw as usize {
+                let x0 = px * lod_u;
+                let y0 = py * lod_u;
+                let x1 = (x0 + lod_u).min(sw);
+                let y1 = (y0 + lod_u).min(sh);
+                let mut sum = [0u32; 4];
+                let mut n = 0u32;
+                for y in y0..y1 {
+                    let row = y * sw * 4;
+                    for x in x0..x1 {
+                        let i = row + x * 4;
+                        if i + 4 <= full.len() {
+                            sum[0] += full[i] as u32;
+                            sum[1] += full[i + 1] as u32;
+                            sum[2] += full[i + 2] as u32;
+                            sum[3] += full[i + 3] as u32;
+                            n += 1;
+                        }
+                    }
+                }
+                let di = (py * pw as usize + px) * 4;
+                if n > 0 {
+                    out[di] = (sum[0] / n) as u8;
+                    out[di + 1] = (sum[1] / n) as u8;
+                    out[di + 2] = (sum[2] / n) as u8;
+                    out[di + 3] = (sum[3] / n) as u8;
+                }
+            }
+        }
+        (out, pw, ph)
+    }
+
     fn extract_roi(&self, rect: DirtyRect) -> Vec<u8> {
         let w = rect.width() as usize;
         let h = rect.height() as usize;

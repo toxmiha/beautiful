@@ -32,7 +32,8 @@ pub const PIPELINE_SPANS: &[&str] = &[
     "frame.top_menu",
     "frame.options_bar",
     "frame.bottom_bar",
-    "gpu.rebuild_from_layers",
+    "gpu.mip_view",
+    "gpu.mip_dirty",
     "gpu.upload_full",
     "gpu.upload_partial",
     "proj.expose_view",
@@ -47,12 +48,12 @@ pub const PIPELINE_COUNTERS: &[&str] = &[
     "count.dirty_parts",
     "count.offscreen_parts",
     "count.pending_frames",
-    "count.rebuild_from_layers",
+    "count.mip_view",
+    "count.mip_cover_miss",
     "count.upload_full",
     "count.upload_partial",
     "count.expose_view",
     "count.mip_dirty",
-    "count.mip_dirty_from_layers",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

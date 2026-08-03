@@ -93,6 +93,14 @@ pub struct Document {
     /// Opacity/blend/clip: same sandwich path (plates keyed by content_revision).
     #[serde(skip)]
     property_fast_idx: Option<usize>,
+    /// Free Transform / Move: sandwich plates + floating middle (PS/CSP-style live).
+    #[serde(skip)]
+    transform_sandwich_idx: Option<usize>,
+    /// Soft Light GPU underlay: omit non-Normal above only (Normals/opacity stay).
+    /// Soft Light CPU: leave false so Soft Light + Normal stay in underlay (SAI);
+    /// live overlay corrects Soft Light∩float only.
+    #[serde(skip)]
+    pub transform_omit_blend_above: bool,
     /// Bumped on pixel/structure/opacity edits — not on pure visibility toggles.
     #[serde(skip)]
     edit_gen: u64,
@@ -152,6 +160,8 @@ impl Document {
             visibility_expose_idx: None,
             visibility_applied_view: DirtyRect::empty(),
             property_fast_idx: None,
+            transform_sandwich_idx: None,
+            transform_omit_blend_above: false,
             edit_gen: 0,
             history: History::default(),
             op_journal: DocOpJournal::default(),
@@ -1168,12 +1178,285 @@ impl Document {
         }
     }
 
+    /// Display-only dirty for transform sandwich — does not bump `content_revision`
+    /// (keeps below/above plates warm) and avoids op-journal / offscreen blowup.
+    pub fn touch_transform_display(&mut self, old: Option<DirtyRect>) {
+        let pad = 8u32;
+        if let Some(mut old) = old {
+            old = old.padded(pad, self.width, self.height);
+            old.clamp_to(self.width, self.height);
+            if !old.is_empty() {
+                self.composite.mark_dirty(old);
+            }
+        }
+        if let Some(mut new) = self.floating_selection_dirty_rect() {
+            new = new.padded(pad, self.width, self.height);
+            new.clamp_to(self.width, self.height);
+            if !new.is_empty() {
+                self.composite.mark_dirty(new);
+            }
+        }
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Enable PS/CSP-style live transform: warm sandwich plates, floating in middle.
+    pub fn begin_transform_sandwich(&mut self, layer_idx: usize) {
+        let idx = layer_idx.min(self.layers.len().saturating_sub(1));
+        self.transform_sandwich_idx = Some(idx);
+        // Lift punched a hole — must rebuild plates (same content_revision would
+        // otherwise reuse a pre-hole cache → ghost remnant).
+        self.bump_content();
+        self.composite.force_full = false;
+        let mut roi = self
+            .floating_selection_dirty_rect()
+            .unwrap_or_else(|| DirtyRect::full(self.width, self.height));
+        roi = roi.padded(256, self.width, self.height);
+        roi.clamp_to(self.width, self.height);
+        self.composite.ensure_for_view(roi, 0);
+        self.visibility_backdrop.ensure(
+            self.width,
+            self.height,
+            self.background,
+            &self.layers,
+            idx,
+            self.content_revision,
+            roi,
+        );
+        // Seed dirty so first frame paints hole+floating via sandwich.
+        if let Some(fr) = self.floating_selection_dirty_rect() {
+            self.composite.mark_dirty(fr.padded(16, self.width, self.height));
+        }
+    }
+
+    pub fn end_transform_sandwich(&mut self) {
+        self.transform_sandwich_idx = None;
+    }
+
+    /// Drop transform plate buffers (below/above/on/off) after Apply/Cancel.
+    pub fn release_transform_plates(&mut self) {
+        self.visibility_backdrop.release_transform_plates();
+    }
+
+    /// Soft Light transform: arm sandwich idx without bumping content_revision.
+    pub fn arm_transform_sandwich_idx(&mut self, layer_idx: usize) {
+        let idx = layer_idx.min(self.layers.len().saturating_sub(1));
+        if self.layers.is_empty() || self.layers[idx].is_folder {
+            return;
+        }
+        self.transform_sandwich_idx = Some(idx);
+    }
+
+    pub fn transform_sandwich_active(&self) -> bool {
+        self.transform_sandwich_idx.is_some() && self.selection.floating.is_some()
+    }
+
+    /// Normal/src-over above only — safe for transparent egui above plate.
+    pub fn transform_overlay_ok(&self) -> bool {
+        let idx = self
+            .selection
+            .floating_layer
+            .unwrap_or(self.active_layer)
+            .min(self.layers.len().saturating_sub(1));
+        crate::visibility_cache::VisibilityBackdrop::transform_overlay_above_ok(
+            &self.layers,
+            idx,
+        )
+    }
+
+    /// Soft/Hard Light (etc.) above the transform slot — need backdrop-aware bake.
+    pub fn transform_above_needs_backdrop(&self) -> bool {
+        !self.transform_overlay_ok()
+            && self.selection.floating_overlay_only
+            && self.selection.floating.is_some()
+    }
+
+    /// Floating layer itself has non-Normal blend — egui src-over preview is wrong.
+    pub fn transform_float_needs_backdrop(&self) -> bool {
+        self.selection.floating_overlay_only
+            && self.selection.floating.is_some()
+            && self.floating_transform_blend_mode() != crate::layer::BlendMode::Normal
+    }
+
+    /// Live InStack overlay needed (above Soft Light and/or float own blend).
+    pub fn transform_live_blend_needed(&self) -> bool {
+        self.transform_above_needs_backdrop() || self.transform_float_needs_backdrop()
+    }
+
+    /// Live Soft Light work rect: float OBB ∩ union(above contributing bounds).
+    /// Empty → no live bake needed (above blend doesn't touch the float).
+    pub fn transform_above_live_work_rect(&self, float_roi: DirtyRect) -> Option<DirtyRect> {
+        let idx = self
+            .selection
+            .floating_layer
+            .unwrap_or(self.active_layer)
+            .min(self.layers.len().saturating_sub(1));
+        crate::visibility_cache::VisibilityBackdrop::above_blend_work_rect(
+            &self.layers,
+            idx,
+            float_roi,
+            self.width,
+            self.height,
+        )
+    }
+
+    /// Opacity of the floating transform layer (folder ancestors included).
+    pub fn floating_transform_opacity(&self) -> f32 {
+        let idx = self
+            .selection
+            .floating_layer
+            .unwrap_or(self.active_layer)
+            .min(self.layers.len().saturating_sub(1));
+        let Some(layer) = self.layers.get(idx) else {
+            return 1.0;
+        };
+        (layer.opacity.clamp(0.0, 1.0)
+            * crate::layer::ancestor_folder_opacity(&self.layers, idx))
+        .clamp(0.0, 1.0)
+    }
+
+    /// Effective blend mode of the floating transform layer.
+    pub fn floating_transform_blend_mode(&self) -> crate::layer::BlendMode {
+        let idx = self
+            .selection
+            .floating_layer
+            .unwrap_or(self.active_layer)
+            .min(self.layers.len().saturating_sub(1));
+        crate::layer::effective_blend_mode(&self.layers, idx)
+    }
+
+    /// Blend layers above the float slot onto packed `pixels` for `rect`
+    /// (`pixels` length = rect.w * rect.h * 4). Soft/Hard Light see real backdrop.
+    pub fn bake_transform_above_on_backdrop(&self, pixels: &mut [u8], rect: DirtyRect) {
+        let mut rect = rect;
+        rect.clamp_to(self.width, self.height);
+        if rect.is_empty() {
+            return;
+        }
+        let w = rect.width();
+        let need = (w as usize)
+            .saturating_mul(rect.height() as usize)
+            .saturating_mul(4);
+        if pixels.len() < need {
+            return;
+        }
+        let idx = self
+            .selection
+            .floating_layer
+            .unwrap_or(self.active_layer)
+            .min(self.layers.len().saturating_sub(1));
+        crate::visibility_cache::VisibilityBackdrop::blend_above_into(
+            pixels,
+            w,
+            rect.x0,
+            rect.y0,
+            self.width,
+            self.height,
+            &self.layers,
+            idx,
+            rect,
+        );
+    }
+
+    /// Lod Soft/Hard Light bake — O(lod_pixels), not O(full_rect).
+    /// `pixels` is `lod_w * lod_h * 4` covering `rect` when stretched.
+    pub fn bake_transform_above_on_backdrop_lod(
+        &self,
+        pixels: &mut [u8],
+        rect: DirtyRect,
+        lod_w: u32,
+        lod_h: u32,
+        lod: u32,
+    ) {
+        let mut rect = rect;
+        rect.clamp_to(self.width, self.height);
+        if rect.is_empty() || lod_w == 0 || lod_h == 0 {
+            return;
+        }
+        let need = (lod_w as usize)
+            .saturating_mul(lod_h as usize)
+            .saturating_mul(4);
+        if pixels.len() < need {
+            return;
+        }
+        let idx = self
+            .selection
+            .floating_layer
+            .unwrap_or(self.active_layer)
+            .min(self.layers.len().saturating_sub(1));
+        crate::visibility_cache::VisibilityBackdrop::blend_above_into_lod(
+            pixels,
+            lod_w,
+            lod_h,
+            rect.x0,
+            rect.y0,
+            lod.max(1),
+            self.width,
+            self.height,
+            &self.layers,
+            idx,
+        );
+    }
+
+    /// Blit an arbitrary RGBA rect into packed `pixels` for `rect` (doc-space).
+    pub fn blit_rgba_into_packed(
+        &self,
+        pixels: &mut [u8],
+        rect: DirtyRect,
+        src: &[u8],
+        sw: u32,
+        sh: u32,
+        x: f32,
+        y: f32,
+    ) {
+        let mut rect = rect;
+        rect.clamp_to(self.width, self.height);
+        if rect.is_empty() || sw == 0 || sh == 0 {
+            return;
+        }
+        let w = rect.width() as usize;
+        let blit = crate::composite::FloatingBlit {
+            pixels: src,
+            width: sw,
+            height: sh,
+            x,
+            y,
+            layer_idx: 0,
+        };
+        for yrow in rect.y0..rect.y1 {
+            let row = ((yrow - rect.y0) as usize) * w * 4;
+            let span = &mut pixels[row..row + w * 4];
+            crate::composite::blit_floating_into_span(
+                span,
+                rect.x0 as usize,
+                rect.x1 as usize,
+                yrow as usize,
+                blit,
+            );
+        }
+    }
+
+    /// Blit current floating selection into packed RGBA for `rect`.
+    pub fn blit_floating_into_packed(&self, pixels: &mut [u8], rect: DirtyRect) {
+        let Some(f) = self.selection.floating.as_ref() else {
+            return;
+        };
+        self.blit_rgba_into_packed(pixels, rect, &f.pixels, f.width, f.height, f.x, f.y);
+    }
+
     pub fn move_floating_selection(&mut self, dx: f32, dy: f32) {
         let Some(old) = self.floating_selection_dirty_rect() else {
             return;
         };
         self.selection.move_floating(dx, dy);
-        self.invalidate_floating_change(Some(old));
+        // Overlay-only live transform: underlay frozen, pose drawn by egui — no dirty.
+        if self.selection.floating_overlay_only {
+            return;
+        }
+        if self.transform_sandwich_idx.is_some() {
+            self.touch_transform_display(Some(old));
+        } else {
+            self.invalidate_floating_change(Some(old));
+        }
     }
 
     pub fn active_layer_mut(&mut self) -> &mut Layer {
@@ -1826,6 +2109,55 @@ impl Document {
         let mut view_p = view.padded(view_pad, self.width, self.height);
         view_p.clamp_to(self.width, self.height);
 
+        // Free Transform overlay: underlay = below + holed active.
+        // Soft Light CPU: Soft Light + Normal/opacity stay in underlay (outside float
+        // correct); live Soft Light∩float overlay. Soft Light GPU sets
+        // `transform_omit_blend_above` to omit Soft Light only.
+        if self.selection.floating_overlay_only && self.selection.floating.is_some() {
+            if self.composite.force_full || self.composite.has_cpu_dirty() {
+                if self.try_sync_transform_underlay(view_p) {
+                    // Full-upload the holed underlay so no pre-lift tile survives on GPU.
+                    let _ = self.composite.take_gpu_dirty();
+                    return SyncResult {
+                        full_upload: true,
+                        partial: None,
+                        partials: Vec::new(),
+                    };
+                }
+            }
+            // Underlay already in dense — never fall through to a normal composite
+            // (that would bake layers-above back into the plate). LOD/mip may still
+            // rebuild from dense in the GPU path.
+            return SyncResult {
+                full_upload: false,
+                partial: None,
+                partials: Vec::new(),
+            };
+        }
+
+        // Free Transform / Move live: sandwich only when NOT using overlay-only
+        // (gradient-style path skips composite entirely during drag).
+        if self.transform_sandwich_idx.is_some()
+            && self.selection.floating.is_some()
+            && !self.selection.floating_overlay_only
+            && self.try_sync_transform_sandwich(view_p)
+        {
+            let partial = self.composite.take_gpu_dirty();
+            return if partial.is_empty() {
+                SyncResult {
+                    full_upload: false,
+                    partial: None,
+                    partials: Vec::new(),
+                }
+            } else {
+                SyncResult {
+                    full_upload: false,
+                    partial: Some(partial),
+                    partials: Vec::new(),
+                }
+            };
+        }
+
         // Eye / opacity / blend sandwich: plates keyed by content_revision.
         let sandwich_idx = self.visibility_fast_idx.or(self.property_fast_idx);
         if self.selection.floating.is_none()
@@ -1835,7 +2167,8 @@ impl Document {
             self.property_fast_idx = None;
             let partial = self.composite.take_gpu_dirty();
             // Never promote sandwich dirty to full_upload — even when the rect
-            // spans the whole document. full_upload forces rebuild_from_layers
+            // spans the whole document. full_upload at lod>1 clears mip coverage and
+            // refills the padded view (near-full miss may still call rebuild_from_layers).
             // at lod>1 (~200ms) and was the eye-spam / opacity CPU spike.
             return if partial.is_empty() {
                 SyncResult {
@@ -1858,19 +2191,266 @@ impl Document {
             .floating_layer
             .unwrap_or(self.active_layer)
             .min(self.layers.len().saturating_sub(1));
-        let floating_ref = floating.as_ref().map(|f| crate::composite::FloatingBlit {
+        // Overlay live path: never blit floating into the stack (egui draws it).
+        let floating_ref = if self.selection.floating_overlay_only {
+            None
+        } else {
+            floating.as_ref().map(|f| crate::composite::FloatingBlit {
+                pixels: f.pixels.as_slice(),
+                width: f.width,
+                height: f.height,
+                x: f.x,
+                y: f.y,
+                layer_idx,
+            })
+        };
+        let result =
+            self.composite
+                .sync_for_view(self.background, &self.layers, floating_ref, view, view_pad);
+        self.selection.floating = floating;
+        result
+    }
+
+    /// Above-plate pixels for Free Transform overlay (doc ROI + plate_gen).
+    pub fn transform_above_plate(&self) -> Option<(&[u8], u32, u32, u32, u32, u64)> {
+        self.visibility_backdrop.above_plate()
+    }
+
+    /// Overlay underlay: composite below + holed active only (layers above hidden).
+    /// Above is painted in egui after the live float. Uses the normal composite path
+    /// so the lift hole is reliable (sandwich apply_underlay left stale GPU ghosts).
+    fn try_sync_transform_underlay(&mut self, view: DirtyRect) -> bool {
+        let idx = self
+            .selection
+            .floating_layer
+            .unwrap_or(self.active_layer)
+            .min(self.layers.len().saturating_sub(1));
+        if idx >= self.layers.len() || self.layers[idx].is_folder {
+            return false;
+        }
+
+        // First arm (`force_full`): rebuild the *entire* document underlay.
+        // Viewport-only sync + clearing offscreen left pre-lift tiles in the dense
+        // buffer — zoom/pan/LOD then showed seams, ghosts, and "washed" halves.
+        let full = DirtyRect::full(self.width, self.height);
+        let full_pass = self.composite.force_full;
+        let sync_clip = if full_pass { full } else { view };
+        if sync_clip.is_empty() {
+            return false;
+        }
+
+        // Above plate must cover at least the sync region (full doc on first arm).
+        let plate_view = if full_pass {
+            full
+        } else {
+            view.padded(256, self.width, self.height)
+        };
+        self.visibility_backdrop.ensure_transform_plates(
+            self.width,
+            self.height,
+            self.background,
+            &self.layers,
+            idx,
+            self.content_revision,
+            plate_view,
+        );
+
+        // Soft/Hard above: omit from underlay (Path B GPU restores Soft∪float; Path C Soft
+        // vanishes Instant Preview — never Soft-under-float via egui).
+        let mut omit: Vec<usize> = Vec::new();
+        if self.transform_above_needs_backdrop() {
+            if self.transform_omit_blend_above {
+                for i in (idx + 1)..self.layers.len() {
+                    let layer = &self.layers[i];
+                    if !layer.visible || layer.is_folder {
+                        continue;
+                    }
+                    let opacity = (layer.opacity.clamp(0.0, 1.0)
+                        * crate::ancestor_folder_opacity(&self.layers, i))
+                    .clamp(0.0, 1.0);
+                    if opacity <= 0.0 {
+                        continue;
+                    }
+                    if layer.content_bounds().is_some_and(|b| !b.is_empty()) {
+                        omit.push(i);
+                    }
+                }
+            }
+        } else {
+            for i in (idx + 1)..self.layers.len() {
+                if self.layers[i].visible {
+                    omit.push(i);
+                }
+            }
+        }
+        let _omit_guard = crate::omit_above::OmitAboveGuard::install(omit);
+
+        // Exclude floating — underlay must show the punched hole only.
+        let floating = self.selection.floating.take();
+        let _sync = if full_pass {
+            // Full document — every tile becomes underlay (below + hole).
+            self.composite.sync_for_view(
+                self.background,
+                &self.layers,
+                None,
+                full,
+                0,
+            )
+        } else {
+            self.composite.sync_for_view(
+                self.background,
+                &self.layers,
+                None,
+                sync_clip,
+                64,
+            )
+        };
+        self.selection.floating = floating;
+        // OmitAboveGuard drops here — clear TLS.
+
+        if full_pass {
+            // Full pass already drained dirty; never keep pre-lift scraps.
+            self.composite.offscreen_dirty.clear();
+        }
+        true
+    }
+
+    /// Expand/rebuild the transform above plate when the view pans/zooms past it.
+    pub fn ensure_transform_above_for_view(&mut self, view: DirtyRect) {
+        if !self.selection.floating_overlay_only || self.selection.floating.is_none() {
+            return;
+        }
+        let idx = self
+            .selection
+            .floating_layer
+            .unwrap_or(self.active_layer)
+            .min(self.layers.len().saturating_sub(1));
+        if idx >= self.layers.len() || self.layers[idx].is_folder {
+            return;
+        }
+        let mut plate_view = view.padded(256, self.width, self.height);
+        plate_view.clamp_to(self.width, self.height);
+        if plate_view.is_empty() {
+            return;
+        }
+        self.visibility_backdrop.ensure_transform_plates(
+            self.width,
+            self.height,
+            self.background,
+            &self.layers,
+            idx,
+            self.content_revision,
+            plate_view,
+        );
+    }
+
+    /// Live Free Transform sandwich over `view` (plates + floating middle).
+    fn try_sync_transform_sandwich(&mut self, view: DirtyRect) -> bool {
+        let Some(idx) = self.transform_sandwich_idx else {
+            return false;
+        };
+        if idx >= self.layers.len() || self.layers[idx].is_folder {
+            return false;
+        }
+        if self.selection.floating.is_none() {
+            return false;
+        }
+        // Never fall back to full-doc force_full during live transform — that was
+        // the F12 melt (composite 150–350ms/frame). Clear and stay on sandwich.
+        if self.composite.force_full {
+            self.composite.force_full = false;
+        }
+
+        let mut apply = DirtyRect::empty();
+        if !self.composite.dirty.is_empty() {
+            apply.union(self.composite.dirty.intersect(view));
+        }
+        for r in &self.composite.dirty_parts {
+            let hit = r.intersect(view);
+            if !hit.is_empty() {
+                apply.union(hit);
+            }
+        }
+        if apply.is_empty() {
+            if let Some(fr) = self.floating_selection_dirty_rect() {
+                apply = fr.intersect(view);
+            }
+        }
+        apply.clamp_to(self.width, self.height);
+        if apply.is_empty() {
+            return false;
+        }
+
+        // Plates cover the dirty OBB only — NOT the whole viewport.
+        // Keep pad tight: Soft Light transform updates old∪new float every move;
+        // 256px pad was rebuilding huge plates and killing FPS (unlike SAI local dirty).
+        let pad = if apply.width().saturating_mul(apply.height()) > 1_000_000 {
+            64
+        } else {
+            32
+        };
+        let plate_view = apply.padded(pad, self.width, self.height);
+        self.composite.ensure_for_view(plate_view, 0);
+        self.visibility_backdrop.ensure(
+            self.width,
+            self.height,
+            self.background,
+            &self.layers,
+            idx,
+            self.content_revision,
+            plate_view,
+        );
+        if !self
+            .visibility_backdrop
+            .matches(idx, self.content_revision, self.width, self.height)
+        {
+            return false;
+        }
+
+        let layer_idx = self
+            .selection
+            .floating_layer
+            .unwrap_or(idx)
+            .min(self.layers.len().saturating_sub(1));
+        let floating = self.selection.floating.take();
+        let Some(f) = floating.as_ref() else {
+            self.selection.floating = floating;
+            return false;
+        };
+        let blit = crate::composite::FloatingBlit {
             pixels: f.pixels.as_slice(),
             width: f.width,
             height: f.height,
             x: f.x,
             y: f.y,
             layer_idx,
-        });
-        let result =
-            self.composite
-                .sync_for_view(self.background, &self.layers, floating_ref, view, view_pad);
+        };
+        let wrote = {
+            let Some(target) = self.composite.display_write_target() else {
+                self.selection.floating = floating;
+                return false;
+            };
+            self.visibility_backdrop.apply_with_floating(
+                target.pixels,
+                target.stride_w,
+                target.origin_x,
+                target.origin_y,
+                &self.layers,
+                apply,
+                blit,
+            )
+        };
         self.selection.floating = floating;
-        result
+        if !wrote {
+            return false;
+        }
+
+        // Viewport-only: drop offscreen backlog (was sticky CPU + desync).
+        self.composite.dirty = DirtyRect::empty();
+        self.composite.dirty_parts.clear();
+        self.composite.offscreen_dirty.clear();
+        self.composite.gpu_dirty.union(apply);
+        true
     }
 
     /// Sandwich apply for one non-folder layer over `view` (eye or property change).
@@ -1998,6 +2578,9 @@ impl Document {
 
     /// Floating overlay for compositors (in-stack at `floating_layer` / active).
     pub fn floating_blit(&self) -> Option<crate::composite::FloatingBlit<'_>> {
+        if self.selection.floating_overlay_only {
+            return None;
+        }
         let f = self.selection.floating.as_ref()?;
         let layer_idx = self
             .selection

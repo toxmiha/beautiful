@@ -88,6 +88,35 @@ pub fn show(ctx: &egui::Context, open: &mut bool) {
                     .small()
                     .weak(),
                 );
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Canvas debug").small().strong());
+                    let tile_on = crate::debug_flags::show_tile_debug();
+                    if ui
+                        .selectable_label(
+                            tile_on,
+                            if tile_on { "Tile debug ON" } else { "Tile debug" },
+                        )
+                        .on_hover_text(
+                            "Occupied 64px tiles (active layer) + composite dirty parts",
+                        )
+                        .clicked()
+                    {
+                        crate::debug_flags::toggle_show_tile_debug();
+                    }
+                    let lod_on = crate::debug_flags::show_lod_debug();
+                    if ui
+                        .selectable_label(
+                            lod_on,
+                            if lod_on { "LOD / mip ON" } else { "LOD / mip" },
+                        )
+                        .on_hover_text(
+                            "cyan=cover ok · red=gap · amber=view · thin amber=pad · yellow=mip texels",
+                        )
+                        .clicked()
+                    {
+                        crate::debug_flags::toggle_show_lod_debug();
+                    }
+                });
                 ui.separator();
 
                 // Frame timeline

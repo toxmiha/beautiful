@@ -249,21 +249,25 @@ pub fn lod_factor_for_zoom_hysteresis(zoom: f32, current: u32) -> u32 {
     if current == 0 || current == target {
         return target;
     }
+    // Thresholds are keyed by *current* LOD:
+    // - up_need[current]: zoom must rise above this to sharpen (leave a coarse LOD)
+    // - down_need[current]: zoom must fall below this to coarsen (leave a fine LOD)
+    // Keep a wide gap vs raw boundaries (0.55/0.28/0.14/…) so size-adjusted zoom on
+    // ~3K docs does not thrash 1↔2 every wheel notch.
     let up_need = match current {
-        // Prefer sharper sooner when zooming in (was 0.65 — felt soft until click).
-        1 => 0.58,
-        2 => 0.28,
-        4 => 0.14,
-        8 => 0.07,
-        16 => 0.035,
-        _ => 0.0,
+        2 => 0.70,
+        4 => 0.40,
+        8 => 0.20,
+        16 => 0.10,
+        32 => 0.05,
+        _ => 0.0, // already at 1 or unknown — unused when sharpening
     };
     let down_need = match current {
-        1 => 0.52,
-        2 => 0.24,
-        4 => 0.12,
-        8 => 0.06,
-        16 => 0.03,
+        1 => 0.42,
+        2 => 0.18,
+        4 => 0.09,
+        8 => 0.045,
+        16 => 0.022,
         _ => 0.0,
     };
     if target > current {
@@ -292,18 +296,25 @@ pub fn lod_factor_for_document(zoom: f32, current: u32, doc_w: u32, doc_h: u32) 
 
 /// Which LOD factor to show on screen.
 ///
-/// Paint-app policy (not a timer hack):
-/// - **Sharper** (`want < current`): always take `want` in one jump — fast zoom-in
-///   must not stay on a soft mip until the wheel stops.
-/// - **Coarser** (`want > current`): only when `allow_coarsen` (zoom gesture idle),
-///   so wheel thrash does not rebuild 4K every notch.
+/// Asymmetric paint-app policy (evidence: F12 + action log 2026-08-02):
+/// - **Sharpen** (`want < current`): always one octave per call — holding a
+///   coarse plate through a fast zoom-in reads as "shakal"; jumping `8→1` in
+///   one frame paid ~250–330ms, so we still step.
+/// - **Coarsen** (`want > current`): only when `allow_coarsen` (zoom gesture
+///   idle). Keeping a fine plate while zooming out is cheap minify and looks
+///   correct; deferring the rebuild avoids mid-gesture hitch.
 pub fn resolve_display_lod(current: u32, want: u32, allow_coarsen: bool) -> u32 {
     let cur = current.max(1);
     let want = want.max(1);
+    if cur == want {
+        return cur;
+    }
     if want < cur {
-        want
-    } else if want > cur && allow_coarsen {
-        want
+        // Sharpen one power-of-two step (8→4→2→1).
+        (cur / 2).max(want).max(1)
+    } else if allow_coarsen {
+        // Coarsen one step (1→2→4→8…).
+        cur.saturating_mul(2).min(want).max(2)
     } else {
         cur
     }
@@ -341,6 +352,35 @@ impl DisplayMip {
         self.coverage.covers_rect(need)
     }
 
+    /// Coverage grid size in document-tile cells (for debug overlays).
+    pub fn coverage_dims(&self) -> (u32, u32) {
+        (self.coverage.tiles_x, self.coverage.tiles_y)
+    }
+
+    /// Number of document tiles currently marked covered in the hybrid mip.
+    pub fn covered_tile_count(&self) -> usize {
+        let mut n = 0usize;
+        for ty in 0..self.coverage.tiles_y {
+            for tx in 0..self.coverage.tiles_x {
+                if self.coverage.get(tx, ty) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// Visit each covered document tile `(tx, ty)` in coverage space.
+    pub fn for_each_covered_tile(&self, mut f: impl FnMut(u32, u32)) {
+        for ty in 0..self.coverage.tiles_y {
+            for tx in 0..self.coverage.tiles_x {
+                if self.coverage.get(tx, ty) {
+                    f(tx, ty);
+                }
+            }
+        }
+    }
+
     fn mark_coverage(&mut self, rect: DirtyRect) {
         self.coverage.mark_rect(rect);
     }
@@ -373,6 +413,7 @@ impl DisplayMip {
     }
 
     /// Rebuild entire mip from full-res composite (unmultiplied RGBA8).
+    #[cfg(test)]
     pub fn rebuild_full(&mut self, src: &[u8], doc_w: u32, doc_h: u32, factor: u32) {
         self.ensure_size(doc_w, doc_h, factor);
         if factor <= 1 {
@@ -451,15 +492,27 @@ impl DisplayMip {
 
         let cover_area = (cover.width() as u64).saturating_mul(cover.height() as u64);
         let doc_area = (doc_w as u64).saturating_mul(doc_h as u64).max(1);
-        let missing = self.coverage.uncovered_rects(cover, doc_w, doc_h);
+        let mut missing = self.coverage.uncovered_rects(cover, doc_w, doc_h);
         let mut miss_area = 0u64;
         for p in &missing {
             miss_area = miss_area
                 .saturating_add((p.width() as u64).saturating_mul(p.height() as u64));
         }
         if miss_area == 0 {
-            // Bitset already claims cover (race with tile rounding) — trust covers.
-            return DirtyRect::empty();
+            // covers_rect said "no" but uncovered_rects found nothing (tile rounding).
+            // Do not trust the bitset — force the whole cover as one hole.
+            let f = factor.max(1);
+            let aligned = DirtyRect {
+                x0: (cover.x0 / f) * f,
+                y0: (cover.y0 / f) * f,
+                x1: ((cover.x1 + f - 1) / f * f).min(doc_w),
+                y1: ((cover.y1 + f - 1) / f * f).min(doc_h),
+            };
+            if aligned.is_empty() {
+                return DirtyRect::empty();
+            }
+            missing = vec![aligned];
+            miss_area = (aligned.width() as u64).saturating_mul(aligned.height() as u64);
         }
         // Near-full document: one full rebuild is cheaper than many tile runs.
         if (self.coverage.is_empty()
@@ -678,6 +731,7 @@ impl DisplayMip {
     }
 }
 
+#[cfg(test)]
 fn downsample_box(
     src: &[u8],
     doc_w: u32,
@@ -938,21 +992,34 @@ mod tests {
 
     #[test]
     fn lod_hysteresis_avoids_thrash() {
-        let z = 0.60;
-        let a = lod_factor_for_zoom_hysteresis(z, 1);
-        // Still on level 1 due to hysteresis (raw would be 2 at 0.60).
-        assert_eq!(a, 1);
-        let b = lod_factor_for_zoom_hysteresis(0.45, 1);
-        assert_eq!(b, 2);
+        // At 0.50 raw is still LOD2; with current=1 we stay until below down_need.
+        assert_eq!(lod_factor_for_zoom_hysteresis(0.50, 1), 1);
+        // Clearly below down_need (0.42) → leave LOD1.
+        assert_eq!(lod_factor_for_zoom_hysteresis(0.35, 1), 2);
+        // Dead zone: from LOD2, stay until clearly above up_need (0.70).
+        assert_eq!(lod_factor_for_zoom_hysteresis(0.60, 2), 2);
+        assert_eq!(lod_factor_for_zoom_hysteresis(0.72, 2), 1);
     }
 
     #[test]
-    fn resolve_display_lod_sharpens_always_coarsens_when_allowed() {
-        assert_eq!(resolve_display_lod(8, 2, false), 2);
-        assert_eq!(resolve_display_lod(8, 2, true), 2);
+    fn resolve_display_lod_asymmetric_during_gesture() {
+        // Gesture live: sharpen one octave; hold coarsen.
+        assert_eq!(resolve_display_lod(8, 1, false), 4);
+        assert_eq!(resolve_display_lod(8, 2, false), 4);
         assert_eq!(resolve_display_lod(2, 8, false), 2);
-        assert_eq!(resolve_display_lod(2, 8, true), 8);
         assert_eq!(resolve_display_lod(4, 4, false), 4);
+    }
+
+    #[test]
+    fn resolve_display_lod_steps_one_octave_when_idle() {
+        // Idle: at most one octave per call (no 8→1 / 1→8 death hitch).
+        assert_eq!(resolve_display_lod(8, 1, true), 4);
+        assert_eq!(resolve_display_lod(4, 1, true), 2);
+        assert_eq!(resolve_display_lod(2, 1, true), 1);
+        assert_eq!(resolve_display_lod(1, 8, true), 2);
+        assert_eq!(resolve_display_lod(2, 8, true), 4);
+        assert_eq!(resolve_display_lod(4, 8, true), 8);
+        assert_eq!(resolve_display_lod(2, 2, true), 2);
     }
 
     #[test]

@@ -1087,6 +1087,93 @@ fn twist_rgba(pixels: &mut [u8], w: u32, h: u32, amount: f32) {
     });
 }
 
+/// Edge darkening (or tint) toward `color`. `amount` 0..100, `softness` 0..100.
+pub fn vignette(layer: &mut Layer, amount: f32, softness: f32, color: [u8; 3]) {
+    with_rgba_buffer(layer, |px, w, h| {
+        vignette_rgba(px, w, h, amount, softness, color)
+    });
+}
+
+fn vignette_rgba(
+    pixels: &mut [u8],
+    w: u32,
+    h: u32,
+    amount: f32,
+    softness: f32,
+    color: [u8; 3],
+) {
+    let amount = (amount / 100.0).clamp(0.0, 1.0);
+    if amount < 0.001 || w == 0 || h == 0 {
+        return;
+    }
+    let soft = (softness / 100.0).clamp(0.05, 1.0);
+    let cx = (w as f32 - 1.0) * 0.5;
+    let cy = (h as f32 - 1.0) * 0.5;
+    let max_r = cx.hypot(cy).max(1.0);
+    let inner = (1.0 - soft).clamp(0.0, 0.95);
+    pixels.par_chunks_mut(4).enumerate().for_each(|(idx, px)| {
+        let x = (idx as u32 % w) as f32;
+        let y = (idx as u32 / w) as f32;
+        let r = (x - cx).hypot(y - cy) / max_r;
+        let t = ((r - inner) / (1.0 - inner).max(0.05)).clamp(0.0, 1.0);
+        let t = t * t * amount;
+        if t < 0.001 {
+            return;
+        }
+        let a = px[3] as f32 / 255.0;
+        if a < 0.001 {
+            return;
+        }
+        for c in 0..3 {
+            let src = px[c] as f32;
+            let dst = color[c] as f32;
+            px[c] = (src + (dst - src) * t).round().clamp(0.0, 255.0) as u8;
+        }
+    });
+}
+
+/// Soft glow: blur a copy and screen-blend back. Optional tint overrides glow color.
+pub fn glow(layer: &mut Layer, radius: f32, intensity: f32, color: Option<[u8; 3]>) {
+    let radius = radius.clamp(0.5, 64.0);
+    let intensity = (intensity / 100.0).clamp(0.0, 2.0);
+    if intensity < 0.001 {
+        return;
+    }
+    let padding = radius.ceil().clamp(0.0, 80.0) as u32 * 3;
+    with_content_region(layer, padding, |region| {
+        let mut glow_layer = Layer::new(String::from("glow"), region.width, region.height);
+        glow_layer.set_pixels_dense(region.pixels_dense());
+        gaussian_blur_dense(&mut glow_layer, radius, None);
+        let blurred = glow_layer.pixels_dense();
+        let mut pixels = region.pixels_dense();
+        let w = region.width;
+        let h = region.height;
+        pixels.par_chunks_mut(4).enumerate().for_each(|(idx, px)| {
+            let g = &blurred[idx * 4..idx * 4 + 4];
+            let mut gr = g[0] as f32;
+            let mut gg = g[1] as f32;
+            let mut gb = g[2] as f32;
+            let ga = g[3] as f32 / 255.0;
+            if let Some([cr, cg, cb]) = color {
+                // Tint glow by luminance of blurred RGB.
+                let lum = (0.2126 * gr + 0.7152 * gg + 0.0722 * gb) / 255.0;
+                gr = cr as f32 * lum;
+                gg = cg as f32 * lum;
+                gb = cb as f32 * lum;
+            }
+            // Screen blend scaled by intensity * glow alpha.
+            let k = (intensity * ga).clamp(0.0, 1.0);
+            for (i, src_c) in [gr, gg, gb].into_iter().enumerate() {
+                let base = px[i] as f32;
+                let screen = 255.0 - (255.0 - base) * (255.0 - src_c) / 255.0;
+                px[i] = (base + (screen - base) * k).round().clamp(0.0, 255.0) as u8;
+            }
+            let _ = (w, h);
+        });
+        region.set_pixels_dense(pixels);
+    });
+}
+
 fn warp_radial(pixels: &mut [u8], w: u32, h: u32, amount: f32, fisheye: bool) {
     if amount.abs() < 0.01 || w == 0 || h == 0 { return; }
     let src = pixels.to_vec();

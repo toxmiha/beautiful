@@ -3,8 +3,6 @@ use crate::DirtyRect;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocOpKind {
     Stroke,
-    Filter,
-    Structure,
     Other,
 }
 
@@ -35,10 +33,6 @@ impl DocOpJournal {
         seq
     }
 
-    pub fn clear(&mut self) {
-        self.ops.clear();
-    }
-
     pub fn since(&self, seq: u64) -> &[DocOp] {
         let idx = self.ops.partition_point(|op| op.seq < seq);
         &self.ops[idx..]
@@ -60,7 +54,7 @@ mod tests {
         };
 
         let a = journal.push(0, dirty, DocOpKind::Stroke);
-        let b = journal.push(0, dirty, DocOpKind::Filter);
+        let b = journal.push(0, dirty, DocOpKind::Other);
 
         assert_eq!(a, 0);
         assert_eq!(b, 1);

@@ -17,20 +17,21 @@ impl CanvasView {
         let doc_w = document.width as f32;
         let doc_h = document.height as f32;
         let transform_tool = matches!(*tool_mut, WorkspaceTool::Transform | WorkspaceTool::Warp);
-        let show_mesh = matches!(*tool_mut, WorkspaceTool::Warp)
-            || (matches!(*tool_mut, WorkspaceTool::Transform)
-                && matches!(
-                    state.transform_mode,
-                    TransformMode::Distort | TransformMode::Mesh
-                ));
         // Entering transform tools starts a Confirm/Cancel session (lifts once).
         if transform_tool && document.selection.rect.is_some() {
             let _ = state.begin_transform_session(document);
         }
-        if show_mesh {
-            if matches!(*tool_mut, WorkspaceTool::Warp) {
-                state.transform_mode = TransformMode::Mesh;
-            }
+        // Warp tool ↔ Mesh mode must bake Free/Distort pose first (never silent reset).
+        if matches!(*tool_mut, WorkspaceTool::Warp)
+            && state.transform_mode != TransformMode::Mesh
+        {
+            state.switch_transform_mode(document, tool_mut, TransformMode::Mesh);
+        }
+        if matches!(
+            state.transform_mode,
+            TransformMode::Distort | TransformMode::Mesh
+        ) || matches!(*tool_mut, WorkspaceTool::Warp)
+        {
             ensure_warp_grid(state, document);
         }
         let tool = *tool_mut;
@@ -204,6 +205,7 @@ impl CanvasView {
             tool,
             WorkspaceTool::Brush
                 | WorkspaceTool::Pencil
+                | WorkspaceTool::PixelBrush
                 | WorkspaceTool::Airbrush
                 | WorkspaceTool::Mixer
                 | WorkspaceTool::Eraser
@@ -214,6 +216,7 @@ impl CanvasView {
         let selection_tool = matches!(
             tool,
             WorkspaceTool::SelectRect
+                | WorkspaceTool::SelectEllipse
                 | WorkspaceTool::Move
                 | WorkspaceTool::Transform
                 | WorkspaceTool::Lasso
@@ -470,6 +473,7 @@ impl CanvasView {
             tool,
             WorkspaceTool::Brush
                 | WorkspaceTool::Pencil
+                | WorkspaceTool::PixelBrush
                 | WorkspaceTool::Airbrush
                 | WorkspaceTool::Mixer
                 | WorkspaceTool::Eraser
@@ -765,7 +769,7 @@ impl CanvasView {
             }
         }
 
-        let painter = ui.painter_at(viewport);
+        let painter = ui.painter_at(paint_aabb.intersect(viewport));
 
         let button_held =
             ctx.input(|i| i.pointer.button_down(PointerButton::Primary)) || state.lmb_down;
@@ -881,23 +885,38 @@ impl CanvasView {
 
         // Canvas visuals on.
         const DEBUG_DISABLE_CANVAS_DRAW: bool = false;
+        state.softlight_gpu_drew = false;
 
         // Upload + draw: Renderer reads document (single sync per frame).
         if !DEBUG_DISABLE_CANVAS_DRAW {
             if let Some(rs) = wgpu_rs {
+                state.release_transform_gpu_resources(rs, document);
                 if state.gpu_invalidate {
                     crate::canvas_gpu::invalidate(rs);
                     state.gpu_invalidate = false;
                 }
-                // Live gradient drag does not change layer pixels — skip composite/upload
-                // (renderer write lock + sync) so FPS stays high while waving handles.
-                let skip_sync = state.gradient_editing() && !state.dirty && !state.gpu_invalidate;
+                // Live gradient / Free Transform: freeze underlay, paint overlay —
+                // skip composite/upload so FPS matches Gradient tool.
+                let xform_live = state.xform_live_overlay_active(document);
+                // Never skip when LOD must change — otherwise mip tiles stay on the
+                // pre-lift plate while the underlay is frozen (zoom-dependent seams).
+                let want_lod = beautiful_core::lod_factor_for_document(
+                    state.zoom,
+                    state.display_lod,
+                    document.width,
+                    document.height,
+                );
+                let lod_pending = want_lod != state.display_lod;
+                let skip_sync = (state.gradient_editing() || xform_live)
+                    && !state.dirty
+                    && !state.gpu_invalidate
+                    && !lod_pending;
                 // Stage 2: hit-test/state still run above; no sync / GPU paint / present path.
                 let no_present = crate::debug_flags::no_canvas_present();
                 if !skip_sync && !no_present {
                     let view = state.view_dirty_rect(document);
                     let live_paint = state.is_drawing;
-                    // Sharpen anytime; coarsen only when the wheel gesture is idle.
+                    // Coarsen only after zoom gesture idle; sharpen always steps.
                     let allow_coarsen = !state.coarsen_held() && !zoom_applied;
                     let _present = crate::perf::Scope::new(
                         crate::perf::Category::Upload,
@@ -905,6 +924,12 @@ impl CanvasView {
                     );
                     let _sync =
                         crate::perf::Scope::new(crate::perf::Category::Upload, "frame.sync");
+                    // Soft/Hard above: always omit from underlay (Path B restores via GPU).
+                    // Path C without omit left Soft under egui float → transform "above" Soft.
+                    document.transform_omit_blend_above = document
+                        .transform_above_needs_backdrop()
+                        && matches!(state.transform_mode, TransformMode::Free)
+                        && document.selection.floating_overlay_only;
                     let synced = crate::canvas_gpu::sync_from_document(
                         rs,
                         document,
@@ -915,6 +940,7 @@ impl CanvasView {
                         view,
                         allow_coarsen,
                     );
+                    document.transform_omit_blend_above = false;
                     let want = beautiful_core::lod_factor_for_document(
                         state.zoom,
                         state.display_lod,
@@ -922,8 +948,9 @@ impl CanvasView {
                         document.height,
                     );
                     if want != state.display_lod {
-                        if want < state.display_lod.max(1) {
-                            // Sharpen should have applied this frame — retry if deferred.
+                        // Still converging (one-octave steps, or coarsen hold).
+                        if want < state.display_lod {
+                            // Sharpen catch-up even during gesture hold.
                             state.dirty = true;
                             ui.ctx().request_repaint();
                         } else if !allow_coarsen {
@@ -934,7 +961,25 @@ impl CanvasView {
                         }
                     } else if synced {
                         state.dirty = false;
+                        // Upload above plate BEFORE freeze — otherwise we freeze with
+                        // float-on-top and no z-order plate (looks like "поверх слоёв").
+                        if document.selection.floating_overlay_only {
+                            state.ensure_xform_above_tex(ctx, document);
+                        }
+                        state.note_xform_underlay_synced(document);
+                        if document.selection.floating_overlay_only
+                            && !state.xform_underlay_frozen
+                        {
+                            document.composite.mark_full();
+                            state.dirty = true;
+                            ui.ctx().request_repaint();
+                        }
                     } else if state.dirty {
+                        // Underlay sync consumed force_full but GPU upload did not
+                        // commit — re-arm so the next frame rebuilds the hole.
+                        if document.selection.floating_overlay_only {
+                            document.composite.mark_full();
+                        }
                         ui.ctx().request_repaint();
                     }
                 }
@@ -1000,7 +1045,15 @@ impl CanvasView {
                             })
                         })
                     };
-                    crate::canvas_gpu::paint_canvas(ui, paint_rect, canvas_params, gradient);
+                    // Free + Soft Light + lod1: Soft Light GPU pass (float + Soft Light).
+                    let softlight = state.softlight_gpu_prepare(rs, document);
+                    crate::canvas_gpu::paint_canvas(
+                        ui,
+                        paint_rect,
+                        canvas_params,
+                        gradient,
+                        softlight,
+                    );
                 }
             } else {
                 state.ensure_texture(ctx, document);
@@ -1034,6 +1087,38 @@ impl CanvasView {
         }
 
         // Gradient vector overlay (above canvas pixels, like selection handles).
+        if crate::debug_flags::show_tile_debug() {
+            paint_tile_debug_overlay(
+                &painter,
+                canvas_center,
+                egui::vec2(display_w, display_h),
+                state.rotation_deg,
+                document.view_flip_h,
+                document,
+            );
+        }
+        if crate::debug_flags::show_lod_debug() {
+            let view = state.view_dirty_rect(document);
+            let want_lod = beautiful_core::lod_factor_for_document(
+                state.zoom,
+                state.display_lod,
+                document.width,
+                document.height,
+            );
+            paint_lod_debug_overlay(
+                &painter,
+                canvas_center,
+                egui::vec2(display_w, display_h),
+                state.rotation_deg,
+                document.view_flip_h,
+                document,
+                state.display_lod,
+                want_lod,
+                &state.display_mip,
+                view,
+            );
+        }
+
         if let Some(sess) = state.gradient_session.as_ref() {
             paint_gradient_gizmo(
                 &painter,
@@ -1079,8 +1164,18 @@ impl CanvasView {
                 }
             }
 
-            // Marching ants: during Free transform use floating AABB (outline would lag).
-            // Mesh/Distort keep live contour from resync; otherwise prefer stored outline.
+            // Live Free / Distort / Mesh content (frozen underlay + overlay).
+            let overlay_live = document.selection.floating_overlay_only
+                && state.transform_editing();
+            if overlay_live {
+                // Pan/zoom: expand Normal above plate. Soft Light: GPU InStack only.
+                let view = state.view_dirty_rect(document);
+                if !document.transform_above_needs_backdrop() {
+                    document.ensure_transform_above_for_view(view);
+                }
+                state.ensure_xform_live_tex(ctx, document);
+                state.ensure_xform_above_tex(ctx, document);
+            }
             let free_transform = transform_edit
                 && matches!(state.transform_mode, TransformMode::Free)
                 && matches!(tool, WorkspaceTool::Transform);
@@ -1088,6 +1183,46 @@ impl CanvasView {
                 if let (Some(fx), Some((_, bw, bh, _, _))) =
                     (state.free_xform.as_ref(), state.transform_baseline.as_ref())
                 {
+                    if document.selection.floating_overlay_only {
+                        // Soft Light GPU: float + Soft Light in wgpu pass.
+                        // Else: egui float (+ Normal above plate). Soft cube removed.
+                        if !state.softlight_gpu_drew {
+                            if let Some(tex) = state.xform_live_tex.as_ref() {
+                                paint_free_transform_live_image(
+                                    &painter,
+                                    tex.id(),
+                                    canvas_center,
+                                    egui::vec2(display_w, display_h),
+                                    doc_w,
+                                    doc_h,
+                                    state.rotation_deg,
+                                    fx,
+                                    *bw,
+                                    *bh,
+                                    document.floating_transform_opacity(),
+                                );
+                            }
+                            if !document.transform_above_needs_backdrop() {
+                                if let Some((tex, ox, oy, aw, ah, _)) =
+                                    state.xform_above_tex.as_ref()
+                                {
+                                    paint_selection_mask_overlay(
+                                        &painter,
+                                        tex.id(),
+                                        canvas_center,
+                                        egui::vec2(display_w, display_h),
+                                        doc_w,
+                                        doc_h,
+                                        state.rotation_deg,
+                                        *ox as f32,
+                                        *oy as f32,
+                                        *aw,
+                                        *ah,
+                                    );
+                                }
+                            }
+                        }
+                    }
                     paint_free_transform_overlay(
                         &painter,
                         canvas_center,
@@ -1118,6 +1253,68 @@ impl CanvasView {
                         time,
                         false,
                     );
+                }
+            } else if overlay_live {
+                // Distort / Mesh: baseline tex + tessellated warp mesh (no CPU Soft cube).
+                if let (Some(tex), Some((_, bw, bh, ox, oy)), Some(pts)) = (
+                    state.xform_live_tex.as_ref(),
+                    state.transform_baseline.as_ref(),
+                    state.warp_controls.as_ref(),
+                ) {
+                    let n = state.mesh_grid_n.max(2);
+                    if !state.warp_lattice_edited {
+                        let (lx0, ly0) = pts.first().copied().unwrap_or((0.0, 0.0));
+                        paint_selection_mask_overlay(
+                            &painter,
+                            tex.id(),
+                            canvas_center,
+                            egui::vec2(display_w, display_h),
+                            doc_w,
+                            doc_h,
+                            state.rotation_deg,
+                            *ox + lx0,
+                            *oy + ly0,
+                            *bw,
+                            *bh,
+                        );
+                    } else {
+                        let handles = state.warp_node_handles.as_ref().map(|v| v.as_slice());
+                        paint_warp_live_mesh(
+                            &painter,
+                            tex.id(),
+                            canvas_center,
+                            egui::vec2(display_w, display_h),
+                            doc_w,
+                            doc_h,
+                            state.rotation_deg,
+                            document.view_flip_h,
+                            *ox,
+                            *oy,
+                            *bw,
+                            *bh,
+                            n,
+                            pts,
+                            handles,
+                            document.floating_transform_opacity(),
+                        );
+                    }
+                }
+                if !document.transform_above_needs_backdrop() {
+                    if let Some((tex, ox, oy, aw, ah, _)) = state.xform_above_tex.as_ref() {
+                        paint_selection_mask_overlay(
+                            &painter,
+                            tex.id(),
+                            canvas_center,
+                            egui::vec2(display_w, display_h),
+                            doc_w,
+                            doc_h,
+                            state.rotation_deg,
+                            *ox as f32,
+                            *oy as f32,
+                            *aw,
+                            *ah,
+                        );
+                    }
                 }
             } else if !document.selection.outline.is_empty() {
                 paint_lasso_overlay(
@@ -1634,7 +1831,14 @@ impl CanvasView {
         }
 
         // Repaint while drawing / panning / zooming, or while LOD factor still lags zoom.
-        if panning || primary_down || zoom_applied || state.is_drawing || state.dirty {
+        if panning
+            || primary_down
+            || zoom_applied
+            || state.is_drawing
+            || state.dirty
+            || crate::debug_flags::show_tile_debug()
+            || crate::debug_flags::show_lod_debug()
+        {
             ctx.request_repaint();
         } else if state.coarsen_held() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));

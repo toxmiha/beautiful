@@ -1,4 +1,4 @@
-//! Background job primitives (cancel + progress).
+//! Background job primitives (cancel token).
 //!
 //! # If painting regresses after a memory/perf change
 //! 1. Reproduce with one tool / one canvas size.
@@ -10,7 +10,7 @@
 //! 6. RAM spike → ensure full-doc Vec did not return in CompositeCache/StrokeStack.
 //! 7. `cargo_check` + unit tests → release `dist/beautiful.exe` → smoke paint.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -31,27 +31,5 @@ impl CancelToken {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct JobProgress {
-    pub done: AtomicU64,
-    pub total: AtomicU64,
-}
-
-impl JobProgress {
-    pub fn fraction(&self) -> f32 {
-        let total = self.total.load(Ordering::Relaxed);
-        if total == 0 {
-            return 0.0;
-        }
-        let done = self.done.load(Ordering::Relaxed).min(total);
-        done as f32 / total as f32
-    }
-
-    pub fn set(&self, done: u64, total: u64) {
-        self.total.store(total, Ordering::Relaxed);
-        self.done.store(done, Ordering::Relaxed);
     }
 }

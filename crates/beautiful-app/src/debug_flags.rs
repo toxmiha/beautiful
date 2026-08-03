@@ -1,5 +1,6 @@
-//! Temporary perf isolation flags (env). Remove after evidence gate.
+//! Temporary perf isolation flags (env) + runtime debug toggles (F12 HUD).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 fn env_on(name: &'static str) -> bool {
@@ -49,6 +50,39 @@ pub fn no_brush_engine() -> bool {
 /// Perf A/B: opaque HWND (no DComp Visual / no clear-to-zero). Startup only.
 pub fn opaque_window() -> bool {
     env_on("BEAUTIFUL_OPAQUE") || env_on("NO_TRANSPARENT")
+}
+
+static SHOW_TILE_DEBUG: AtomicBool = AtomicBool::new(false);
+static SHOW_LOD_DEBUG: AtomicBool = AtomicBool::new(false);
+
+/// F12 microprofiler toggle: draw occupied/dirty tile overlays on the canvas.
+pub fn show_tile_debug() -> bool {
+    SHOW_TILE_DEBUG.load(Ordering::Relaxed)
+}
+
+pub fn set_show_tile_debug(on: bool) {
+    SHOW_TILE_DEBUG.store(on, Ordering::Relaxed);
+}
+
+pub fn toggle_show_tile_debug() -> bool {
+    let next = !show_tile_debug();
+    set_show_tile_debug(next);
+    next
+}
+
+/// F12: draw DisplayMip coverage + LOD plate grid on the canvas.
+pub fn show_lod_debug() -> bool {
+    SHOW_LOD_DEBUG.load(Ordering::Relaxed)
+}
+
+pub fn set_show_lod_debug(on: bool) {
+    SHOW_LOD_DEBUG.store(on, Ordering::Relaxed);
+}
+
+pub fn toggle_show_lod_debug() -> bool {
+    let next = !show_lod_debug();
+    set_show_lod_debug(next);
+    next
 }
 
 pub fn log_active_flags() {

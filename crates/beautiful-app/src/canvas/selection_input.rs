@@ -32,6 +32,7 @@ pub(crate) fn handle_selection_input(
                 WorkspaceTool::Crop
                     | WorkspaceTool::Lasso
                     | WorkspaceTool::SelectRect
+                    | WorkspaceTool::SelectEllipse
                     | WorkspaceTool::Transform
                     | WorkspaceTool::Warp
                     | WorkspaceTool::Move
@@ -67,14 +68,20 @@ pub(crate) fn handle_selection_input(
                         WorkspaceTool::Transform | WorkspaceTool::Warp => {
                             let _ = state.begin_transform_session(document);
                             state.transform_start_scale = 1.0;
+                            if matches!(tool_now, WorkspaceTool::Warp)
+                                && state.transform_mode != TransformMode::Mesh
+                            {
+                                state.switch_transform_mode(
+                                    document,
+                                    tool,
+                                    TransformMode::Mesh,
+                                );
+                            }
                             if matches!(
                                 state.transform_mode,
                                 TransformMode::Distort | TransformMode::Mesh
                             ) || matches!(tool_now, WorkspaceTool::Warp)
                             {
-                                if matches!(tool_now, WorkspaceTool::Warp) {
-                                    state.transform_mode = TransformMode::Mesh;
-                                }
                                 ensure_warp_grid(state, document);
                                 let (ctrl, shift, alt) = ctx.input(|i| {
                                     (i.modifiers.ctrl, i.modifiers.shift, i.modifiers.alt)
@@ -91,12 +98,15 @@ pub(crate) fn handle_selection_input(
                                     }
                                 } else if !ctrl {
                                     drag_warp_point(state, document, x, y, shift);
+                                    if document.selection.floating_overlay_only {
+                                        ctx.request_repaint();
+                                    }
                                 }
                             } else if state.transform_mode == TransformMode::Free {
                                 begin_free_drag(state, document, x, y);
                             }
                         }
-                        WorkspaceTool::SelectRect => {
+                        WorkspaceTool::SelectRect | WorkspaceTool::SelectEllipse => {
                             let (shift, alt) = ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
                             let op = SelectionCombine::from_modifiers(shift, alt);
                             state.sel_gesture_before = Some(document.snapshot_selection());
@@ -110,13 +120,24 @@ pub(crate) fn handle_selection_input(
                                 document.selection.clear();
                             }
                             let rect = SelectionRect::from_points((x, y), (x, y));
+                            let mask = if matches!(tool_now, WorkspaceTool::SelectEllipse) {
+                                beautiful_core::SelectionMask::from_ellipse(rect)
+                            } else {
+                                beautiful_core::SelectionMask::from_rect(rect)
+                            };
                             if matches!(op, SelectionCombine::Replace) {
-                                document.selection.set_rect_live(rect);
+                                if matches!(tool_now, WorkspaceTool::SelectEllipse) {
+                                    document.selection.mask = Some(mask);
+                                    document.selection.rect = Some(rect);
+                                    document.selection.refresh_outline();
+                                } else {
+                                    document.selection.set_rect_live(rect);
+                                }
                             } else {
                                 document.selection.set_combined_preview(
                                     state.sel_combine_base.as_ref(),
                                     op,
-                                    beautiful_core::SelectionMask::from_rect(rect),
+                                    mask,
                                 );
                             }
                         }
@@ -152,20 +173,31 @@ pub(crate) fn handle_selection_input(
                     let dy = y - ly;
                     let shift = ctx.input(|i| i.modifiers.shift);
                     match tool_now {
-                        WorkspaceTool::SelectRect => {
+                        WorkspaceTool::SelectRect | WorkspaceTool::SelectEllipse => {
                             let (ex, ey) = if shift {
                                 crate::stroke_input::constrain_to_square(sx, sy, x, y)
                             } else {
                                 (x, y)
                             };
                             let rect = SelectionRect::from_points((sx, sy), (ex, ey));
+                            let mask = if matches!(tool_now, WorkspaceTool::SelectEllipse) {
+                                beautiful_core::SelectionMask::from_ellipse(rect)
+                            } else {
+                                beautiful_core::SelectionMask::from_rect(rect)
+                            };
                             if matches!(state.sel_combine_op, SelectionCombine::Replace) {
-                                document.selection.set_rect_live(rect);
+                                if matches!(tool_now, WorkspaceTool::SelectEllipse) {
+                                    document.selection.mask = Some(mask);
+                                    document.selection.rect = Some(rect);
+                                    document.selection.refresh_outline();
+                                } else {
+                                    document.selection.set_rect_live(rect);
+                                }
                             } else {
                                 document.selection.set_combined_preview(
                                     state.sel_combine_base.as_ref(),
                                     state.sel_combine_op,
-                                    beautiful_core::SelectionMask::from_rect(rect),
+                                    mask,
                                 );
                             }
                         }
@@ -183,6 +215,7 @@ pub(crate) fn handle_selection_input(
                                 && (dx.abs() >= 0.5 || dy.abs() >= 0.5)
                             {
                                 document.move_floating_selection(dx, dy);
+                                state.mark_dirty();
                             }
                         }
                         WorkspaceTool::Transform => match state.transform_mode {
@@ -192,12 +225,18 @@ pub(crate) fn handle_selection_input(
                             TransformMode::Distort | TransformMode::Mesh => {
                                 if !ctx.input(|i| i.modifiers.ctrl) {
                                     drag_warp_point(state, document, x, y, false);
+                                    if document.selection.floating_overlay_only {
+                                        ctx.request_repaint();
+                                    }
                                 }
                             }
                         },
                         WorkspaceTool::Warp => {
                             if !ctx.input(|i| i.modifiers.ctrl) {
                                 drag_warp_point(state, document, x, y, false);
+                                if document.selection.floating_overlay_only {
+                                    ctx.request_repaint();
+                                }
                             }
                         }
                         _ => {}
@@ -209,7 +248,10 @@ pub(crate) fn handle_selection_input(
     }
 
     if primary_released {
-        if matches!(tool_now, WorkspaceTool::SelectRect) {
+        if matches!(
+            tool_now,
+            WorkspaceTool::SelectRect | WorkspaceTool::SelectEllipse
+        ) {
             let gesture_too_small = match (state.drag_doc_start, state.drag_doc_last) {
                 (Some((sx, sy)), Some((lx, ly))) => {
                     let r = SelectionRect::from_points((sx, sy), (lx, ly));
@@ -236,7 +278,13 @@ pub(crate) fn handle_selection_input(
                 } else {
                     // Always materialize mask so paint/fill/copy see the selection.
                     if matches!(state.sel_combine_op, SelectionCombine::Replace) {
-                        document.selection.finalize_rect_mask();
+                        if matches!(tool_now, WorkspaceTool::SelectEllipse) {
+                            // Ellipse already wrote mask during drag.
+                            document.selection.ensure_mask();
+                            document.selection.refresh_outline();
+                        } else {
+                            document.selection.finalize_rect_mask();
+                        }
                     } else {
                         document.selection.ensure_mask();
                     }
@@ -299,14 +347,23 @@ pub(crate) fn handle_selection_input(
         if matches!(tool_now, WorkspaceTool::Transform)
             && matches!(state.transform_mode, TransformMode::Free)
         {
-            let had_drag = state.free_xform.as_ref().and_then(|fx| fx.drag).is_some();
+            let drag_kind = state.free_xform.as_ref().and_then(|fx| fx.drag);
             if let Some(fx) = state.free_xform.as_mut() {
                 fx.drag = None;
             }
-            // Always HQ refresh on release — kills proxy/nearest ghosts after stretch.
-            if had_drag {
-                refresh_free_transform_preview(state, document, false);
-                state.mark_dirty();
+            // Move already updated floating. Overlay path keeps pose in free_xform —
+            // bake only on Apply (gradient model). Scale/rotate in-stack still soft-resample.
+            if matches!(
+                drag_kind,
+                Some(FreeDragKind::Scale(_)) | Some(FreeDragKind::Rotate)
+            ) {
+                if document.selection.floating_overlay_only {
+                    sync_free_floating_pose(state, document);
+                } else {
+                    state.last_free_preview_at = 0.0;
+                    refresh_free_transform_preview(state, document, true);
+                    state.mark_dirty();
+                }
             }
         }
         if matches!(tool_now, WorkspaceTool::Warp)
@@ -322,6 +379,9 @@ pub(crate) fn handle_selection_input(
                     refresh_warp_preview_full(state, document);
                 }
             }
+        }
+        if state.transform_editing() && document.selection.floating_overlay_only {
+            state.finish_xform_above_live(ctx, document);
         }
         state.drag_doc_start = None;
         state.drag_doc_last = None;
@@ -381,11 +441,12 @@ pub(crate) fn handle_selection_input(
                         pts[i].1 += ndy;
                     }
                 }
-                let n = state.mesh_grid_n.max(2);
-                if let Some(hs) = state.warp_node_handles.as_mut() {
-                    beautiful_core::refit_warp_handles_near(pts, hs, n, &sel);
+                state.warp_lattice_edited = true;
+                if document.selection.floating_overlay_only {
+                    ctx.request_repaint();
+                } else {
+                    refresh_warp_preview_full(state, document);
                 }
-                refresh_warp_preview_full(state, document);
             }
         }
     }

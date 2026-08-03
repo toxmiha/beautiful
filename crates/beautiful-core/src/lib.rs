@@ -2,6 +2,7 @@ mod brush;
 mod color;
 mod composite;
 mod display_lod;
+mod display_sync;
 mod doc_op;
 mod document;
 mod engine;
@@ -16,6 +17,7 @@ mod io;
 mod jobs;
 mod layer;
 mod mask_tiles;
+mod omit_above;
 pub mod perf_probe;
 mod preview;
 mod projection;
@@ -37,7 +39,8 @@ pub use color::{
     store_premul_linear, Rgba,
 };
 pub use composite::{
-    CompositeCache, DirtyRect, FloatingBlit, SyncResult, COMPOSITE_BUDGET_PX,
+    composite_region_packed_into, CompositeCache, DirtyRect, FloatingBlit, SyncResult,
+    COMPOSITE_BUDGET_PX,
 };
 pub use projection::{budget as projection_budget, Projection, ProjectionBackend};
 pub use display_lod::{
@@ -45,8 +48,12 @@ pub use display_lod::{
     build_navigator_thumb_from_tiles,
     document_peak_bytes, document_size_allowed, lod_factor_for_document, lod_factor_for_zoom,
     lod_factor_for_zoom_hysteresis, resolve_display_lod, size_adjusted_zoom, DisplayMip,
-    MAX_DOC_SIDE, MAX_GPU_TEX_SIDE,
-    MAX_LAYER_PIXEL_BYTES, SOFT_COMFORT_BYTES,
+    MAX_DOC_SIDE, MAX_GPU_TEX_SIDE, MAX_LAYER_PIXEL_BYTES,
+};
+pub use display_sync::{
+    apply_mip_action, mip_dims, mip_size_matches, plan_display_frame, plan_mip_action,
+    skip_projection_for_mip, update_mip_partial, ApplyMipResult, DISPLAY_VIEW_PAD,
+    DisplayFramePlan, MipAction,
 };
 pub use doc_op::{DocOp, DocOpJournal, DocOpKind};
 pub use document::{Document, LayerDropPlace, StageRect};
@@ -60,13 +67,14 @@ pub use io::{
     document_from_rgba, export_jpeg, export_png, export_psd_flat, load_document, load_raster_bytes,
     load_raster_image, save_document, IoError,
 };
-pub use jobs::{CancelToken, JobProgress};
+pub use jobs::CancelToken;
 pub use filters::AdjustmentKind;
 pub use layer::{
     ancestor_folder_mask_cov, ancestor_folder_opacity, blend_over, blend_rgb, effective_blend_mode,
     BlendMode, Layer,
 };
 pub use mask_tiles::AlphaTileMap;
+pub use omit_above::{is_omitted as transform_layer_omitted, OmitAboveGuard};
 pub use preview::{
     encode_document_preview_jpeg, load_file_preview, load_file_preview_max, FilePreview,
 };
@@ -94,5 +102,5 @@ pub use warp::{
     eval_warp_surface_nodes, inverse_bilinear_quad, mesh_warp_rgba, mesh_warp_rgba_ex,
     nearest_warp_bezier_edge, opposite_edge_node, pull_warp_patch_at_uv, refit_warp_handles_near,
     refit_warp_handles_smooth, split_warp_axis, split_warp_crosswise, warp_anchor_kind,
-    WarpAnchorKind, WarpBezierEdge,
+    warp_bake_cell_subdiv, warp_live_tess_steps, WarpAnchorKind, WarpBezierEdge,
 };

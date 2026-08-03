@@ -332,6 +332,27 @@ fn system_panel_extra_autosave(ui: &mut egui::Ui, settings: &mut AppSettings) {
             );
         });
     });
+
+    ui.add_space(12.0);
+    crate::ui_kit::section(ui, "Discord Rich Presence");
+    crate::ui_kit::hint(
+        ui,
+        "Create an Application at discord.com/developers → copy Client ID. Or set env BEAUTIFUL_DISCORD_CLIENT_ID.",
+    );
+    ui.checkbox(
+        &mut settings.discord_rpc_enabled,
+        theme::label("Enable Discord Rich Presence"),
+    );
+    ui.add_enabled_ui(settings.discord_rpc_enabled, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(theme::label_dim("Client ID"));
+            ui.add(
+                egui::TextEdit::singleline(&mut settings.discord_client_id)
+                    .desired_width(220.0)
+                    .hint_text("Application Client ID"),
+            );
+        });
+    });
 }
 
 fn interface_panel(

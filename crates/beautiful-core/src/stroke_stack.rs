@@ -508,23 +508,7 @@ fn try_expand_plates(
 /// Above plate is correct only for Normal, non-clip layers (blend depends on dst otherwise;
 /// clip-to-below above active samples changing active alpha).
 fn above_cache_ok(layers: &[Layer], active: usize) -> bool {
-    for (li, layer) in layers.iter().enumerate().skip(active.saturating_add(1)) {
-        if !layer.visible || layer.is_folder {
-            continue;
-        }
-        if (layer.opacity.clamp(0.0, 1.0) * ancestor_folder_opacity(layers, li)).clamp(0.0, 1.0)
-            <= 0.0
-        {
-            continue;
-        }
-        if effective_blend_mode(layers, li) != BlendMode::Normal {
-            return false;
-        }
-        if layer.clip_to_below {
-            return false;
-        }
-    }
-    true
+    crate::visibility_cache::VisibilityBackdrop::transform_overlay_above_ok(layers, active)
 }
 
 #[inline]

@@ -116,7 +116,7 @@ pub(crate) enum WarpDragTarget {
         b: usize,
         t: f32,
     },
-    /// Pull patch surface at fixed UV via inward handles (interior drag).
+    /// Pull patch surface at fixed UV (Mesh interior). Distort uses this as translate.
     Interior {
         u: f32,
         v: f32,

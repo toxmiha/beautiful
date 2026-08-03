@@ -26,8 +26,8 @@ pub struct CanvasState {
     pub last_viewport: egui::Rect,
     /// Last placed canvas rect before rotation (axis-aligned), screen coords.
     pub last_canvas_rect: egui::Rect,
-    /// Hold *coarser* LOD applies until the wheel gesture goes idle.
-    /// Sharper LOD is never held (see `resolve_display_lod`).
+    /// Hold *coarser* LOD until the wheel gesture goes idle.
+    /// Sharpen always steps (see asymmetric `resolve_display_lod`).
     coarsen_hold_until: Option<std::time::Instant>,
     /// Last screen-space zoom pivot (fallback when hover is briefly missing).
     zoom_screen_pivot: Option<egui::Pos2>,
@@ -47,6 +47,9 @@ pub struct CanvasState {
     warp_node_handles: Option<Vec<[Option<(f32, f32)>; 4]>>,
     /// Per-node Unison (`true`) vs Independent (`false`) handle mode.
     warp_handle_unison: Option<Vec<bool>>,
+    /// False until the user bends a corner/whisker/edge — identity paint uses a
+    /// plain textured quad so entering Distort/Mesh does not change pixels.
+    warp_lattice_edited: bool,
     warp_drag: Option<WarpDragTarget>,
     /// Multi-selected nodes (Shift+click). Primary is last.
     warp_selected: Vec<usize>,
@@ -54,6 +57,8 @@ pub struct CanvasState {
     warp_proxy: Option<(Vec<u8>, u32, u32, u32)>,
     /// Throttle live warp recomposite (seconds).
     last_warp_preview_at: f64,
+    /// Throttle Free Transform scale/rotate live bake.
+    last_free_preview_at: f64,
     /// Free / Distort / Mesh transform UI mode.
     pub transform_mode: TransformMode,
     /// Mesh grid size (N×N). Distort uses 2.
@@ -118,6 +123,25 @@ pub struct CanvasState {
     mask_thumbs: std::collections::HashMap<usize, (u64, TextureHandle)>,
     /// Orange alpha mask texture for irregular selections.
     selection_mask_texture: Option<(u64, u32, u32, u32, u32, TextureHandle)>,
+    /// Baseline pixels as egui texture for live Free Transform (pose-only drag).
+    xform_live_tex: Option<TextureHandle>,
+    /// Re-upload live tex from floating (after warp resample).
+    xform_live_stale: bool,
+    /// Layers above the transform slot (frozen plate), painted after the float.
+    xform_above_tex: Option<(TextureHandle, u32, u32, u32, u32, u64)>,
+    /// Skip Soft Light GPU re-upload while float/Soft Light pixels & ROI are unchanged.
+    /// `(content_revision, float_w, float_h, atlas_w, atlas_h, clip_qx0, clip_qy0, clip_qx1, clip_qy1)`.
+    softlight_gpu_upload_key: Option<(u64, u32, u32, u32, u32, u32, u32, u32, u32)>,
+    /// Float tex uploaded for this content_revision + size (don't reupload float on atlas-only moves).
+    softlight_gpu_float_key: Option<(u64, u32, u32)>,
+    /// Expand-only Soft∩float clip for this transform session (prevents z-order flicker).
+    softlight_clip_frozen: Option<beautiful_core::DirtyRect>,
+    /// Soft Light GPU pass armed for this frame (skip egui float).
+    softlight_gpu_drew: bool,
+    /// Drop Soft GPU textures on next paint (after Apply/Cancel).
+    softlight_gpu_release: bool,
+    /// Underlay plate is frozen; pointer drag only updates overlay pose.
+    xform_underlay_frozen: bool,
     /// Throttle full recomposite while dragging layer opacity.
     opacity_touch_at: f64,
     /// True while opacity slider is dragged — skip nav rebuild until release.
@@ -161,10 +185,12 @@ impl Default for CanvasState {
             warp_controls: None,
             warp_node_handles: None,
             warp_handle_unison: None,
+            warp_lattice_edited: false,
             warp_drag: None,
             warp_selected: Vec::new(),
             warp_proxy: None,
             last_warp_preview_at: 0.0,
+            last_free_preview_at: 0.0,
             transform_mode: TransformMode::Free,
             mesh_grid_n: 2,
             transform_baseline: None,
@@ -200,6 +226,15 @@ impl Default for CanvasState {
             layer_thumbs: std::collections::HashMap::new(),
             mask_thumbs: std::collections::HashMap::new(),
             selection_mask_texture: None,
+            xform_live_tex: None,
+            xform_live_stale: false,
+            xform_above_tex: None,
+            softlight_gpu_upload_key: None,
+            softlight_gpu_float_key: None,
+            softlight_clip_frozen: None,
+            softlight_gpu_drew: false,
+            softlight_gpu_release: false,
+            xform_underlay_frozen: false,
             opacity_touch_at: 0.0,
             opacity_dragging: false,
             opacity_touch_pending: false,
@@ -222,13 +257,636 @@ impl CanvasState {
         self.warp_controls = None;
         self.warp_node_handles = None;
         self.warp_handle_unison = None;
+        self.warp_lattice_edited = false;
         self.warp_drag = None;
         self.warp_selected.clear();
         self.warp_proxy = None;
     }
 
+    #[allow(dead_code)]
     pub fn clear_free_xform(&mut self) {
         self.free_xform = None;
+        self.xform_live_tex = None;
+        self.xform_live_stale = false;
+        self.xform_above_tex = None;
+        self.softlight_gpu_upload_key = None;
+        self.softlight_gpu_float_key = None;
+        self.softlight_clip_frozen = None;
+        self.softlight_gpu_drew = false;
+        self.softlight_gpu_release = true;
+        self.xform_underlay_frozen = false;
+    }
+
+    /// Release Path B GPU textures + transform plates (call when wgpu RenderState is available).
+    pub fn release_transform_gpu_resources(
+        &mut self,
+        rs: &eframe::egui_wgpu::RenderState,
+        document: &mut Document,
+    ) {
+        if !self.softlight_gpu_release {
+            return;
+        }
+        crate::canvas_gpu::release_softlight_sources(rs);
+        self.softlight_gpu_release = false;
+        self.softlight_gpu_upload_key = None;
+        self.softlight_gpu_float_key = None;
+        self.softlight_gpu_drew = false;
+        document.release_transform_plates();
+    }
+
+    /// Upload baseline once for Free pose quad / Mesh warp mesh (same source tex).
+    pub fn ensure_xform_live_tex(&mut self, ctx: &Context, _document: &Document) {
+        if self.xform_live_tex.is_some() && !self.xform_live_stale {
+            return;
+        }
+        let Some((pix, w, h, _, _)) = self.transform_baseline.as_ref() else {
+            return;
+        };
+        if *w == 0 || *h == 0 || pix.len() < (*w as usize) * (*h as usize) * 4 {
+            return;
+        }
+        let image = ColorImage::from_rgba_unmultiplied([*w as usize, *h as usize], pix);
+        let opts = TextureOptions {
+            magnification: TextureFilter::Linear,
+            minification: TextureFilter::Linear,
+            ..TextureOptions::LINEAR
+        };
+        if let Some(tex) = self.xform_live_tex.as_mut() {
+            tex.set(image, opts);
+        } else {
+            self.xform_live_tex = Some(ctx.load_texture("xform_live", image, opts));
+        }
+        self.xform_live_stale = false;
+    }
+
+    /// Sync frozen "layers above" plate for correct z-order over the live float.
+    pub fn ensure_xform_above_tex(&mut self, ctx: &Context, document: &Document) {
+        // Soft/Hard Light: above is restored by GPU Soft Light pass (Free+lod1) or
+        // CPU Soft Light live — never a Normal above plate (wrong backdrop).
+        if document.transform_above_needs_backdrop() {
+            self.xform_above_tex = None;
+            return;
+        }
+        let Some((pix, ox, oy, w, h, gen)) = document.transform_above_plate() else {
+            self.xform_above_tex = None;
+            return;
+        };
+        if w == 0 || h == 0 || pix.len() < (w as usize) * (h as usize) * 4 {
+            self.xform_above_tex = None;
+            return;
+        }
+        if let Some((_, x, y, tw, th, g)) = self.xform_above_tex.as_ref() {
+            if *x == ox && *y == oy && *tw == w && *th == h && *g == gen {
+                return;
+            }
+        }
+        let image = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], pix);
+        let opts = TextureOptions {
+            magnification: TextureFilter::Linear,
+            minification: TextureFilter::Linear,
+            ..TextureOptions::LINEAR
+        };
+        let tex = ctx.load_texture("xform_above", image, opts);
+        self.xform_above_tex = Some((tex, ox, oy, w, h, gen));
+    }
+
+    /// Soft/Hard Light live: CPU only SoftLight∩(old∪new) — not the whole float.
+    /// Soft Light outside the float stays in the frozen underlay (SAI-style dirty).
+    /// Path A Overlay / B GPU InStack Soft Light / C fallback (no CPU Soft cube).
+    pub fn transform_blend_path_label(&self, document: &Document) -> &'static str {
+        if !document.transform_live_blend_needed() {
+            "A_overlay"
+        } else if self.softlight_gpu_xform_active(document) {
+            "B_instack_gpu"
+        } else {
+            "C_static_above"
+        }
+    }
+
+    fn log_transform_blend_path(&self, document: &Document, why: &str) {
+        crate::action_log::log(
+            "xform_path",
+            &format!(
+                "{why} path={} above={} float_blend={} lod={}",
+                self.transform_blend_path_label(document),
+                document.transform_above_needs_backdrop(),
+                document.transform_float_needs_backdrop(),
+                self.display_lod
+            ),
+        );
+    }
+
+    /// Free + GPU InStack: restore up to N above layers (blend/clip) over live float.
+    /// Independent of display_lod. Over limit / unsupported mode → Path C.
+    pub fn softlight_gpu_xform_active(&self, document: &Document) -> bool {
+        document.transform_above_needs_backdrop()
+            && matches!(self.transform_mode, TransformMode::Free)
+            && document.selection.floating_overlay_only
+            && self.free_xform.is_some()
+            && self.transform_baseline.is_some()
+            && Self::blend_mode_gpu_u(document.floating_transform_blend_mode()).is_some()
+            && self
+                .instack_gpu_layers(document)
+                .and_then(|layers| Self::instack_gpu_descs(&layers))
+                .is_some()
+    }
+
+    /// Soft/Hard/Mul/Screen/Overlay + Normal=5.
+    fn blend_mode_gpu_u(mode: beautiful_core::BlendMode) -> Option<u32> {
+        match mode {
+            beautiful_core::BlendMode::SoftLight => Some(0),
+            beautiful_core::BlendMode::HardLight => Some(1),
+            beautiful_core::BlendMode::Multiply => Some(2),
+            beautiful_core::BlendMode::Screen => Some(3),
+            beautiful_core::BlendMode::Overlay => Some(4),
+            beautiful_core::BlendMode::Normal => Some(5),
+            _ => None,
+        }
+    }
+
+    /// Current float OBB padded+quantized (256). Session clip expands only (no shrink).
+    fn instack_float_clip_q(
+        &self,
+        document: &Document,
+    ) -> Option<beautiful_core::DirtyRect> {
+        let (fx, bw, bh) = match (self.free_xform.as_ref(), self.transform_baseline.as_ref()) {
+            (Some(fx), Some((_, bw, bh, _, _))) => (fx, *bw, *bh),
+            _ => return None,
+        };
+        let mut clip = crate::canvas::transform_free::free_obb_dirty_rect(
+            fx,
+            bw,
+            bh,
+            document.width,
+            document.height,
+        )
+        .padded(256, document.width, document.height);
+        clip.clamp_to(document.width, document.height);
+        if clip.is_empty() {
+            return None;
+        }
+        const Q: u32 = 256;
+        clip.x0 = (clip.x0 / Q) * Q;
+        clip.y0 = (clip.y0 / Q) * Q;
+        clip.x1 = ((clip.x1.saturating_add(Q - 1)) / Q).saturating_mul(Q).min(document.width);
+        clip.y1 = ((clip.y1.saturating_add(Q - 1)) / Q).saturating_mul(Q).min(document.height);
+        if clip.x1 <= clip.x0 || clip.y1 <= clip.y0 {
+            return None;
+        }
+        Some(clip)
+    }
+
+    /// Sticky expand-only Soft∩float clip for this session.
+    fn instack_session_clip(&self, document: &Document) -> Option<beautiful_core::DirtyRect> {
+        let mut clip = self.instack_float_clip_q(document)?;
+        if let Some(fr) = self.softlight_clip_frozen {
+            clip.union(fr);
+            clip.clamp_to(document.width, document.height);
+        }
+        if clip.is_empty() {
+            None
+        } else {
+            Some(clip)
+        }
+    }
+
+    /// Contributing above layers for GPU InStack (z-order). None → Path C.
+    /// All layers share the same session clip tile (transparent outside content).
+    /// Tuple: (li, ox, oy, w, h, mode, opacity, clip_code).
+    fn instack_gpu_layers(
+        &self,
+        document: &Document,
+    ) -> Option<Vec<(usize, u32, u32, u32, u32, u32, f32, u32)>> {
+        let float_idx = document
+            .selection
+            .floating_layer
+            .unwrap_or(document.active_layer)
+            .min(document.layers.len().saturating_sub(1));
+        let clip = self.instack_session_clip(document)?;
+        let tw = clip.width().max(1);
+        let th = clip.height().max(1);
+
+        let mut out = Vec::new();
+        let mut has_live = false;
+        for (li, layer) in document.layers.iter().enumerate().skip(float_idx + 1) {
+            if !layer.visible || layer.is_folder {
+                continue;
+            }
+            let opacity = (layer.opacity.clamp(0.0, 1.0)
+                * beautiful_core::ancestor_folder_opacity(&document.layers, li))
+            .clamp(0.0, 1.0);
+            if opacity <= 0.0 {
+                continue;
+            }
+            let Some(bounds) = layer.content_bounds() else {
+                continue;
+            };
+            if bounds.is_empty() {
+                continue;
+            }
+            let mode = beautiful_core::effective_blend_mode(&document.layers, li);
+            // Unsupported blend → Normal Instant Preview (don't kill Path B).
+            let mode_u = Self::blend_mode_gpu_u(mode).unwrap_or(5);
+            let wants_clip = layer.clip_to_below && li > 0;
+            if mode != beautiful_core::BlendMode::Normal || wants_clip {
+                has_live = true;
+            }
+            // Skip layers that don't touch the float clip (nothing to restore over float).
+            if bounds.intersect(clip).is_empty() {
+                continue;
+            }
+            out.push((
+                li,
+                clip.x0,
+                clip.y0,
+                tw,
+                th,
+                mode_u,
+                opacity,
+                wants_clip,
+            ));
+            if out.len() > crate::canvas_gpu::INSTACK_GPU_MAX_ABOVE {
+                return None;
+            }
+        }
+        if out.is_empty() || !has_live {
+            return None;
+        }
+        // Resolve clip base like CPU `nearest_paintable_alpha` (not stack dst.a).
+        let mut coded: Vec<(usize, u32, u32, u32, u32, u32, f32, u32)> =
+            Vec::with_capacity(out.len());
+        for &(li, ox, oy, w, h, mode_u, opacity, wants_clip) in &out {
+            let clip_code = if !wants_clip {
+                0u32
+            } else {
+                let mut j = li;
+                let mut code = 0u32;
+                while j > 0 {
+                    j -= 1;
+                    if document.layers[j].is_folder {
+                        continue;
+                    }
+                    if j == float_idx {
+                        code = 1;
+                    } else if let Some(slot) = out.iter().position(|&(idx, ..)| idx == j) {
+                        code = 2 + slot as u32;
+                    }
+                    break;
+                }
+                code
+            };
+            coded.push((li, ox, oy, w, h, mode_u, opacity, clip_code));
+        }
+        Some(coded)
+    }
+
+    /// Grid atlas: shared tile size, cols = ceil(sqrt(n)) — stays under 8192 for Soft∩float.
+    fn instack_gpu_descs(
+        layers: &[(usize, u32, u32, u32, u32, u32, f32, u32)],
+    ) -> Option<([crate::canvas_gpu::InStackLayerGpu; crate::canvas_gpu::INSTACK_GPU_MAX_ABOVE], u32, u32, u32)> {
+        let n = layers.len();
+        if n == 0 {
+            return None;
+        }
+        let tile_w = layers[0].3.max(1);
+        let tile_h = layers[0].4.max(1);
+        let cols = (n as f32).sqrt().ceil() as u32;
+        let cols = cols.max(1);
+        let rows = ((n as u32) + cols - 1) / cols;
+        let atlas_w = cols.saturating_mul(tile_w).max(1);
+        let atlas_h = rows.saturating_mul(tile_h).max(1);
+        if atlas_w > 8192 || atlas_h > 8192 || (atlas_w as u64) * (atlas_h as u64) > 32_000_000 {
+            return None;
+        }
+        let mut descs = [crate::canvas_gpu::InStackLayerGpu::default(); crate::canvas_gpu::INSTACK_GPU_MAX_ABOVE];
+        for (i, &(_, ox, oy, w, h, mode_u, opacity, clip_code)) in layers.iter().enumerate() {
+            let col = (i as u32) % cols;
+            let row = (i as u32) / cols;
+            let x0 = col * tile_w;
+            let y0 = row * tile_h;
+            descs[i] = crate::canvas_gpu::InStackLayerGpu {
+                doc_ox: ox as f32,
+                doc_oy: oy as f32,
+                doc_w: w as f32,
+                doc_h: h as f32,
+                atlas_u0: x0 as f32 / atlas_w as f32,
+                atlas_v0: y0 as f32 / atlas_h as f32,
+                atlas_u1: (x0 + w.max(1)) as f32 / atlas_w as f32,
+                atlas_v1: (y0 + h.max(1)) as f32 / atlas_h as f32,
+                mode: mode_u,
+                opacity,
+                clip: clip_code,
+            };
+        }
+        Some((descs, layers.len() as u32, atlas_w, atlas_h))
+    }
+
+    /// Pack above layers into a grid atlas (shared Soft∩float tile per layer).
+    fn instack_gpu_pack_atlas(
+        document: &Document,
+        layers: &[(usize, u32, u32, u32, u32, u32, f32, u32)],
+        atlas_w: u32,
+        atlas_h: u32,
+    ) -> Option<Vec<u8>> {
+        let n = layers.len();
+        if n == 0 {
+            return None;
+        }
+        let tile_w = layers[0].3.max(1);
+        let tile_h = layers[0].4.max(1);
+        let cols = (n as f32).sqrt().ceil() as u32;
+        let cols = cols.max(1);
+        let mut atlas = vec![0u8; (atlas_w as usize) * (atlas_h as usize) * 4];
+        for (i, &(li, ox, oy, w, h, ..)) in layers.iter().enumerate() {
+            let layer = document.layers.get(li)?;
+            let bounds = beautiful_core::DirtyRect {
+                x0: ox,
+                y0: oy,
+                x1: ox + w,
+                y1: oy + h,
+            };
+            let pix = layer.tiles.extract_region(bounds);
+            let bw = w.max(1) as usize;
+            let bh = h.max(1) as usize;
+            let col = (i as u32) % cols;
+            let row = (i as u32) / cols;
+            let x_off = col * tile_w;
+            let y_off = row * tile_h;
+            for r in 0..bh.min(tile_h as usize) {
+                let src = r * bw * 4;
+                let dst = ((y_off as usize + r) * atlas_w as usize + x_off as usize) * 4;
+                let copy = (bw * 4).min(tile_w as usize * 4);
+                if src + copy <= pix.len() && dst + copy <= atlas.len() {
+                    atlas[dst..dst + copy].copy_from_slice(&pix[src..src + copy]);
+                }
+            }
+        }
+        Some(atlas)
+    }
+
+    /// Pointer-up: sync Free pose into floating for commit; CPU Soft Light plate removed (GPU InStack).
+    pub fn finish_xform_above_live(&mut self, _ctx: &Context, document: &mut Document) {
+        if matches!(
+            self.transform_mode,
+            TransformMode::Distort | TransformMode::Mesh
+        ) && document.selection.floating_overlay_only
+        {
+            crate::canvas::transform_warp::refresh_warp_preview_full(self, document);
+        }
+        if matches!(self.transform_mode, TransformMode::Free)
+            && document.selection.floating_overlay_only
+        {
+            if let (Some(fx), Some((base, bw, bh, _, _))) =
+                (self.free_xform.clone(), self.transform_baseline.clone())
+            {
+                let posed = (fx.scale_x - 1.0).abs() > 1e-4
+                    || (fx.scale_y - 1.0).abs() > 1e-4
+                    || fx.rotation_deg.abs() > 1e-3;
+                if posed {
+                    let (pixels, nw, nh) = beautiful_core::apply_free_transform_rgba(
+                        &base,
+                        bw,
+                        bh,
+                        fx.scale_x,
+                        fx.scale_y,
+                        fx.rotation_deg,
+                        self.resample_final,
+                    );
+                    if let Some(f) = document.selection.floating.as_mut() {
+                        f.pixels = pixels;
+                        f.width = nw;
+                        f.height = nh;
+                        f.x = fx.center_x - nw as f32 * 0.5;
+                        f.y = fx.center_y - nh as f32 * 0.5;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Upload InStack GPU atlas when Soft∩float cell changes; float tex once per baseline.
+    pub fn softlight_gpu_prepare(
+        &mut self,
+        rs: &eframe::egui_wgpu::RenderState,
+        document: &Document,
+    ) -> Option<crate::canvas_gpu::SoftLightXformParams> {
+        self.softlight_gpu_drew = false;
+        if !self.softlight_gpu_xform_active(document) {
+            return None;
+        }
+        let (fx, (base, bw, bh, _, _)) = match (
+            self.free_xform.as_ref(),
+            self.transform_baseline.as_ref(),
+        ) {
+            (Some(fx), Some(b)) => (fx, b),
+            _ => return None,
+        };
+        let layers = self.instack_gpu_layers(document)?;
+        let (descs, count, atlas_w, atlas_h) = Self::instack_gpu_descs(&layers)?;
+        let clip = self.instack_session_clip(document)?;
+        // Expand-only: once Soft∩float grows, never shrink (stops Path B flicker at 8192 edge).
+        self.softlight_clip_frozen = Some(clip);
+        let float_key = (document.content_revision, *bw, *bh);
+        let atlas_key = (
+            document.content_revision,
+            *bw,
+            *bh,
+            atlas_w,
+            atlas_h,
+            clip.x0,
+            clip.y0,
+            clip.x1,
+            clip.y1,
+        );
+        let need_float = self.softlight_gpu_float_key != Some(float_key);
+        let need_atlas = self.softlight_gpu_upload_key != Some(atlas_key);
+        if need_float || need_atlas {
+            let atlas = if need_atlas {
+                let packed = Self::instack_gpu_pack_atlas(document, &layers, atlas_w, atlas_h)?;
+                crate::action_log::log(
+                    "instack_gpu",
+                    &format!(
+                        "upload float={}x{} atlas={}x{} layers={} clip={}x{}..{}x{} float_up={} atlas_up={}",
+                        bw, bh, atlas_w, atlas_h, count, clip.x0, clip.y0, clip.x1, clip.y1,
+                        need_float, need_atlas
+                    ),
+                );
+                crate::action_log::flush();
+                Some(packed)
+            } else {
+                None
+            };
+            if !crate::canvas_gpu::sync_softlight_sources_partial(
+                rs,
+                if need_float { Some((base.as_slice(), *bw, *bh)) } else { None },
+                atlas.as_ref().map(|a| (a.as_slice(), atlas_w, atlas_h)),
+            ) {
+                crate::action_log::log("instack_gpu", "sync_softlight_sources failed");
+                crate::action_log::flush();
+                return None;
+            }
+            if need_float {
+                self.softlight_gpu_float_key = Some(float_key);
+            }
+            if need_atlas {
+                self.softlight_gpu_upload_key = Some(atlas_key);
+            }
+        }
+        self.softlight_gpu_drew = true;
+        Some(crate::canvas_gpu::SoftLightXformParams {
+            doc_w: document.width as f32,
+            doc_h: document.height as f32,
+            free_center: (fx.center_x, fx.center_y),
+            free_scale: (fx.scale_x, fx.scale_y),
+            free_rot_deg: fx.rotation_deg,
+            baseline_w: *bw as f32,
+            baseline_h: *bh as f32,
+            float_opacity: document.floating_transform_opacity(),
+            float_mode: Self::blend_mode_gpu_u(document.floating_transform_blend_mode())
+                .unwrap_or(5),
+            layers: descs,
+            layer_count: count,
+        })
+    }
+
+    /// After underlay GPU present: freeze only when overlay z-order is ready.
+    pub fn note_xform_underlay_synced(&mut self, document: &Document) {
+        if !document.selection.floating_overlay_only || self.xform_underlay_frozen {
+            return;
+        }
+        let idx = document
+            .selection
+            .floating_layer
+            .unwrap_or(document.active_layer)
+            .min(document.layers.len().saturating_sub(1));
+        // Soft omitted on Path B — freeze once underlay (below only) is uploaded.
+        if document.transform_above_needs_backdrop() {
+            self.xform_underlay_frozen = true;
+            return;
+        }
+        let has_above = document.layers.iter().enumerate().any(|(i, layer)| {
+            i > idx && layer.visible && !layer.is_folder && layer.opacity > 0.0
+        });
+        // Do not freeze without the above plate — float would paint over those layers.
+        if has_above && self.xform_above_tex.is_none() {
+            self.dirty = true;
+            return;
+        }
+        self.xform_underlay_frozen = true;
+    }
+
+    /// True while transform session uses frozen underlay + overlay (Free / Distort / Mesh).
+    pub fn xform_live_overlay_active(&self, document: &Document) -> bool {
+        self.transform_session.is_some()
+            && document.selection.floating_overlay_only
+            && self.xform_underlay_frozen
+    }
+
+    /// Bake Free pose into floating + baseline so Distort/Mesh inherit the result.
+    /// Silent: keeps overlay_only and does not dirty the frozen underlay.
+    fn bake_pending_free_into_baseline(&mut self, document: &mut Document) {
+        if !matches!(self.transform_mode, TransformMode::Free) {
+            return;
+        }
+        let Some(fx) = self.free_xform.clone() else {
+            return;
+        };
+        let Some((pix, w, h, _ox, _oy)) = self.transform_baseline.clone() else {
+            return;
+        };
+        let (pixels, nw, nh) = beautiful_core::apply_free_transform_rgba(
+            &pix,
+            w,
+            h,
+            fx.scale_x,
+            fx.scale_y,
+            fx.rotation_deg,
+            self.resample_final,
+        );
+        let cx = fx.center_x;
+        let cy = fx.center_y;
+        let x = cx - nw as f32 * 0.5;
+        let y = cy - nh as f32 * 0.5;
+        if let Some(f) = document.selection.floating.as_mut() {
+            f.pixels = pixels.clone();
+            f.width = nw;
+            f.height = nh;
+            f.x = x;
+            f.y = y;
+            f.rotation_deg = 0.0;
+            document.selection.rect = Some(beautiful_core::SelectionRect {
+                x0: x,
+                y0: y,
+                x1: x + nw as f32,
+                y1: y + nh as f32,
+            });
+        }
+        document.selection.resync_mask_from_floating();
+        self.transform_baseline = Some((pixels, nw, nh, x, y));
+        self.free_xform = Some(FreeXform::from_baseline(nw, nh, x, y));
+        self.xform_live_tex = None;
+        self.xform_live_stale = true;
+    }
+
+    /// Commit warped floating into baseline (leaving Mesh/Distort).
+    /// Silent bake — underlay stays frozen.
+    fn bake_pending_warp_into_baseline(&mut self, document: &mut Document) {
+        if !matches!(
+            self.transform_mode,
+            TransformMode::Distort | TransformMode::Mesh
+        ) {
+            return;
+        }
+        let overlay = document.selection.floating_overlay_only;
+        // Rasterize current lattice into floating, then promote to baseline.
+        refresh_warp_preview_full(self, document);
+        document.selection.floating_overlay_only = overlay;
+        if let Some(f) = document.selection.floating.as_ref() {
+            self.transform_baseline = Some((f.pixels.clone(), f.width, f.height, f.x, f.y));
+            if let Some(fx) = self.free_xform.as_mut() {
+                *fx = FreeXform::from_baseline(f.width, f.height, f.x, f.y);
+            } else {
+                self.free_xform =
+                    Some(FreeXform::from_baseline(f.width, f.height, f.x, f.y));
+            }
+        }
+        self.clear_warp_controls();
+        self.xform_live_tex = None;
+        self.xform_live_stale = true;
+    }
+
+    /// Flatten current Free pose or Mesh lattice into `transform_baseline` (same session).
+    pub fn commit_live_transform_to_baseline(&mut self, document: &mut Document) {
+        if self.transform_session.is_none() {
+            return;
+        }
+        match self.transform_mode {
+            TransformMode::Free => self.bake_pending_free_into_baseline(document),
+            TransformMode::Distort | TransformMode::Mesh => {
+                self.bake_pending_warp_into_baseline(document)
+            }
+        }
+        document.selection.floating_overlay_only = true;
+    }
+
+    /// Re-enter gradient-style overlay without rebuilding the hole (same content_revision).
+    fn arm_overlay_live(&mut self, document: &mut Document, rebuild_underlay: bool) {
+        document.end_transform_sandwich();
+        document.selection.floating_overlay_only = true;
+        document.composite.offscreen_dirty.clear();
+        document.composite.dirty_parts.clear();
+        self.xform_live_tex = None;
+        self.xform_live_stale = true;
+        if rebuild_underlay || !self.xform_underlay_frozen {
+            document.composite.mark_full();
+            self.xform_underlay_frozen = false;
+            self.xform_above_tex = None;
+                    self.display_mip_tex = None;
+            self.display_mip = beautiful_core::DisplayMip::empty();
+            self.display_lod = 1;
+            self.gpu_invalidate = true;
+            self.mark_dirty();
+        }
     }
 
     /// Switch Free / Distort / Mesh without discarding the current pixel result.
@@ -248,35 +906,51 @@ impl CanvasState {
         }
 
         if self.transform_session.is_some() {
-            if let Some(f) = document.selection.floating.as_ref() {
-                self.transform_baseline = Some((f.pixels.clone(), f.width, f.height, f.x, f.y));
+            match self.transform_mode {
+                TransformMode::Free => self.bake_pending_free_into_baseline(document),
+                TransformMode::Distort | TransformMode::Mesh => {
+                    self.bake_pending_warp_into_baseline(document)
+                }
             }
-            self.clear_warp_controls();
-            self.clear_free_xform();
-            if let Some((_, w, h, ox, oy)) = self.transform_baseline.as_ref() {
-                self.free_xform = Some(FreeXform::from_baseline(*w, *h, *ox, *oy));
-            }
+            // Stay on overlay path across mode switches (one session, many modes).
+            document.selection.floating_overlay_only = true;
+            document.end_transform_sandwich();
         }
 
+        let prev = self.transform_mode;
         self.transform_mode = mode;
         *tool = tool_for;
         if matches!(mode, TransformMode::Distort | TransformMode::Mesh) {
-            // Fresh lattice for the baked baseline (previous handles are wrong size/space).
-            if self.warp_controls.is_none() {
+            // Fresh lattice on the *baked* baseline (size may have changed after Free).
+            if self.warp_controls.is_none()
+                || !matches!(prev, TransformMode::Distort | TransformMode::Mesh)
+            {
                 self.mesh_grid_n = if mode == TransformMode::Mesh { 4 } else { 2 };
+                self.clear_warp_controls();
+            } else if prev != mode {
+                // Distort ↔ Mesh: rebuild lattice for new topology on same baseline.
+                self.mesh_grid_n = if mode == TransformMode::Mesh { 4 } else { 2 };
+                self.clear_warp_controls();
             }
             ensure_warp_grid(self, document);
             if self.transform_session.is_some() {
-                refresh_warp_preview_full(self, document);
+                self.arm_overlay_live(document, false);
             }
         } else if self.transform_session.is_some() {
-            refresh_free_transform_preview(self, document, false);
+            // Free on baked baseline (identity pose = last Mesh/Distort/Free result).
+            if let Some((_, w, h, ox, oy)) = self.transform_baseline.as_ref() {
+                self.free_xform = Some(FreeXform::from_baseline(*w, *h, *ox, *oy));
+            }
+            self.arm_overlay_live(document, false);
+            sync_free_floating_pose(self, document);
         } else if mode == TransformMode::Distort {
             self.mesh_grid_n = 2;
         } else if mode == TransformMode::Mesh {
             self.mesh_grid_n = 4;
         }
-        self.mark_dirty();
+        if !self.xform_underlay_frozen {
+            self.mark_dirty();
+        }
     }
 
     pub fn reset_warp_to_baseline(&mut self, document: &mut Document) {
@@ -383,6 +1057,7 @@ impl CanvasState {
             document
                 .selection
                 .lift_from_layer(&mut document.layers[idx], idx);
+            document.layers[idx].invalidate_paint_f();
             document.selection.rect = Some(rect);
             document.invalidate_selection_footprint();
             let holed = document.layers[idx].tiles.clone_shared();
@@ -405,11 +1080,58 @@ impl CanvasState {
             sel_mask,
             sel_outline,
         });
+        // Gradient-style live Free Transform: composite underlay (hole) once;
+        // drag paints baseline tex with a pose matrix — no per-frame CPU bake.
+        document.end_transform_sandwich();
+        document.selection.floating_overlay_only = true;
+        document.composite.force_full = false;
+        document.composite.offscreen_dirty.clear();
+        document.composite.dirty_parts.clear();
+        document.bump_content();
+        // Full underlay once (below + hole, no above). mark_full so GPU cannot keep
+        // a pre-lift plate that shows the ghost remnant.
+        document.composite.mark_full();
+        self.xform_underlay_frozen = false;
+        self.xform_live_tex = None;
+        self.xform_live_stale = true;
+        self.xform_above_tex = None;
+        self.softlight_gpu_upload_key = None;
+        self.softlight_gpu_float_key = None;
+        self.softlight_clip_frozen = None;
+        self.softlight_gpu_drew = false;
+        // Drop mip/GPU caches — zoomed tiles must not keep pre-lift content.
+        self.display_mip_tex = None;
+        self.display_mip = beautiful_core::DisplayMip::empty();
+        self.display_lod = 1;
+        self.gpu_invalidate = true;
         self.mark_dirty();
+        crate::action_log::log(
+            "transform",
+            &format!(
+                "begin overlay layer={idx} needs_backdrop={} float_blend={}",
+                document.transform_above_needs_backdrop(),
+                document.transform_float_needs_backdrop()
+            ),
+        );
+        self.log_transform_blend_path(document, "begin");
+        crate::action_log::flush();
         true
     }
 
     pub fn confirm_transform_session(&mut self, document: &mut Document, tool: &mut WorkspaceTool) {
+        // If still in Free overlay, bake pose before commit path.
+        if matches!(self.transform_mode, TransformMode::Free)
+            && document.selection.floating_overlay_only
+        {
+            self.bake_pending_free_into_baseline(document);
+        }
+        // Leave overlay path before baking so invalidate/composite see floating again.
+        document.selection.floating_overlay_only = false;
+        document.end_transform_sandwich();
+        self.xform_underlay_frozen = false;
+        self.xform_live_tex = None;
+        self.xform_live_stale = false;
+        self.xform_above_tex = None;
         let mesh_mode = matches!(*tool, WorkspaceTool::Warp)
             || (matches!(*tool, WorkspaceTool::Transform)
                 && matches!(
@@ -426,6 +1148,7 @@ impl CanvasState {
                 let n = self.mesh_grid_n.max(2);
                 let handles = self.warp_node_handles.clone();
                 let old_footprint = document.floating_selection_dirty_rect();
+                let subdiv = beautiful_core::warp_bake_cell_subdiv(w, h, n, true);
                 document.selection.mesh_warp_floating_from_ex(
                     &pix,
                     w,
@@ -437,7 +1160,7 @@ impl CanvasState {
                     handles.as_ref().map(|v| v.as_slice()),
                     false,
                     true,
-                    12,
+                    subdiv,
                 );
                 document.invalidate_floating_change(old_footprint);
             }
@@ -487,6 +1210,17 @@ impl CanvasState {
         }
         self.transform_baseline = None;
         self.free_xform = None;
+        self.xform_live_tex = None;
+        self.xform_above_tex = None;
+        self.xform_underlay_frozen = false;
+        self.softlight_gpu_upload_key = None;
+        self.softlight_gpu_float_key = None;
+        self.softlight_clip_frozen = None;
+        self.softlight_gpu_drew = false;
+        self.softlight_gpu_release = true;
+        document.end_transform_sandwich();
+        document.selection.floating_overlay_only = false;
+        document.release_transform_plates();
         self.warp_controls = None;
         self.warp_node_handles = None;
         self.warp_handle_unison = None;
@@ -499,6 +1233,9 @@ impl CanvasState {
         self.thumbs_deferred = true;
         self.layer_thumb_pending = Some(confirm_layer);
         self.nav_pending = true;
+        // Overlay underlay had layers-above stripped — force full stack rebuild
+        // (partial dirty left stale tiles until eye toggle).
+        document.touch();
         self.mark_dirty();
     }
 
@@ -517,6 +1254,17 @@ impl CanvasState {
         }
         self.transform_baseline = None;
         self.free_xform = None;
+        self.xform_live_tex = None;
+        self.xform_above_tex = None;
+        self.xform_underlay_frozen = false;
+        self.softlight_gpu_upload_key = None;
+        self.softlight_gpu_float_key = None;
+        self.softlight_clip_frozen = None;
+        self.softlight_gpu_drew = false;
+        self.softlight_gpu_release = true;
+        document.end_transform_sandwich();
+        document.selection.floating_overlay_only = false;
+        document.release_transform_plates();
         self.warp_controls = None;
         self.warp_node_handles = None;
         self.warp_handle_unison = None;
@@ -524,6 +1272,7 @@ impl CanvasState {
         self.warp_proxy = None;
         *tool = WorkspaceTool::SelectRect;
         self.transform_mode = TransformMode::Free;
+        document.touch();
         self.mark_dirty();
     }
 
@@ -614,6 +1363,7 @@ impl CanvasState {
             tool,
             WorkspaceTool::Brush
                 | WorkspaceTool::Pencil
+                | WorkspaceTool::PixelBrush
                 | WorkspaceTool::Airbrush
                 | WorkspaceTool::Mixer
                 | WorkspaceTool::Eraser
@@ -892,17 +1642,21 @@ impl CanvasState {
         )
     }
 
-    /// True while coarser display LOD is deferred (zoom gesture still live).
+    /// True while *coarser* LOD is deferred (zoom gesture still live).
+    /// Sharpen is not gated by this — see `resolve_display_lod`.
     pub fn coarsen_held(&self) -> bool {
         self.coarsen_hold_until
             .map(|t| std::time::Instant::now() < t)
             .unwrap_or(false)
     }
 
-    /// After the last wheel notch, wait this long before allowing a coarser mip.
-    /// Hybrid viewport fill made coarsen cheap; keep a short settle so trackpad
-    /// inertia does not thrash LOD, without the old 550ms full-rebuild hang.
-    const COARSEN_HOLD: std::time::Duration = std::time::Duration::from_millis(180);
+    /// After the last wheel notch, wait this long before allowing LOD *coarsen*.
+    ///
+    /// Must exceed typical inter-notch gaps. Action log showed ~226–280ms between
+    /// notches; a 220ms hold expired mid-gesture and applied coarsen (`1→2`,
+    /// `2→8`) while the user was still zooming — F12: mip_view×31.
+    /// Sharpen stays one-octave/frame during the hold (avoids zoom-in shakal).
+    const COARSEN_HOLD: std::time::Duration = std::time::Duration::from_millis(500);
 
     fn note_zoom_gesture(&mut self) {
         self.coarsen_hold_until = Some(std::time::Instant::now() + Self::COARSEN_HOLD);
@@ -1118,8 +1872,18 @@ impl CanvasState {
         self.pan = Vec2::ZERO;
     }
 
-    /// Document-space rectangle currently visible in the workspace viewport.
-    pub fn visible_doc_rect(&self, doc_w: f32, doc_h: f32, flip_h: bool) -> egui::Rect {
+    /// Viewport footprint in document space (may extend past the canvas).
+    ///
+    /// Like Photoshop's Navigator red box: full viewport AABB, not clamped to the
+    /// document. Clamping corners independently collapsed the rect into a line/point
+    /// when the view hung off an edge; skipping out-of-doc corners via
+    /// [`screen_to_canvas`] did the same.
+    pub fn visible_doc_rect_unbounded(
+        &self,
+        doc_w: f32,
+        doc_h: f32,
+        flip_h: bool,
+    ) -> egui::Rect {
         if !self.last_viewport.is_positive() || !self.last_canvas_rect.is_positive() {
             return egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(doc_w, doc_h));
         }
@@ -1140,7 +1904,7 @@ impl CanvasState {
 
         for c in corners {
             if let Some((x, y)) =
-                screen_to_canvas(c, canvas, doc_w, doc_h, self.rotation_deg, flip_h)
+                screen_to_doc_space(c, canvas, doc_w, doc_h, self.rotation_deg, flip_h)
             {
                 min_x = min_x.min(x);
                 min_y = min_y.min(y);
@@ -1149,14 +1913,24 @@ impl CanvasState {
             }
         }
 
-        if !min_x.is_finite() {
+        if !min_x.is_finite() || max_x <= min_x || max_y <= min_y {
             return egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(doc_w, doc_h));
         }
 
-        egui::Rect::from_min_max(
-            egui::pos2(min_x.clamp(0.0, doc_w), min_y.clamp(0.0, doc_h)),
-            egui::pos2(max_x.clamp(0.0, doc_w), max_y.clamp(0.0, doc_h)),
-        )
+        egui::Rect::from_min_max(egui::pos2(min_x, min_y), egui::pos2(max_x, max_y))
+    }
+
+    /// Document ∩ viewport (clamped). For composite / LOD cover — never a collapsed edge.
+    pub fn visible_doc_rect(&self, doc_w: f32, doc_h: f32, flip_h: bool) -> egui::Rect {
+        let unbounded = self.visible_doc_rect_unbounded(doc_w, doc_h, flip_h);
+        let doc = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(doc_w, doc_h));
+        let hit = unbounded.intersect(doc);
+        if hit.is_positive() {
+            hit
+        } else {
+            // Fully off-canvas: empty — callers treat as no view cover.
+            egui::Rect::NOTHING
+        }
     }
 
     /// Visible document area as a DirtyRect (for viewport-clipped composite).
@@ -1166,6 +1940,9 @@ impl CanvasState {
             document.height as f32,
             document.view_flip_h,
         );
+        if !r.is_positive() {
+            return beautiful_core::DirtyRect::empty();
+        }
         beautiful_core::DirtyRect::from_egui_doc_rect(
             r.min.x,
             r.min.y,
@@ -1193,18 +1970,18 @@ impl CanvasState {
             self.nav_thumb_rev = u64::MAX; // rebuild navigator thumb
         }
 
-        let want = beautiful_core::lod_factor_for_document(
+        let view_probe = self.view_dirty_rect(document);
+        let plan = beautiful_core::plan_display_frame(
             self.zoom,
             self.display_lod,
             document.width,
             document.height,
-        );
-        let lod = beautiful_core::resolve_display_lod(
-            self.display_lod,
-            want,
             !self.coarsen_held(),
+            view_probe,
+            &self.display_mip,
         );
-        let lod_changed = lod != self.display_lod;
+        let lod = plan.lod;
+        let lod_changed = plan.lod_changed;
         if lod_changed {
             crate::action_log::log(
                 "lod",
@@ -1213,7 +1990,7 @@ impl CanvasState {
                     self.zoom,
                     document.width,
                     document.height,
-                    self.display_lod,
+                    plan.raw_lod,
                     lod,
                     beautiful_core::MAX_GPU_TEX_SIDE
                 ),
@@ -1222,19 +1999,16 @@ impl CanvasState {
         let filter_changed =
             texture_filter_bucket(self.zoom) != texture_filter_bucket(self.filter_zoom);
 
-        // Hot path: idle hover / cursor move — zero GPU texture work.
-        // At lod>1 also require viewport mip coverage (pan can expand without dirty).
-        let view_probe = self.view_dirty_rect(document);
-        let cover_probe = view_probe.padded(128, document.width, document.height);
-        let mip_ready = self.display_lod <= 1
-            || (self.display_mip_tex.is_some() && self.display_mip.covers_doc(cover_probe));
+        // Hot path: idle hover / cursor move — zero texture work.
+        let mip_ready = plan.mip_covers_view
+            && (self.display_lod <= 1 || self.display_mip_tex.is_some());
         if !self.dirty && !filter_changed && !lod_changed && self.texture.is_some() && mip_ready {
             return;
         }
 
         let opts = canvas_texture_options(self.zoom);
         self.filter_zoom = self.zoom;
-        self.display_lod = lod;
+        // LOD committed after present update below (same rule as GPU path).
 
         if !self.dirty && !lod_changed {
             // Only filter mode changed on existing full-res tex.
@@ -1249,37 +2023,53 @@ impl CanvasState {
                     }
                 }
             }
+            self.display_lod = lod;
             return;
         }
 
-        const VIEW_PAD: u32 = 128;
         let view = self.view_dirty_rect(document);
+        let cover = plan.cover;
         document.expose_view(view);
-        // Viewport sync only — LOD mip is rebuilt from layers, not full composite.
-        // Leaving mip LOD requires a fresh full-res plate even if only zoom dirty.
-        // Use ensure_for_view — not ensure_dense — so Roi docs stay viewport-sized.
         if lod_changed && lod <= 1 {
-            let cover = view.padded(VIEW_PAD, document.width, document.height);
             document.composite.invalidate_rect(cover);
-            document.composite.ensure_for_view(view, VIEW_PAD);
+            document
+                .composite
+                .ensure_for_view(view, beautiful_core::DISPLAY_VIEW_PAD);
         }
-        let sync = if self.dirty || (lod_changed && lod <= 1) {
-            document.sync_display_view(view, VIEW_PAD)
-        } else {
+        let sync = if beautiful_core::skip_projection_for_mip(
+            lod,
+            lod_changed,
+            false,
+            document.composite.has_pending_work(),
+        ) && !self.dirty
+        {
             beautiful_core::SyncResult {
                 full_upload: false,
                 partial: None,
                 partials: Vec::new(),
             }
+        } else {
+            // Soft/Hard above: omit from underlay; Path B GPU restores Soft over float.
+            document.transform_omit_blend_above = document.transform_above_needs_backdrop()
+                && matches!(self.transform_mode, TransformMode::Free)
+                && document.selection.floating_overlay_only;
+            document.sync_display_view(view, beautiful_core::DISPLAY_VIEW_PAD)
         };
+        document.transform_omit_blend_above = false;
         let name = "canvas_composite";
         let roi = document.composite.is_roi();
 
         if lod <= 1 {
             // Full-resolution display path (zoom ≳ 75%).
             if !roi && !document.composite.dense_pixels_ready() {
-                document.composite.ensure_for_view(view, VIEW_PAD);
-                let _ = document.sync_display_view(view, VIEW_PAD);
+                document
+                    .composite
+                    .ensure_for_view(view, beautiful_core::DISPLAY_VIEW_PAD);
+                document.transform_omit_blend_above = document.transform_above_needs_backdrop()
+                    && matches!(self.transform_mode, TransformMode::Free)
+                    && document.selection.floating_overlay_only;
+                let _ = document.sync_display_view(view, beautiful_core::DISPLAY_VIEW_PAD);
+                document.transform_omit_blend_above = false;
             }
 
             let upload_parts = |tex: &mut egui::TextureHandle, parts: &[DirtyRect]| {
@@ -1360,92 +2150,35 @@ impl CanvasState {
                 let _ = document.composite.take_gpu_dirty();
             }
         } else {
-            // Zoomed-out: hybrid viewport mip (same policy as canvas_gpu).
+            // Zoomed-out: shared hybrid mip plan (same as canvas_gpu).
             let mip_opts = TextureOptions {
                 magnification: TextureFilter::Linear,
                 minification: TextureFilter::Linear,
                 ..TextureOptions::LINEAR
             };
-            let cover = view.padded(VIEW_PAD, document.width, document.height);
-            let mip_size_ok = self.display_mip.factor == lod
-                && self.display_mip.width == ((document.width + lod - 1) / lod).max(1)
-                && self.display_mip.height == ((document.height + lod - 1) / lod).max(1);
-            if lod_changed || !mip_size_ok || self.display_mip_tex.is_none() {
-                self.display_mip.invalidate_coverage();
-                self.display_mip.ensure_size(document.width, document.height, lod);
-                let floating = document.floating_blit();
-                let _ = self.display_mip.ensure_view_from_layers(
-                    document.background,
-                    &document.layers,
-                    floating,
-                    document.width,
-                    document.height,
-                    lod,
-                    cover,
-                );
-            } else if sync.full_upload {
-                self.display_mip.invalidate_coverage();
-                let floating = document.floating_blit();
-                let _ = self.display_mip.ensure_view_from_layers(
-                    document.background,
-                    &document.layers,
-                    floating,
-                    document.width,
-                    document.height,
-                    lod,
-                    cover,
-                );
-            } else {
-                let rects: Vec<DirtyRect> = if !sync.partials.is_empty() {
-                    sync.partials.clone()
-                } else if let Some(r) = sync.partial {
-                    vec![r]
-                } else {
-                    Vec::new()
-                };
-                self.display_mip
-                    .ensure_size(document.width, document.height, lod);
-                for rect in rects {
-                    if let Some(pixels) = document.composite.dense_pixels() {
-                        self.display_mip.update_dirty(
-                            pixels,
-                            document.width,
-                            document.height,
-                            lod,
-                            rect,
-                        );
-                    } else {
-                        let packed = document.composite.extract(rect);
-                        if !packed.is_empty() {
-                            self.display_mip
-                                .update_from_packed_rect(&packed, rect, lod);
-                        } else {
-                            let floating = document.floating_blit();
-                            self.display_mip.update_dirty_from_layers(
-                                document.background,
-                                &document.layers,
-                                floating,
-                                document.width,
-                                document.height,
-                                lod,
-                                rect,
-                            );
-                        }
-                    }
-                }
-                if !self.display_mip.covers_doc(cover) {
-                    let floating = document.floating_blit();
-                    let _ = self.display_mip.ensure_view_from_layers(
-                        document.background,
-                        &document.layers,
-                        floating,
-                        document.width,
-                        document.height,
-                        lod,
-                        cover,
-                    );
-                }
-            }
+            let mip_ok = beautiful_core::mip_size_matches(
+                &self.display_mip,
+                document.width,
+                document.height,
+                lod,
+            );
+            let present_ok = self.display_mip_tex.is_some() && mip_ok;
+            let covers = self.display_mip.covers_doc(cover);
+            let action = beautiful_core::plan_mip_action(
+                lod_changed,
+                mip_ok,
+                present_ok,
+                false,
+                &sync,
+                covers,
+            );
+            let _ = beautiful_core::apply_mip_action(
+                &mut self.display_mip,
+                document,
+                lod,
+                cover,
+                action,
+            );
             let image = ColorImage::from_rgba_unmultiplied(
                 [
                     self.display_mip.width as usize,
@@ -1482,6 +2215,7 @@ impl CanvasState {
             }
         }
 
+        self.display_lod = lod.max(1);
         self.dirty = false;
     }
 
@@ -1495,11 +2229,6 @@ impl CanvasState {
         } else {
             self.texture.as_ref().map(|t| t.id())
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn texture_id(&self) -> Option<egui::TextureId> {
-        self.texture.as_ref().map(|t| t.id())
     }
 
     /// Navigator overview: prefer canvas display mip (smooth), else dense, else layers.
@@ -1798,3 +2527,4 @@ pub(crate) use types::*;
 pub use coords::ZOOM_STEP;
 pub use types::{CropAspect, GradientSession, TransformMode, TransformSession};
 pub use view::CanvasView;
+

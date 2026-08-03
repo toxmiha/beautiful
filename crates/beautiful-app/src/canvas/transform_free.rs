@@ -294,7 +294,18 @@ pub(crate) fn drag_free_transform(
     }
 
     if let Some((dx, dy)) = move_delta {
-        // Live move: shift floating pixels every frame (handles track free_xform).
+        // Pose-only while overlay frozen (gradient model): no composite / dirty.
+        if document.selection.floating_overlay_only {
+            document.selection.move_floating(dx, dy);
+            if let Some(f) = document.selection.floating.as_ref() {
+                if let Some(fx) = state.free_xform.as_mut() {
+                    fx.center_x = f.x + f.width as f32 * 0.5;
+                    fx.center_y = f.y + f.height as f32 * 0.5;
+                }
+            }
+            ctx.request_repaint();
+            return;
+        }
         document.move_floating_selection(dx, dy);
         if let Some(f) = document.selection.floating.as_ref() {
             if let Some(fx) = state.free_xform.as_mut() {
@@ -302,46 +313,44 @@ pub(crate) fn drag_free_transform(
                 fx.center_y = f.y + f.height as f32 * 0.5;
             }
         }
-        if let Some(old) = old_obb {
-            document.touch_region(old);
-        }
-        if let Some(fx) = state.free_xform.as_ref() {
-            document.touch_region(free_obb_dirty_rect(
-                fx,
-                bw,
-                bh,
-                document.width,
-                document.height,
-            ));
-        }
         state.mark_dirty();
         ctx.request_repaint();
         return;
     }
 
     if need_pixels {
-        // Always resample on scale/rotate — pose-only updates left wrong-sized
-        // floating buffers and ghost footprints at the old AABB.
-        state.last_warp_preview_at = instant_secs();
-        refresh_free_transform_preview(state, document, true);
-        if let Some(old) = old_obb {
-            document.touch_region(old);
+        // Overlay path: stretch/rotate via textured quad — no CPU resample.
+        if document.selection.floating_overlay_only {
+            sync_free_floating_pose(state, document);
+            ctx.request_repaint();
+            return;
         }
-        if let Some(fx) = state.free_xform.as_ref() {
-            document.touch_region(free_obb_dirty_rect(
-                fx,
-                bw,
-                bh,
-                document.width,
-                document.height,
-            ));
+        // Throttled resample (~12 fps) for sandwich / in-stack fallback.
+        let now = instant_secs();
+        if now - state.last_free_preview_at >= 0.08 {
+            state.last_free_preview_at = now;
+            refresh_free_transform_preview(state, document, true);
+            if let Some(old) = old_obb {
+                if document.transform_sandwich_active() {
+                    document.touch_transform_display(Some(old));
+                } else {
+                    document.touch_region(old);
+                }
+            }
+            if let Some(fx) = state.free_xform.as_ref() {
+                let obb = free_obb_dirty_rect(fx, bw, bh, document.width, document.height);
+                if document.transform_sandwich_active() {
+                    document.touch_transform_display(Some(obb));
+                } else {
+                    document.touch_region(obb);
+                }
+            }
+            state.mark_dirty();
         }
-        state.mark_dirty();
         ctx.request_repaint();
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn sync_free_floating_pose(state: &mut CanvasState, document: &mut Document) {
     let Some(fx) = state.free_xform.as_ref() else {
         return;
@@ -349,7 +358,7 @@ pub(crate) fn sync_free_floating_pose(state: &mut CanvasState, document: &mut Do
     let Some(f) = document.selection.floating.as_mut() else {
         return;
     };
-    // Keep AABB around current buffer; preview refresh sets exact size.
+    // Keep AABB around current buffer; preview refresh / Apply sets exact size.
     f.x = fx.center_x - f.width as f32 * 0.5;
     f.y = fx.center_y - f.height as f32 * 0.5;
     document.selection.rect = Some(SelectionRect {
@@ -365,6 +374,7 @@ pub(crate) fn refresh_free_transform_preview(
     document: &mut Document,
     allow_proxy: bool,
 ) {
+    let _t = crate::perf::Scope::new(crate::perf::Category::Composite, "xform.free_preview");
     let Some((pix, w, h, _, _)) = state.transform_baseline.as_ref() else {
         return;
     };
@@ -373,50 +383,23 @@ pub(crate) fn refresh_free_transform_preview(
     };
     let old_footprint = document.floating_selection_dirty_rect();
     let old_obb = free_obb_dirty_rect(fx, *w, *h, document.width, document.height);
-    let area = (*w as u64).saturating_mul(*h as u64);
-    let step = if allow_proxy {
-        if area > 4_000_000 {
-            8u32
-        } else if area > 1_000_000 {
-            4
-        } else if area > 200_000 {
-            2
-        } else {
-            1
-        }
-    } else {
-        1
-    };
 
-    let (src_owned, sw, sh, sx, sy) = if step > 1 {
-        let sw = ((*w + step - 1) / step).max(1);
-        let sh = ((*h + step - 1) / step).max(1);
-        let small = beautiful_core::resample_nearest(pix, *w, *h, sw, sh);
-        (Some(small), sw, sh, fx.scale_x, fx.scale_y)
-    } else {
-        (None, *w, *h, fx.scale_x, fx.scale_y)
-    };
-    let src = src_owned.as_deref().unwrap_or(pix);
-
+    // Drag/release: Nearest/Bilinear at full OBB size (matches handles). Apply: HQ.
+    // Ignore UI "Dragging: Bicubic Automatic" during live — that alone is 80–160ms.
     let filter = if allow_proxy {
         beautiful_core::ResampleFilter::Nearest
     } else {
-        state.resample_drag
+        state.resample_final
     };
-    let (mut pixels, mut nw, mut nh) =
-        beautiful_core::apply_free_transform_rgba(src, sw, sh, sx, sy, fx.rotation_deg, filter);
-
-    if allow_proxy {
-        const MAX_SIDE: u32 = 1024;
-        if nw.max(nh) > MAX_SIDE {
-            let scale = MAX_SIDE as f32 / nw.max(nh) as f32;
-            let pw = ((nw as f32 * scale).round() as u32).max(1);
-            let ph = ((nh as f32 * scale).round() as u32).max(1);
-            pixels = beautiful_core::resample_nearest(&pixels, nw, nh, pw, ph);
-            nw = pw;
-            nh = ph;
-        }
-    }
+    let (pixels, nw, nh) = beautiful_core::apply_free_transform_rgba(
+        pix,
+        *w,
+        *h,
+        fx.scale_x,
+        fx.scale_y,
+        fx.rotation_deg,
+        filter,
+    );
 
     let cx = fx.center_x;
     let cy = fx.center_y;
@@ -434,13 +417,26 @@ pub(crate) fn refresh_free_transform_preview(
             y1: f.y + f.height as f32,
         });
     }
-    document.invalidate_floating_change(old_footprint);
-    document.touch_region(old_obb);
-    document.touch_region(free_obb_dirty_rect(
-        fx,
-        *w,
-        *h,
-        document.width,
-        document.height,
-    ));
+    document.selection.floating_overlay_only = false;
+    if document.transform_sandwich_active() {
+        document.touch_transform_display(old_footprint);
+        document.touch_transform_display(Some(old_obb));
+        document.touch_transform_display(Some(free_obb_dirty_rect(
+            fx,
+            *w,
+            *h,
+            document.width,
+            document.height,
+        )));
+    } else {
+        document.invalidate_floating_change(old_footprint);
+        document.touch_region(old_obb);
+        document.touch_region(free_obb_dirty_rect(
+            fx,
+            *w,
+            *h,
+            document.width,
+            document.height,
+        ));
+    }
 }
