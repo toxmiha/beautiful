@@ -101,6 +101,9 @@ pub struct Document {
     /// live overlay corrects Soft Light∩float only.
     #[serde(skip)]
     pub transform_omit_blend_above: bool,
+    /// Ctrl+Move: pre-lift tiles + selection until floating is sealed on deselect.
+    #[serde(skip)]
+    pub sel_float_undo: Option<(usize, TileBuffer, SelectionSnap)>,
     /// Bumped on pixel/structure/opacity edits — not on pure visibility toggles.
     #[serde(skip)]
     edit_gen: u64,
@@ -162,6 +165,7 @@ impl Document {
             property_fast_idx: None,
             transform_sandwich_idx: None,
             transform_omit_blend_above: false,
+            sel_float_undo: None,
             edit_gen: 0,
             history: History::default(),
             op_journal: DocOpJournal::default(),
@@ -333,6 +337,11 @@ impl Document {
     }
 
     pub fn undo(&mut self) -> bool {
+        // Parked Ctrl+Move: first Undo restores pre-lift pixels (do not leave a hole
+        // while undoing an older history step).
+        if self.selection.floating.is_some() && self.sel_float_undo.is_some() {
+            return self.discard_parked_selection_float();
+        }
         // Mid-stroke Ctrl+Z must restore pixels, not drop the snapshot and undo
         // an older history entry.
         if self.history.stroke_is_open() {
@@ -382,6 +391,15 @@ impl Document {
     }
 
     fn apply_history_effect(&mut self, effect: crate::history::HistoryEffect) {
+        // Never leave a lift-hole under a history restore.
+        if self.sel_float_undo.is_some() {
+            let _ = self.discard_parked_selection_float();
+        } else if self.selection.floating.is_some() {
+            self.selection.floating = None;
+            self.selection.floating_layer = None;
+            self.selection.floating_overlay_only = false;
+            self.end_transform_sandwich();
+        }
         if let Some(sel) = effect.selection {
             self.selection.floating = None;
             self.selection.floating_layer = None;
@@ -603,6 +621,7 @@ impl Document {
         if layer_idx >= self.layers.len() || self.selection.floating.is_none() {
             return;
         }
+        self.sel_float_undo = None;
         let mut dirty = self
             .floating_selection_dirty_rect()
             .unwrap_or_else(DirtyRect::empty);
@@ -675,6 +694,7 @@ impl Document {
             self.selection.refresh_outline();
         }
         self.bump_content();
+        self.end_transform_sandwich();
         self.touch_region(dirty);
     }
 
@@ -685,13 +705,106 @@ impl Document {
         layer_before: &TileBuffer,
         undo_sel: SelectionSnap,
     ) {
+        // Dirty = float ∪ origin only — full touch() was a Ctrl+Z FPS cliff on 4K docs.
+        let mut dirty = self
+            .floating_selection_dirty_rect()
+            .unwrap_or_else(DirtyRect::empty);
+        if let Some(r) = self.selection.rect {
+            dirty.union(DirtyRect::from_egui_doc_rect(
+                r.x0,
+                r.y0,
+                r.x1,
+                r.y1,
+                self.width,
+                self.height,
+            ));
+        }
+        if let Some(r) = undo_sel.rect {
+            dirty.union(DirtyRect::from_egui_doc_rect(
+                r.x0,
+                r.y0,
+                r.x1,
+                r.y1,
+                self.width,
+                self.height,
+            ));
+        }
         if layer_idx < self.layers.len() {
             self.layers[layer_idx].tiles.restore_shared(layer_before);
             self.layers[layer_idx].invalidate_paint_f();
         }
         self.restore_selection_snap(undo_sel);
+        self.end_transform_sandwich();
+        self.sel_float_undo = None;
         self.bump_content();
-        self.touch();
+        dirty.clamp_to(self.width, self.height);
+        if dirty.is_empty() {
+            self.touch();
+        } else {
+            self.touch_region(dirty.padded(64, self.width, self.height));
+        }
+    }
+
+    /// Park Ctrl+Move: keep hole + floating until deselect seals (SAI/PS-style).
+    pub fn park_selection_float(
+        &mut self,
+        layer_idx: usize,
+        layer_before: TileBuffer,
+        undo_sel: SelectionSnap,
+    ) {
+        self.sel_float_undo = Some((layer_idx, layer_before, undo_sel));
+        self.end_transform_sandwich();
+        self.invalidate_parked_float_display();
+    }
+
+    /// Kill ghost: dirty lift-origin hole ∪ current float.
+    pub fn invalidate_parked_float_display(&mut self) {
+        let mut dirty = DirtyRect::empty();
+        if let Some(fr) = self.floating_selection_dirty_rect() {
+            dirty.union(fr);
+        }
+        if let Some((_, _, snap)) = self.sel_float_undo.as_ref() {
+            if let Some(r) = snap.rect {
+                dirty.union(DirtyRect::from_egui_doc_rect(
+                    r.x0,
+                    r.y0,
+                    r.x1,
+                    r.y1,
+                    self.width,
+                    self.height,
+                ));
+            }
+        }
+        dirty.clamp_to(self.width, self.height);
+        if dirty.is_empty() {
+            return;
+        }
+        dirty = dirty.padded(64, self.width, self.height);
+        self.composite.mark_dirty(dirty);
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Seal floating into the layer (deselect / Ctrl+D). Uses pre-lift undo when present.
+    pub fn seal_floating_selection(&mut self) {
+        if self.selection.floating.is_none() {
+            self.sel_float_undo = None;
+            return;
+        }
+        if let Some((idx, before, undo_sel)) = self.sel_float_undo.take() {
+            self.commit_selection_move(idx, &before, undo_sel);
+        } else {
+            self.commit_selection();
+            self.end_transform_sandwich();
+        }
+    }
+
+    /// Discard floating and restore pre-lift tiles (Ctrl+Z / Esc of a parked move).
+    pub fn discard_parked_selection_float(&mut self) -> bool {
+        let Some((idx, before, undo_sel)) = self.sel_float_undo.take() else {
+            return false;
+        };
+        self.cancel_selection_move(idx, &before, undo_sel);
+        true
     }
 
     /// Commit floating onto a restored post-lift (holed) tile snapshot (one history step).
@@ -845,7 +958,8 @@ impl Document {
 
     pub fn deselect(&mut self) {
         if self.selection.floating.is_some() {
-            self.commit_selection();
+            // Seal parked Ctrl+Move (or any floating) — hole closes only on deselect.
+            self.seal_floating_selection();
         }
         let before = self.snapshot_selection();
         if before.rect.is_none() && before.mask.is_none() {
@@ -1199,7 +1313,9 @@ impl Document {
         self.revision = self.revision.wrapping_add(1);
     }
 
-    /// Enable PS/CSP-style live transform: warm sandwich plates, floating in middle.
+    /// Enable PS/CSP-style live transform / Ctrl+Move: warm sandwich plates, floating in middle.
+    /// Drag frames use [`Self::touch_transform_display`] + [`Self::try_sync_transform_sandwich`]
+    /// (O(ROI) below memcpy + float + above), not a full stack composite.
     pub fn begin_transform_sandwich(&mut self, layer_idx: usize) {
         let idx = layer_idx.min(self.layers.len().saturating_sub(1));
         self.transform_sandwich_idx = Some(idx);
@@ -1297,6 +1413,46 @@ impl Document {
             self.width,
             self.height,
         )
+    }
+
+    /// Union of content bounds for layers above the float slot (no float clip).
+    /// Path B restores Soft∪float — omit punches the whole Soft layer, so the GPU
+    /// clip must cover this union or Soft vanishes outside Soft∩float.
+    pub fn transform_above_union_bounds(&self) -> Option<DirtyRect> {
+        let idx = self
+            .selection
+            .floating_layer
+            .unwrap_or(self.active_layer)
+            .min(self.layers.len().saturating_sub(1));
+        let mut union: Option<DirtyRect> = None;
+        for (li, layer) in self.layers.iter().enumerate().skip(idx + 1) {
+            if !layer.visible || layer.is_folder {
+                continue;
+            }
+            let opacity = (layer.opacity.clamp(0.0, 1.0)
+                * crate::ancestor_folder_opacity(&self.layers, li))
+            .clamp(0.0, 1.0);
+            if opacity <= 0.0 {
+                continue;
+            }
+            let Some(bounds) = layer.content_bounds() else {
+                continue;
+            };
+            if bounds.is_empty() {
+                continue;
+            }
+            union = Some(match union {
+                Some(mut u) => {
+                    u.union(bounds);
+                    u
+                }
+                None => bounds,
+            });
+        }
+        union.filter(|r| !r.is_empty()).map(|mut r| {
+            r.clamp_to(self.width, self.height);
+            r
+        })
     }
 
     /// Opacity of the floating transform layer (folder ancestors included).
@@ -2255,8 +2411,7 @@ impl Document {
             plate_view,
         );
 
-        // Soft/Hard above: omit from underlay (Path B GPU restores Soft∪float; Path C Soft
-        // vanishes Instant Preview — never Soft-under-float via egui).
+        // Soft/Hard above: omit when Path B restores Soft∪float. Else Soft stays in underlay.
         let mut omit: Vec<usize> = Vec::new();
         if self.transform_above_needs_backdrop() {
             if self.transform_omit_blend_above {

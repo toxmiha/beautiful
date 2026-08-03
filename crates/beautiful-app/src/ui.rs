@@ -1450,6 +1450,10 @@ pub fn top_menu(
                             if theme::btn(ui, theme::label("Undo")).clicked() {
                                 if document.active_is_folder() {
                                     document.require_paintable("Отмена");
+                                } else if canvas.cancel_sel_pixel_move(document) {
+                                    canvas.clear_drawing_gesture(document);
+                                    canvas.mark_dirty();
+                                    canvas.invalidate_nav();
                                 } else {
                                     document.undo();
                                     canvas.clear_drawing_gesture(document);
@@ -5352,6 +5356,11 @@ pub fn handle_shortcuts(
             if document.active_is_folder() {
                 // notice drained by app chrome
                 document.require_paintable("Отмена (Ctrl+Z)");
+            } else if canvas.cancel_sel_pixel_move(document) {
+                canvas.clear_drawing_gesture(document);
+                canvas.mark_dirty();
+                canvas.invalidate_nav();
+                need_repaint = true;
             } else {
                 document.undo();
                 canvas.clear_drawing_gesture(document);
@@ -5382,7 +5391,6 @@ pub fn handle_shortcuts(
         }
         if input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace) {
             if document.selection.rect.is_some() || document.selection.floating.is_some() {
-                // Clear selection pixels via lift+discard
                 if document.selection.floating.is_none() {
                     if let Some(rect) = document.selection.rect {
                         let idx = document.active_layer;
@@ -5392,7 +5400,11 @@ pub fn handle_shortcuts(
                         document.selection.rect = Some(rect);
                     }
                 }
+                // Drop floating pixels; hole stays (cut). Abandon park undo.
+                document.sel_float_undo = None;
                 document.selection.floating = None;
+                document.selection.floating_layer = None;
+                document.end_transform_sandwich();
                 document.selection.clear();
                 document.invalidate_full();
             }

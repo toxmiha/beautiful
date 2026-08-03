@@ -973,9 +973,47 @@ pub(crate) fn paint_selection_mask_overlay(
     width: u32,
     height: u32,
 ) {
+    paint_selection_mask_overlay_opacity(
+        painter,
+        texture,
+        center,
+        display_size,
+        doc_w,
+        doc_h,
+        rotation_deg,
+        x,
+        y,
+        width,
+        height,
+        1.0,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_selection_mask_overlay_opacity(
+    painter: &egui::Painter,
+    texture: egui::TextureId,
+    center: egui::Pos2,
+    display_size: Vec2,
+    doc_w: f32,
+    doc_h: f32,
+    rotation_deg: f32,
+    x: f32,
+    y: f32,
+    width: u32,
+    height: u32,
+    opacity: f32,
+) {
     if width == 0 || height == 0 {
         return;
     }
+    let tint = {
+        let a = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        if a == 0 {
+            return;
+        }
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, a)
+    };
     let corners = [
         doc_to_screen(
             center,
@@ -1025,7 +1063,7 @@ pub(crate) fn paint_selection_mask_overlay(
         egui::pos2(1.0, 1.0),
         egui::pos2(0.0, 1.0),
     ]) {
-        mesh.colored_vertex(corner, egui::Color32::WHITE);
+        mesh.colored_vertex(corner, tint);
         mesh.vertices.last_mut().expect("just added vertex").uv = uv;
     }
     mesh.add_triangle(0, 1, 2);

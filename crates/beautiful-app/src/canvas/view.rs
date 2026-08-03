@@ -254,8 +254,7 @@ impl CanvasView {
             rotated_aabb_size(display_w, display_h, state.rotation_deg),
         );
 
-        // Ctrl+drag / Move tool: move selection contents (no Free Transform).
-        // Release mouse OR Ctrl → fix floating at new place (pixels stay).
+        // Ctrl+drag / Move tool: float until deselect seals (SAI/PS — not on mouse-up).
         if !space && !panning && !state.transform_editing() {
             let ctrl = ctx.input(|i| i.modifiers.ctrl);
             let primary_held = ctx.input(|i| i.pointer.button_down(PointerButton::Primary));
@@ -267,7 +266,6 @@ impl CanvasView {
                 && primary_held
                 && state.sel_pixel_move.is_none()
                 && document.selection.rect.is_some()
-                && document.selection.floating.is_none()
             {
                 if let Some(pos) = response.interact_pointer_pos() {
                     if let Some((x, y)) = screen_to_canvas(
@@ -279,9 +277,39 @@ impl CanvasView {
                         document.view_flip_h,
                     ) {
                         if document.selection_contains(x, y) {
-                            let idx = document.active_layer;
+                            let idx = document
+                                .selection
+                                .floating_layer
+                                .unwrap_or(document.active_layer);
                             if document.layers.get(idx).is_some_and(|l| l.is_folder) {
                                 let _ = document.require_paintable("Перемещение выделения");
+                            } else if document.selection.floating.is_some() {
+                                // Resume parked float (hole stays until deselect).
+                                let (before_tiles, undo_sel) =
+                                    if let Some((i, t, s)) = document.sel_float_undo.as_ref() {
+                                        if *i == idx {
+                                            (t.clone_shared(), s.clone())
+                                        } else {
+                                            (
+                                                document.layers[idx].tiles.clone_shared(),
+                                                document.snapshot_selection(),
+                                            )
+                                        }
+                                    } else {
+                                        (
+                                            document.layers[idx].tiles.clone_shared(),
+                                            document.snapshot_selection(),
+                                        )
+                                    };
+                                state.sel_pixel_move = Some(SelPixelMoveSession {
+                                    layer_idx: idx,
+                                    before_tiles,
+                                    undo_sel,
+                                    start: (x, y),
+                                    last: (x, y),
+                                    lifted: true,
+                                    moved: false,
+                                });
                             } else {
                                 state.sel_pixel_move = Some(SelPixelMoveSession {
                                     layer_idx: idx,
@@ -323,7 +351,7 @@ impl CanvasView {
                                     document.selection.rect = Some(r);
                                     document.invalidate_selection_footprint();
                                     sess.lifted = true;
-                                    sess.moved = true;
+                                    sess.moved = false;
                                     sess.last = sess.start;
                                     sel_move_dirty = true;
                                 }
@@ -349,13 +377,13 @@ impl CanvasView {
 
             if primary_released || (state.sel_pixel_move.is_some() && !ctrl && !move_tool) {
                 if let Some(sess) = state.sel_pixel_move.take() {
-                    if sess.moved && sess.lifted {
-                        document.commit_selection_move(
+                    if sess.lifted && sess.moved {
+                        // Park floating — seal only on deselect, not mouse-up.
+                        document.park_selection_float(
                             sess.layer_idx,
-                            &sess.before_tiles,
+                            sess.before_tiles,
                             sess.undo_sel,
                         );
-                        state.nav_pending = true;
                         state.mark_dirty();
                     } else if sess.lifted {
                         document.cancel_selection_move(
@@ -924,12 +952,10 @@ impl CanvasView {
                     );
                     let _sync =
                         crate::perf::Scope::new(crate::perf::Category::Upload, "frame.sync");
-                    // Soft/Hard above: always omit from underlay (Path B restores via GPU).
-                    // Path C without omit left Soft under egui float → transform "above" Soft.
-                    document.transform_omit_blend_above = document
-                        .transform_above_needs_backdrop()
-                        && matches!(state.transform_mode, TransformMode::Free)
-                        && document.selection.floating_overlay_only;
+                    // Soft/Hard above: omit only when Path B can restore Soft∪float.
+                    let want_omit = state.should_omit_blend_above_for_underlay(document);
+                    state.prepare_underlay_omit_transition(document, want_omit);
+                    document.transform_omit_blend_above = want_omit;
                     let synced = crate::canvas_gpu::sync_from_document(
                         rs,
                         document,

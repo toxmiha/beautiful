@@ -134,7 +134,7 @@ pub struct CanvasState {
     softlight_gpu_upload_key: Option<(u64, u32, u32, u32, u32, u32, u32, u32, u32)>,
     /// Float tex uploaded for this content_revision + size (don't reupload float on atlas-only moves).
     softlight_gpu_float_key: Option<(u64, u32, u32)>,
-    /// Expand-only Soft∩float clip for this transform session (prevents z-order flicker).
+    /// Expand-only Soft∪float clip for this transform session (prevents z-order flicker).
     softlight_clip_frozen: Option<beautiful_core::DirtyRect>,
     /// Soft Light GPU pass armed for this frame (skip egui float).
     softlight_gpu_drew: bool,
@@ -142,6 +142,8 @@ pub struct CanvasState {
     softlight_gpu_release: bool,
     /// Underlay plate is frozen; pointer drag only updates overlay pose.
     xform_underlay_frozen: bool,
+    /// Omit Soft/Hard from underlay when this plate was last built (thaw if omit flips).
+    xform_underlay_omit_latched: bool,
     /// Throttle full recomposite while dragging layer opacity.
     opacity_touch_at: f64,
     /// True while opacity slider is dragged — skip nav rebuild until release.
@@ -235,6 +237,7 @@ impl Default for CanvasState {
             softlight_gpu_drew: false,
             softlight_gpu_release: false,
             xform_underlay_frozen: false,
+            xform_underlay_omit_latched: false,
             opacity_touch_at: 0.0,
             opacity_dragging: false,
             opacity_touch_pending: false,
@@ -275,6 +278,7 @@ impl CanvasState {
         self.softlight_gpu_drew = false;
         self.softlight_gpu_release = true;
         self.xform_underlay_frozen = false;
+        self.xform_underlay_omit_latched = false;
     }
 
     /// Release Path B GPU textures + transform plates (call when wgpu RenderState is available).
@@ -376,19 +380,69 @@ impl CanvasState {
         );
     }
 
-    /// Free + GPU InStack: restore up to N above layers (blend/clip) over live float.
-    /// Independent of display_lod. Over limit / unsupported mode → Path C.
+    /// Free + GPU InStack: restore Soft∪float over live float (omit Soft from underlay).
+    /// Soft∩float empty or atlas too large → keep Soft in underlay (no Path B).
     pub fn softlight_gpu_xform_active(&self, document: &Document) -> bool {
-        document.transform_above_needs_backdrop()
-            && matches!(self.transform_mode, TransformMode::Free)
-            && document.selection.floating_overlay_only
-            && self.free_xform.is_some()
-            && self.transform_baseline.is_some()
-            && Self::blend_mode_gpu_u(document.floating_transform_blend_mode()).is_some()
-            && self
-                .instack_gpu_layers(document)
-                .and_then(|layers| Self::instack_gpu_descs(&layers))
-                .is_some()
+        self.should_omit_blend_above_for_underlay(document)
+    }
+
+    /// Soft/Hard omit only when Soft∩float is non-empty AND Path B can restore Soft∪float.
+    /// Whole Soft is omitted from underlay — clip must be Soft∪float or Soft vanishes
+    /// outside the float (full-canvas Soft looked like float above the whole stack).
+    pub fn should_omit_blend_above_for_underlay(&self, document: &Document) -> bool {
+        if !document.transform_above_needs_backdrop() {
+            return false;
+        }
+        if !matches!(self.transform_mode, TransformMode::Free) {
+            return false;
+        }
+        if !document.selection.floating_overlay_only {
+            return false;
+        }
+        let (fx, bw, bh) = match (self.free_xform.as_ref(), self.transform_baseline.as_ref()) {
+            (Some(fx), Some((_, bw, bh, _, _))) => (fx, *bw, *bh),
+            _ => return false,
+        };
+        let float_roi = crate::canvas::transform_free::free_obb_dirty_rect(
+            fx,
+            bw,
+            bh,
+            document.width,
+            document.height,
+        );
+        if float_roi.is_empty() {
+            return false;
+        }
+        if !document
+            .transform_above_live_work_rect(float_roi)
+            .is_some_and(|r| !r.is_empty())
+        {
+            return false;
+        }
+        if Self::blend_mode_gpu_u(document.floating_transform_blend_mode()).is_none() {
+            return false;
+        }
+        // Soft∪float atlas must fit — otherwise omit would leave Soft missing with no restore.
+        self.instack_gpu_layers(document)
+            .and_then(|layers| Self::instack_gpu_descs(&layers))
+            .is_some()
+    }
+
+    /// If omit eligibility flipped while underlay is frozen, force a rebuild.
+    pub fn prepare_underlay_omit_transition(
+        &mut self,
+        document: &mut Document,
+        want_omit: bool,
+    ) {
+        if !document.selection.floating_overlay_only {
+            return;
+        }
+        if self.xform_underlay_frozen && want_omit != self.xform_underlay_omit_latched {
+            self.xform_underlay_frozen = false;
+            document.composite.mark_full();
+            self.gpu_invalidate = true;
+            self.mark_dirty();
+        }
     }
 
     /// Soft/Hard/Mul/Screen/Overlay + Normal=5.
@@ -436,14 +490,31 @@ impl CanvasState {
         Some(clip)
     }
 
-    /// Sticky expand-only Soft∩float clip for this session.
+    /// Sticky expand-only Soft∪float clip for this session.
+    /// Soft is omitted as a whole layer — restore must cover Soft bounds ∪ float, not Soft∩float.
     fn instack_session_clip(&self, document: &Document) -> Option<beautiful_core::DirtyRect> {
         let mut clip = self.instack_float_clip_q(document)?;
+        if let Some(above) = document.transform_above_union_bounds() {
+            clip.union(above);
+        }
         if let Some(fr) = self.softlight_clip_frozen {
             clip.union(fr);
-            clip.clamp_to(document.width, document.height);
         }
+        clip.clamp_to(document.width, document.height);
         if clip.is_empty() {
+            return None;
+        }
+        // Re-quantize after Soft∪float expand (float clip alone was already Q-aligned).
+        const Q: u32 = 256;
+        clip.x0 = (clip.x0 / Q) * Q;
+        clip.y0 = (clip.y0 / Q) * Q;
+        clip.x1 = ((clip.x1.saturating_add(Q - 1)) / Q)
+            .saturating_mul(Q)
+            .min(document.width);
+        clip.y1 = ((clip.y1.saturating_add(Q - 1)) / Q)
+            .saturating_mul(Q)
+            .min(document.height);
+        if clip.x1 <= clip.x0 || clip.y1 <= clip.y0 {
             None
         } else {
             Some(clip)
@@ -491,7 +562,7 @@ impl CanvasState {
             if mode != beautiful_core::BlendMode::Normal || wants_clip {
                 has_live = true;
             }
-            // Skip layers that don't touch the float clip (nothing to restore over float).
+            // Skip layers outside Soft∪float session clip (nothing to restore).
             if bounds.intersect(clip).is_empty() {
                 continue;
             }
@@ -540,7 +611,7 @@ impl CanvasState {
         Some(coded)
     }
 
-    /// Grid atlas: shared tile size, cols = ceil(sqrt(n)) — stays under 8192 for Soft∩float.
+    /// Grid atlas: shared tile size, cols = ceil(sqrt(n)) — stays under 8192 for Soft∪float.
     fn instack_gpu_descs(
         layers: &[(usize, u32, u32, u32, u32, u32, f32, u32)],
     ) -> Option<([crate::canvas_gpu::InStackLayerGpu; crate::canvas_gpu::INSTACK_GPU_MAX_ABOVE], u32, u32, u32)> {
@@ -581,7 +652,7 @@ impl CanvasState {
         Some((descs, layers.len() as u32, atlas_w, atlas_h))
     }
 
-    /// Pack above layers into a grid atlas (shared Soft∩float tile per layer).
+    /// Pack above layers into a grid atlas (shared Soft∪float tile per layer).
     fn instack_gpu_pack_atlas(
         document: &Document,
         layers: &[(usize, u32, u32, u32, u32, u32, f32, u32)],
@@ -664,7 +735,7 @@ impl CanvasState {
         }
     }
 
-    /// Upload InStack GPU atlas when Soft∩float cell changes; float tex once per baseline.
+    /// Upload InStack GPU atlas when Soft∪float cell changes; float tex once per baseline.
     pub fn softlight_gpu_prepare(
         &mut self,
         rs: &eframe::egui_wgpu::RenderState,
@@ -684,7 +755,7 @@ impl CanvasState {
         let layers = self.instack_gpu_layers(document)?;
         let (descs, count, atlas_w, atlas_h) = Self::instack_gpu_descs(&layers)?;
         let clip = self.instack_session_clip(document)?;
-        // Expand-only: once Soft∩float grows, never shrink (stops Path B flicker at 8192 edge).
+        // Expand-only: Soft∪float grows sticky (stops Path B flicker at 8192 edge).
         self.softlight_clip_frozen = Some(clip);
         let float_key = (document.content_revision, *bw, *bh);
         let atlas_key = (
@@ -759,9 +830,11 @@ impl CanvasState {
             .floating_layer
             .unwrap_or(document.active_layer)
             .min(document.layers.len().saturating_sub(1));
-        // Soft omitted on Path B — freeze once underlay (below only) is uploaded.
+        // Soft omitted on Path B (Soft∪float) — freeze once underlay is uploaded.
         if document.transform_above_needs_backdrop() {
             self.xform_underlay_frozen = true;
+            self.xform_underlay_omit_latched =
+                self.should_omit_blend_above_for_underlay(document);
             return;
         }
         let has_above = document.layers.iter().enumerate().any(|(i, layer)| {
@@ -1726,6 +1799,30 @@ impl CanvasState {
         self.is_drawing
     }
 
+    /// Cancel in-progress or parked Ctrl+Move (restore pre-lift pixels). True if handled.
+    pub fn cancel_sel_pixel_move(&mut self, document: &mut Document) -> bool {
+        if let Some(sess) = self.sel_pixel_move.take() {
+            if sess.lifted {
+                document.end_transform_sandwich();
+                document.release_transform_plates();
+                document.cancel_selection_move(
+                    sess.layer_idx,
+                    &sess.before_tiles,
+                    sess.undo_sel,
+                );
+                self.mark_dirty();
+                return true;
+            }
+            return false;
+        }
+        if document.discard_parked_selection_float() {
+            self.mark_dirty();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Clear in-progress stroke UI state after undo/redo aborted a gesture.
     pub fn clear_drawing_gesture(&mut self, document: &mut Document) {
         self.is_drawing = false;
@@ -2049,10 +2146,10 @@ impl CanvasState {
                 partials: Vec::new(),
             }
         } else {
-            // Soft/Hard above: omit from underlay; Path B GPU restores Soft over float.
-            document.transform_omit_blend_above = document.transform_above_needs_backdrop()
-                && matches!(self.transform_mode, TransformMode::Free)
-                && document.selection.floating_overlay_only;
+            // Soft/Hard above: omit from underlay only when Path B can restore Soft∪float.
+            let want_omit = self.should_omit_blend_above_for_underlay(document);
+            self.prepare_underlay_omit_transition(document, want_omit);
+            document.transform_omit_blend_above = want_omit;
             document.sync_display_view(view, beautiful_core::DISPLAY_VIEW_PAD)
         };
         document.transform_omit_blend_above = false;
@@ -2065,9 +2162,9 @@ impl CanvasState {
                 document
                     .composite
                     .ensure_for_view(view, beautiful_core::DISPLAY_VIEW_PAD);
-                document.transform_omit_blend_above = document.transform_above_needs_backdrop()
-                    && matches!(self.transform_mode, TransformMode::Free)
-                    && document.selection.floating_overlay_only;
+                let want_omit = self.should_omit_blend_above_for_underlay(document);
+                self.prepare_underlay_omit_transition(document, want_omit);
+                document.transform_omit_blend_above = want_omit;
                 let _ = document.sync_display_view(view, beautiful_core::DISPLAY_VIEW_PAD);
                 document.transform_omit_blend_above = false;
             }
