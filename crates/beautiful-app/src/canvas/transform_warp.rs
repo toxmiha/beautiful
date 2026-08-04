@@ -1,5 +1,54 @@
 use super::*;
 
+/// Park warp lattice nodes on whole document pixels (local = doc - origin).
+pub(crate) fn snap_warp_lattice_to_pixels(
+    pts: &mut [(f32, f32)],
+    origin_x: f32,
+    origin_y: f32,
+) {
+    for p in pts.iter_mut() {
+        let ax = (origin_x + p.0).round();
+        let ay = (origin_y + p.1).round();
+        p.0 = ax - origin_x;
+        p.1 = ay - origin_y;
+    }
+}
+
+/// Park Bezier whisker tips on whole document pixels (relative offsets rewritten).
+pub(crate) fn snap_warp_whiskers_to_pixels(
+    pts: &[(f32, f32)],
+    hs: &mut [[Option<(f32, f32)>; 4]],
+    origin_x: f32,
+    origin_y: f32,
+) {
+    for (i, slots) in hs.iter_mut().enumerate() {
+        if i >= pts.len() {
+            break;
+        }
+        let (ax, ay) = pts[i];
+        for slot in slots.iter_mut() {
+            if let Some((hx, hy)) = slot.as_mut() {
+                let tip_x = (origin_x + ax + *hx).round();
+                let tip_y = (origin_y + ay + *hy).round();
+                *hx = tip_x - origin_x - ax;
+                *hy = tip_y - origin_y - ay;
+            }
+        }
+    }
+}
+
+fn snap_warp_geometry_to_pixels(state: &mut CanvasState, origin_x: f32, origin_y: f32) {
+    if let Some(pts) = state.warp_controls.as_mut() {
+        snap_warp_lattice_to_pixels(pts, origin_x, origin_y);
+    }
+    if let (Some(pts), Some(hs)) = (
+        state.warp_controls.as_ref().map(|p| p.as_slice()),
+        state.warp_node_handles.as_mut(),
+    ) {
+        snap_warp_whiskers_to_pixels(pts, hs, origin_x, origin_y);
+    }
+}
+
 pub(crate) fn warp_alt_toggle_unison(
     state: &mut CanvasState,
     document: &Document,
@@ -35,7 +84,7 @@ pub(crate) fn warp_alt_toggle_unison(
         state.warp_handle_unison = Some(beautiful_core::default_warp_handle_unison(n));
     }
     if let Some(u) = state.warp_handle_unison.as_mut() {
-        // Alt on a hit node toggles it; with multi-select, toggle all selected (PS).
+        // Alt on a hit node toggles it; with multi-select, toggle all selected (common).
         let targets: Vec<usize> =
             if state.warp_selected.contains(&i) && state.warp_selected.len() > 1 {
                 state.warp_selected.clone()
@@ -78,18 +127,25 @@ pub(crate) fn drag_warp_point(
     if document.selection.floating.is_none() {
         return;
     }
-    let lx = x - origin_x;
-    let ly = y - origin_y;
+    // Hit-test uses raw coords; motion snaps to whole document pixels.
+    let hit_lx = x - origin_x;
+    let hit_ly = y - origin_y;
+    let (sx, sy) = beautiful_core::snap_doc_xy(x, y);
+    let lx = sx - origin_x;
+    let ly = sy - origin_y;
     let n = state.mesh_grid_n.max(2);
     let zoom = state.zoom.max(0.05);
-    // PS grab threshold ~5–7 screen px.
+    // Grab threshold ~5–7 screen px.
     let hit_r = (7.0 / zoom).clamp(5.0, 22.0);
     let whisker_r = hit_r * 0.85;
     let edge_r = hit_r * 0.65;
 
     let (plx, ply) = state
         .drag_doc_last
-        .map(|(dx, dy)| (dx - origin_x, dy - origin_y))
+        .map(|(dx, dy)| {
+            let (px, py) = beautiful_core::snap_doc_xy(dx, dy);
+            (px - origin_x, py - origin_y)
+        })
         .unwrap_or((lx, ly));
     let ddx = lx - plx;
     let ddy = ly - ply;
@@ -100,7 +156,7 @@ pub(crate) fn drag_warp_point(
         let mut best_pt: Option<(usize, f32)> = None;
         if let Some(pts) = &state.warp_controls {
             for (i, (px, py)) in pts.iter().enumerate() {
-                let d = ((lx - px).powi(2) + (ly - py).powi(2)).sqrt();
+                let d = ((hit_lx - px).powi(2) + (hit_ly - py).powi(2)).sqrt();
                 if d < hit_r && best_pt.as_ref().is_none_or(|(_, bd)| d < *bd) {
                     best_pt = Some((i, d));
                 }
@@ -116,7 +172,7 @@ pub(crate) fn drag_warp_point(
                     let Some((hx, hy)) = hs[i][dir as usize] else {
                         continue;
                     };
-                    let d = ((lx - ax - hx).powi(2) + (ly - ay - hy).powi(2)).sqrt();
+                    let d = ((hit_lx - ax - hx).powi(2) + (hit_ly - ay - hy).powi(2)).sqrt();
                     if d < whisker_r && best_w.as_ref().is_none_or(|(_, _, bd)| d < *bd) {
                         best_w = Some((i, dir, d));
                     }
@@ -154,7 +210,7 @@ pub(crate) fn drag_warp_point(
             state.warp_node_handles.as_ref(),
         ) {
             if let Some((edge, _)) =
-                beautiful_core::nearest_warp_bezier_edge(pts, hs, n, lx, ly, edge_r)
+                beautiful_core::nearest_warp_bezier_edge(pts, hs, n, hit_lx, hit_ly, edge_r)
             {
                 state.warp_drag = Some(WarpDragTarget::Segment {
                     axis: edge.axis,
@@ -165,7 +221,8 @@ pub(crate) fn drag_warp_point(
                 just_began = true;
             } else {
                 // Empty interior: Distort = move object; Mesh = soft patch pull.
-                let (u, v) = beautiful_core::estimate_warp_uv(pts, n, Some(hs.as_slice()), lx, ly);
+                let (u, v) =
+                    beautiful_core::estimate_warp_uv(pts, n, Some(hs.as_slice()), hit_lx, hit_ly);
                 state.warp_drag = Some(WarpDragTarget::Interior { u, v });
                 just_began = true;
             }
@@ -187,7 +244,9 @@ pub(crate) fn drag_warp_point(
             ) {
                 if node < pts.len() && node < hs.len() {
                     let (ax, ay) = pts[node];
-                    let new_off = (lx - ax, ly - ay);
+                    // Whisker tip parks on whole document pixels.
+                    let tip = beautiful_core::snap_doc_xy(origin_x + hit_lx, origin_y + hit_ly);
+                    let new_off = (tip.0 - origin_x - ax, tip.1 - origin_y - ay);
                     let unison = state
                         .warp_handle_unison
                         .as_ref()
@@ -203,7 +262,7 @@ pub(crate) fn drag_warp_point(
             }
         }
         Some(WarpDragTarget::Segment { axis, a, b, t }) => {
-            if ddx.abs() > 0.01 || ddy.abs() > 0.01 {
+            if ddx != 0.0 || ddy != 0.0 {
                 if let (Some(pts), Some(hs)) = (
                     state.warp_controls.as_mut(),
                     state.warp_node_handles.as_mut(),
@@ -231,7 +290,7 @@ pub(crate) fn drag_warp_point(
             }
         }
         Some(WarpDragTarget::Interior { u, v }) => {
-            if ddx.abs() > 0.01 || ddy.abs() > 0.01 {
+            if ddx != 0.0 || ddy != 0.0 {
                 if matches!(state.transform_mode, TransformMode::Distort) {
                     // Ordinary Distort: empty drag moves the whole floating object.
                     if let Some(pts) = state.warp_controls.as_mut() {
@@ -246,7 +305,7 @@ pub(crate) fn drag_warp_point(
                     state.warp_controls.as_mut(),
                     state.warp_node_handles.as_mut(),
                 ) {
-                    // Mesh: soft interior pull (PS-style). Keep user's whiskers —
+                    // Mesh: soft interior pull (common). Keep user's whiskers —
                     // Catmull refit was overshooting and "exploding" the lattice.
                     beautiful_core::pull_warp_patch_at_uv(pts, hs, n, u, v, ddx, ddy);
                     state.warp_lattice_edited = true;
@@ -260,7 +319,7 @@ pub(crate) fn drag_warp_point(
                     let old = pts[idx];
                     let ndx = lx - old.0;
                     let ndy = ly - old.1;
-                    if ndx.abs() > 0.15 || ndy.abs() > 0.15 {
+                    if ndx != 0.0 || ndy != 0.0 {
                         let mut group: Vec<usize> = if state.warp_selected.contains(&idx) {
                             state.warp_selected.clone()
                         } else {
@@ -287,26 +346,24 @@ pub(crate) fn drag_warp_point(
         None => {}
     }
     if moved {
+        snap_warp_geometry_to_pixels(state, origin_x, origin_y);
+        // Pixel path: bake floating with Dragging filter, then 1:1 blit.
+        let keep_overlay = document.selection.floating_overlay_only;
         refresh_warp_preview(state, document);
-        // Overlay live: pose is GPU mesh — keep repainting without CPU bake.
-        if document.selection.floating_overlay_only {
-            // caller / view already request_repaint via input path
+        if keep_overlay {
+            document.selection.floating_overlay_only = true;
         }
+        state.xform_live_stale = true;
     }
 }
 
 pub(crate) fn refresh_warp_preview(state: &mut CanvasState, document: &mut Document) {
-    // Overlay live path: GPU textured mesh samples baseline — no CPU raster.
-    if document.selection.floating_overlay_only {
-        return;
-    }
     let now = instant_secs();
-    // ~30 fps cap while dragging — still feels live, far less CPU.
+    // ~30 fps while dragging — bake is CPU-heavy on large selections.
     if now - state.last_warp_preview_at < 0.033 {
         return;
     }
     state.last_warp_preview_at = now;
-    // Same raster path as idle — only slightly coarser tessellation while dragging.
     refresh_warp_preview_impl(state, document, true);
 }
 
@@ -345,10 +402,7 @@ pub(crate) fn refresh_warp_preview_impl(
     let old_footprint = document.floating_selection_dirty_rect();
     // Both Mesh and Distort: Coons/Bezier with whiskers (pixel-adaptive tessellation).
     let subdiv = beautiful_core::warp_bake_cell_subdiv(w, h, n, !dragging);
-    // Always pass node handles — Mesh used to force None (bilinear FFD), which
-    // made whiskers visible/draggable but ignored by the surface (felt broken).
     let handles = state.warp_node_handles.as_ref().map(|v| v.as_slice());
-    // Clone only the control list — warp reads baseline by reference via a temp borrow.
     let pts = pts.clone();
     let pix = state
         .transform_baseline
@@ -357,11 +411,22 @@ pub(crate) fn refresh_warp_preview_impl(
     let Some(pix) = pix else {
         return;
     };
-    document
-        .selection
-        .mesh_warp_floating_from_ex(pix, w, h, ox, oy, n, &pts, handles, false, false, subdiv);
+    // Dragging / Preview / Final from the Resample panel.
+    let filter = if dragging {
+        state.resample_drag
+    } else {
+        state.resample_preview
+    };
+    document.selection.mesh_warp_floating_from_ex(
+        pix, w, h, ox, oy, n, &pts, handles, filter, false, subdiv,
+    );
+    park_floating_to_pixels(document);
+    state.note_xform_bake();
     if document.selection.floating_overlay_only {
-        // Silent CPU bake for Apply/mode-switch; live display is GPU mesh.
+        if document.transform_sandwich_active() {
+            document.touch_transform_display(old_footprint);
+            document.touch_transform_display(document.floating_selection_dirty_rect());
+        }
     } else {
         document.invalidate_floating_change(old_footprint);
     }
@@ -384,8 +449,9 @@ pub(crate) fn try_split_warp_crosswise(
         .map(|b| (b.3, b.4))
         .or_else(|| document.selection.floating.as_ref().map(|f| (f.x, f.y)))
         .unwrap_or((0.0, 0.0));
-    let lx = x - origin_x;
-    let ly = y - origin_y;
+    let (sx, sy) = beautiful_core::snap_doc_xy(x, y);
+    let lx = sx - origin_x;
+    let ly = sy - origin_y;
     let n = state.mesh_grid_n.max(2);
     if n >= 6 {
         return false;
@@ -405,7 +471,7 @@ pub(crate) fn try_split_warp_crosswise(
     if !u.is_finite() || !v.is_finite() {
         return false;
     }
-    // Near a cell edge → directional split; near center → crosswise (PS Ctrl).
+    // Near a cell edge → directional split; near center → crosswise (Ctrl split).
     let fu = u - u.floor();
     let fv = v - v.floor();
     let du = fu.min(1.0 - fu);
@@ -418,12 +484,14 @@ pub(crate) fn try_split_warp_crosswise(
     } else {
         beautiful_core::split_warp_crosswise(pts, hs, n, u, v)
     };
-    let Some((new_pts, new_hs, new_n)) = split else {
+    let Some((mut new_pts, mut new_hs, new_n)) = split else {
         return false;
     };
     if new_pts.len() != new_n * new_n || new_hs.len() != new_n * new_n || new_n > 6 {
         return false;
     }
+    snap_warp_lattice_to_pixels(&mut new_pts, origin_x, origin_y);
+    snap_warp_whiskers_to_pixels(&new_pts, &mut new_hs, origin_x, origin_y);
     state.warp_controls = Some(new_pts);
     state.warp_node_handles = Some(new_hs);
     state.warp_handle_unison = Some(beautiful_core::default_warp_handle_unison(new_n));
@@ -448,7 +516,7 @@ pub(crate) fn ensure_warp_grid(state: &mut CanvasState, document: &Document) {
     };
     // Warp lattice:
     // - Distort = 2×2 Coons (4 corners + whiskers)
-    // - Mesh = N×N Coons lattice with per-node whiskers (PS Warp Grid).
+    // - Mesh = N×N Coons lattice with per-node whiskers (warp grid).
     //   Default 4×4 nodes = 3×3 cells.
     if state.warp_controls.is_none() {
         state.mesh_grid_n = if state.transform_mode == TransformMode::Mesh {
@@ -494,7 +562,8 @@ pub(crate) fn ensure_warp_grid(state: &mut CanvasState, document: &Document) {
         for gx in 0..n {
             let u = gx as f32 / (n - 1) as f32;
             let v = gy as f32 / (n - 1) as f32;
-            pts.push((u * bw as f32, v * bh as f32));
+            // Integer lattice from the start (avoids 1/3 drift on 4×4).
+            pts.push(((u * bw as f32).round(), (v * bh as f32).round()));
         }
     }
     state.warp_controls = Some(pts);

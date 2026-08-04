@@ -32,6 +32,10 @@ impl Rgba {
         a: 0,
     };
 
+    pub fn opaque(self) -> Self {
+        Self { a: 255, ..self }
+    }
+
     pub fn to_array(self) -> [u8; 4] {
         [self.r, self.g, self.b, self.a]
     }
@@ -72,6 +76,16 @@ impl Default for Rgba {
     fn default() -> Self {
         Self::BLACK
     }
+}
+
+/// Active drawing color icon (common Main · Sub · Transparent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DrawingColorSlot {
+    #[default]
+    Foreground,
+    Background,
+    Transparent,
 }
 
 /// Approximate sRGB electro-optical transfer (IEC 61966-2-1).

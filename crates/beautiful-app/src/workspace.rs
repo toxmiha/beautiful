@@ -63,14 +63,20 @@ pub struct Sheet {
     pub id: SheetId,
     pub title: String,
     pub rect: Rect,
+    /// Legacy field; paint stack follows `Workspace` Vec order (index 0 = top).
     pub z_order: u32,
     pub document: Option<Document>,
     pub canvas: Option<CanvasState>,
     pub snapshot: Option<SheetSnapshot>,
     pub snapshot_dirty: bool,
+    /// Bumped whenever `snapshot` RGBA is rebuilt — egui texture cache key.
+    pub snapshot_gen: u64,
     /// Last known local canvas view (kept even while focused lives on the app).
     pub view_zoom: f32,
     pub view_pan: egui::Vec2,
+    /// Fills the visible desk viewport; `restored_rect` holds the pre-maximize frame.
+    pub maximized: bool,
+    pub restored_rect: Option<Rect>,
 }
 
 impl Sheet {
@@ -151,8 +157,11 @@ impl Workspace {
                 canvas: None,
                 snapshot: None,
                 snapshot_dirty: true,
+                snapshot_gen: 0,
                 view_zoom: 0.0,
                 view_pan: Vec2::ZERO,
+                maximized: false,
+                restored_rect: None,
             }],
             focused: 0,
             next_id: 2,
@@ -195,14 +204,37 @@ impl Workspace {
         self.focused_sheet_mut().title = title;
     }
 
+    /// Hierarchy is tab-bar order (index 0 = top). Kept as a no-op for call sites.
     pub fn raise_focused(&mut self) {
-        let z = self.next_z;
-        self.next_z += 1;
-        let i = self.focused_index();
-        self.sheets[i].z_order = z;
+        self.sync_z_from_bar_order();
     }
 
-    /// Park the current app body, push a new sheet, install its body into the app.
+    /// Sync legacy `z_order` so index 0 is painted last (on top).
+    fn sync_z_from_bar_order(&mut self) {
+        let n = self.sheets.len() as u32;
+        for (i, s) in self.sheets.iter_mut().enumerate() {
+            s.z_order = n.saturating_sub(i as u32);
+        }
+        self.next_z = n.saturating_add(1);
+    }
+
+    /// Drag-reorder in the sub-tab bar. Index 0 is highest in the stack.
+    pub fn reorder(&mut self, from: usize, to: usize) {
+        if from >= self.sheets.len() || to >= self.sheets.len() || from == to {
+            return;
+        }
+        let focused_id = self.sheets[self.focused_index()].id;
+        let sheet = self.sheets.remove(from);
+        self.sheets.insert(to, sheet);
+        self.focused = self
+            .sheets
+            .iter()
+            .position(|s| s.id == focused_id)
+            .unwrap_or(0);
+        self.sync_z_from_bar_order();
+    }
+
+    /// Park the current app body, insert a new sheet at front (top), install into app.
     pub fn add_and_focus(
         &mut self,
         title: String,
@@ -224,32 +256,38 @@ impl Workspace {
 
         let id = SheetId(self.next_id);
         self.next_id += 1;
-        let z = self.next_z;
-        self.next_z += 1;
         let origin = Pos2::new(
             48.0 + (self.sheets.len() as f32) * 48.0,
             48.0 + (self.sheets.len() as f32) * 40.0,
         );
         let rect = Sheet::frame_for_view(&new_doc, self.desk.zoom, view_screen, origin);
-        self.sheets.push(Sheet {
-            id,
-            title,
-            rect,
-            z_order: z,
-            document: None,
-            canvas: None,
-            snapshot: None,
-            snapshot_dirty: true,
-            view_zoom: 0.0,
-            view_pan: Vec2::ZERO,
-        });
-        self.focused = self.sheets.len() - 1;
+        // Front of the bar = top of the hierarchy.
+        self.sheets.insert(
+            0,
+            Sheet {
+                id,
+                title,
+                rect,
+                z_order: 0,
+                document: None,
+                canvas: None,
+                snapshot: None,
+                snapshot_dirty: true,
+                snapshot_gen: 0,
+                view_zoom: 0.0,
+                view_pan: Vec2::ZERO,
+                maximized: false,
+                restored_rect: None,
+            },
+        );
+        self.focused = 0;
+        self.sync_z_from_bar_order();
         std::mem::swap(app_doc, &mut new_doc);
         std::mem::swap(app_canvas, &mut new_canvas);
         id
     }
 
-    /// Switch focus; swaps document/canvas with the app.
+    /// Switch focus; swaps document/canvas with the app. Does not change bar order.
     pub fn focus_index(
         &mut self,
         idx: usize,
@@ -260,7 +298,6 @@ impl Workspace {
             return false;
         }
         if idx == self.focused_index() {
-            self.raise_focused();
             return false;
         }
         let fi = self.focused_index();
@@ -289,7 +326,6 @@ impl Workspace {
         std::mem::swap(app_canvas, &mut canvas);
         self.sheets[idx].snapshot_dirty = true;
         self.focused = idx;
-        self.raise_focused();
         true
     }
 
@@ -341,20 +377,68 @@ impl Workspace {
             std::mem::swap(app_doc, &mut doc);
             std::mem::swap(app_canvas, &mut canvas);
             self.focused = new_focus;
-            self.raise_focused();
+            self.sync_z_from_bar_order();
         } else {
             self.sheets.remove(idx);
             if idx < self.focused {
                 self.focused -= 1;
             }
+            self.sync_z_from_bar_order();
         }
         true
     }
 
+    /// Paint bottom→top: last in this list is drawn on top. Index 0 of `sheets` is highest.
     pub fn paint_order(&self) -> Vec<usize> {
-        let mut idx: Vec<usize> = (0..self.sheets.len()).collect();
-        idx.sort_by_key(|&i| self.sheets[i].z_order);
-        idx
+        (0..self.sheets.len()).rev().collect()
+    }
+
+    /// Fill the visible desk viewport with sheet `idx` (sticky while maximized).
+    pub fn set_sheet_maximized(&mut self, idx: usize, maximized: bool, desk_view: Rect) {
+        if idx >= self.sheets.len() {
+            return;
+        }
+        if maximized {
+            if !self.sheets[idx].maximized {
+                self.sheets[idx].restored_rect = Some(self.sheets[idx].rect);
+                self.sheets[idx].maximized = true;
+            }
+            self.apply_maximized_rect(idx, desk_view);
+        } else if self.sheets[idx].maximized {
+            if let Some(r) = self.sheets[idx].restored_rect.take() {
+                self.sheets[idx].rect = r;
+            }
+            self.sheets[idx].maximized = false;
+        }
+    }
+
+    pub fn toggle_sheet_maximized(&mut self, idx: usize, desk_view: Rect) {
+        if idx >= self.sheets.len() {
+            return;
+        }
+        let next = !self.sheets[idx].maximized;
+        self.set_sheet_maximized(idx, next, desk_view);
+    }
+
+    fn apply_maximized_rect(&mut self, idx: usize, desk_view: Rect) {
+        if desk_view.width() < 32.0 || desk_view.height() < 32.0 {
+            return;
+        }
+        // Desk camera uses coordinates relative to desk_view.min (see handle_desk_input).
+        let dmin = self.desk.screen_to_desk(Pos2::ZERO);
+        let dmax = self
+            .desk
+            .screen_to_desk(Pos2::new(desk_view.width(), desk_view.height()));
+        self.sheets[idx].rect = Rect::from_min_max(dmin, dmax);
+    }
+
+    /// Keep maximized sheets glued to the current desk viewport.
+    pub fn sync_maximized_sheets(&mut self, desk_view: Rect) {
+        for i in 0..self.sheets.len() {
+            if self.sheets[i].maximized {
+                self.apply_maximized_rect(i, desk_view);
+            }
+        }
     }
 
     pub fn fit_all_in_rect(&mut self, view: Rect) {
@@ -436,9 +520,18 @@ impl Workspace {
     }
 
     pub fn refresh_snapshot_from_doc(sheet: &mut Sheet, document: &Document) {
+        // Full-document "photo" — sharp when inactive. Cap only for huge canvases (RAM).
+        Self::refresh_snapshot_from_doc_sized(sheet, document, 4096);
+    }
+
+    /// Build an inactive-sheet photo. Prefer full res; `max_side` is a safety cap only.
+    pub fn refresh_snapshot_from_doc_sized(
+        sheet: &mut Sheet,
+        document: &Document,
+        max_side: u32,
+    ) {
         let (fw, fh, rgba) = document.stage_rgba_copy();
-        // Desk thumbs stay small — avoid multi-MB previews per sheet.
-        let max_side = 256u32;
+        let max_side = max_side.clamp(1024, 8192);
         let scale = (max_side as f32 / fw.max(fh).max(1) as f32).min(1.0);
         if scale >= 0.999 {
             sheet.snapshot = Some(SheetSnapshot {
@@ -450,13 +543,34 @@ impl Workspace {
             let nw = ((fw as f32) * scale).round().max(1.0) as u32;
             let nh = ((fh as f32) * scale).round().max(1.0) as u32;
             let mut out = vec![0u8; (nw * nh * 4) as usize];
+            let step_x = (fw as f32 / nw as f32).max(1.0);
+            let step_y = (fh as f32 / nh as f32).max(1.0);
+            let rx = (step_x * 0.5).ceil().clamp(1.0, 3.0) as i32;
+            let ry = (step_y * 0.5).ceil().clamp(1.0, 3.0) as i32;
             for y in 0..nh {
                 for x in 0..nw {
-                    let sx = ((x as f32 + 0.5) / nw as f32 * fw as f32) as u32;
-                    let sy = ((y as f32 + 0.5) / nh as f32 * fh as f32) as u32;
-                    let si = ((sy.min(fh - 1) * fw + sx.min(fw - 1)) * 4) as usize;
+                    let cx = ((x as f32 + 0.5) * step_x) as i32;
+                    let cy = ((y as f32 + 0.5) * step_y) as i32;
+                    let mut sum = [0u32; 4];
+                    let mut n = 0u32;
+                    for oy in -ry..=ry {
+                        for ox in -rx..=rx {
+                            let sx = (cx + ox).clamp(0, fw as i32 - 1) as u32;
+                            let sy = (cy + oy).clamp(0, fh as i32 - 1) as u32;
+                            let si = ((sy * fw + sx) * 4) as usize;
+                            sum[0] += rgba[si] as u32;
+                            sum[1] += rgba[si + 1] as u32;
+                            sum[2] += rgba[si + 2] as u32;
+                            sum[3] += rgba[si + 3] as u32;
+                            n += 1;
+                        }
+                    }
                     let di = ((y * nw + x) * 4) as usize;
-                    out[di..di + 4].copy_from_slice(&rgba[si..si + 4]);
+                    let n = n.max(1);
+                    out[di] = (sum[0] / n) as u8;
+                    out[di + 1] = (sum[1] / n) as u8;
+                    out[di + 2] = (sum[2] / n) as u8;
+                    out[di + 3] = (sum[3] / n) as u8;
                 }
             }
             sheet.snapshot = Some(SheetSnapshot {
@@ -465,18 +579,19 @@ impl Workspace {
                 rgba: out,
             });
         }
+        sheet.snapshot_gen = sheet.snapshot_gen.wrapping_add(1);
         sheet.snapshot_dirty = false;
     }
 
-    /// Ensure inactive sheets have snapshots (cheap if already fresh).
-    /// Never rebuilds when a snapshot already exists — avoids full flatten storms.
-    pub fn ensure_inactive_snapshots(&mut self) {
+    /// Ensure inactive sheets have a sharp photo (taken on blur / when dirty).
+    /// Does not downscale to screen size — that caused upscale "шакалка".
+    pub fn ensure_inactive_snapshots(&mut self, _desk_rect: Rect) {
         let focused = self.focused_index();
         for (i, sheet) in self.sheets.iter_mut().enumerate() {
             if i == focused {
                 continue;
             }
-            if sheet.snapshot.is_some() {
+            if sheet.snapshot.is_some() && !sheet.snapshot_dirty {
                 continue;
             }
             if let Some(doc) = sheet.document.take() {
@@ -492,6 +607,7 @@ impl Workspace {
         ui: &mut egui::Ui,
         desk_rect: Rect,
         pointer_over_sheet: bool,
+        temp_hand_down: bool,
     ) -> bool {
         use crate::canvas::ZOOM_STEP;
 
@@ -542,9 +658,8 @@ impl Workspace {
                 }
             }
         }
-        let space = ui.input(|i| i.key_down(egui::Key::Space));
         if response.dragged_by(egui::PointerButton::Middle)
-            || (space && response.dragged_by(egui::PointerButton::Primary))
+            || (temp_hand_down && response.dragged_by(egui::PointerButton::Primary))
         {
             self.desk.pan += response.drag_delta();
             used = true;

@@ -584,12 +584,20 @@ impl FileBrowser {
         start: Option<&Path>,
         suggested_name: &str,
         format: crate::file::ExportFormat,
+        preferred_dir: Option<&Path>,
     ) {
         self.open_as_sheet = false;
         self.save_mode = true;
         self.save_format = format;
         self.title = "Сохранить как".into();
         self.begin_open(formats, start);
+        // Prefer the configured save root (or collection subfolder) over last_cwd.
+        if let Some(dir) = preferred_dir {
+            let _ = std::fs::create_dir_all(dir);
+            if dir.is_dir() {
+                self.apply_loc(BrowserLoc::Dir(dir.to_path_buf()), false);
+            }
+        }
         // Force a real folder (gallery is open-only).
         if self.in_gallery {
             let folder = self.cwd.clone();
@@ -1286,6 +1294,7 @@ impl FileBrowser {
         let mut filter_changed = false;
         let mut place_dir: Option<PathBuf> = None;
         let mut path_navigate: Option<PathBuf> = None;
+        let mut path_open_file: Option<PathBuf> = None;
         let mut open_gallery = false;
         let mut add_bookmark = false;
         let mut remove_bookmark: Option<PathBuf> = None;
@@ -1293,10 +1302,6 @@ impl FileBrowser {
         let mut delete_path: Option<PathBuf> = None;
         let mut section_order_dirty = false;
         let mut drop_section: Option<(SideSection, SideSection)> = None;
-
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            close = true;
-        }
 
         let folder_name = if self.in_gallery {
             "Gallery".to_owned()
@@ -1313,25 +1318,24 @@ impl FileBrowser {
         let recess = theme::acrylic_solid_fill();
         let card_fill = theme::acrylic_solid_card();
 
-        egui::Window::new(self.title.clone())
-            .id(egui::Id::new("beautiful_file_browser"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .order(egui::Order::Foreground)
-            .default_size([1080.0, 600.0])
-            .min_size([860.0, 460.0])
-            .max_size([1480.0, 900.0])
-            .constrain(true)
-            .frame(
-                egui::Frame::window(&ctx.style())
-                    .fill(win_fill)
-                    .stroke(theme::material_stroke())
-                    .corner_radius(10.0)
-                    .inner_margin(0.0)
-                    .shadow(egui::Shadow::NONE),
-            )
-            .show(ctx, |ui| {
+        // Separate OS window (like Explorer), not an in-app modal.
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("beautiful_file_browser"),
+            egui::ViewportBuilder::default()
+                .with_title(self.title.clone())
+                .with_inner_size([1080.0, 600.0])
+                .with_min_inner_size([860.0, 460.0])
+                .with_max_inner_size([1480.0, 900.0])
+                .with_resizable(true),
+            |vp_ctx, class| {
+                if vp_ctx.input(|i| {
+                    i.viewport().close_requested() || i.key_pressed(egui::Key::Escape)
+                }) {
+                    close = true;
+                }
+
+                let window_title = self.title.clone();
+                let mut paint = |ui: &mut egui::Ui| {
                 theme::apply_opaque_chrome(ui);
                 ui.visuals_mut().window_fill = win_fill;
                 ui.visuals_mut().panel_fill = win_fill;
@@ -1391,7 +1395,15 @@ impl FileBrowser {
                             })
                             .corner_radius(4.0),
                         );
-                        egui::Popup::from_toggle_button_response(&filter_btn).show(|ui| {
+                        egui::Popup::from_toggle_button_response(&filter_btn)
+                            .frame(
+                                egui::Frame::popup(&ui.ctx().style())
+                                    .fill(theme::menu_fill())
+                                    .stroke(theme::material_stroke())
+                                    .corner_radius(8.0)
+                                    .inner_margin(egui::Margin::same(8)),
+                            )
+                            .show(|ui| {
                             theme::apply_opaque_chrome(ui);
                             ui.set_min_width(220.0);
                             ui.label(
@@ -1442,36 +1454,70 @@ impl FileBrowser {
                                     let edit = ui.add(
                                         egui::TextEdit::singleline(&mut self.path_edit)
                                             .id(path_id)
-                                            .desired_width((path_w - 36.0).max(80.0))
+                                            .desired_width((path_w - 72.0).max(80.0))
                                             .text_color(theme::TEXT)
                                             .frame(false),
                                     );
                                     if edit.gained_focus() || edit.has_focus() {
                                         self.path_edit_focused = true;
                                     }
-                                    if edit.lost_focus() {
+                                    // Enter submits even though TextEdit loses focus in the same frame.
+                                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    let mut commit_path = enter
+                                        && (edit.has_focus()
+                                            || edit.lost_focus()
+                                            || self.path_edit_focused);
+                                    // Paste of a full folder/file path → navigate (Explorer-like).
+                                    let pasted = edit.changed()
+                                        && ui.input(|i| {
+                                            i.events.iter().any(|e| {
+                                                matches!(e, egui::Event::Paste(_))
+                                            })
+                                        });
+                                    if pasted {
+                                        if matches!(
+                                            parse_address_bar(&self.path_edit),
+                                            Ok(AddressBarAction::Dir(_))
+                                                | Ok(AddressBarAction::File(_))
+                                                | Ok(AddressBarAction::Gallery)
+                                        ) {
+                                            commit_path = true;
+                                        }
+                                    }
+                                    if edit.lost_focus() && !enter {
                                         self.path_edit_focused = false;
                                     }
-                                    if edit.has_focus()
-                                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("→")
+                                                    .color(theme::TEXT)
+                                                    .size(14.0),
+                                            )
+                                            .frame(false)
+                                            .min_size(egui::vec2(22.0, 18.0)),
+                                        )
+                                        .on_hover_text("Перейти / открыть путь")
+                                        .clicked()
                                     {
-                                        let t = self.path_edit.trim().to_string();
-                                        if t.eq_ignore_ascii_case("gallery") {
-                                            open_gallery = true;
-                                        } else {
-                                            let p = PathBuf::from(&t);
-                                            if p.is_dir() {
+                                        commit_path = true;
+                                    }
+                                    if commit_path {
+                                        match parse_address_bar(&self.path_edit) {
+                                            Ok(AddressBarAction::Gallery) => {
+                                                open_gallery = true;
+                                            }
+                                            Ok(AddressBarAction::Dir(p)) => {
                                                 path_navigate = Some(p);
-                                            } else if let Some(parent) = p.parent() {
-                                                if parent.is_dir() {
+                                            }
+                                            Ok(AddressBarAction::File(p)) => {
+                                                if let Some(parent) = p.parent() {
                                                     path_navigate = Some(parent.to_path_buf());
-                                                } else {
-                                                    self.error =
-                                                        Some(format!("Папка не найдена: {t}"));
                                                 }
-                                            } else {
-                                                self.error =
-                                                    Some(format!("Папка не найдена: {t}"));
+                                                path_open_file = Some(p);
+                                            }
+                                            Err(e) => {
+                                                self.error = Some(e);
                                             }
                                         }
                                     }
@@ -1501,20 +1547,46 @@ impl FileBrowser {
                                             .take(10)
                                             .collect();
                                         if !recent.is_empty() {
+                                            let popup_fill = theme::menu_fill();
                                             egui::Popup::from_response(&edit)
                                                 .open_memory(Some(egui::SetOpenCommand::Bool(true)))
-                                                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                                                .close_behavior(
+                                                    egui::PopupCloseBehavior::CloseOnClickOutside,
+                                                )
+                                                .frame(
+                                                    egui::Frame::popup(&ui.ctx().style())
+                                                        .fill(popup_fill)
+                                                        .stroke(theme::material_stroke())
+                                                        .corner_radius(8.0)
+                                                        .inner_margin(egui::Margin::same(8)),
+                                                )
                                                 .show(|ui| {
                                                     theme::apply_opaque_chrome(ui);
+                                                    ui.visuals_mut().panel_fill = popup_fill;
+                                                    ui.visuals_mut().window_fill = popup_fill;
                                                     ui.set_min_width(path_w.min(520.0));
-                                                    ui.label(theme::label_dim("Недавние папки"));
+                                                    ui.label(
+                                                        egui::RichText::new("Недавние папки")
+                                                            .color(theme::TEXT)
+                                                            .size(12.0),
+                                                    );
                                                     ui.separator();
                                                     for p in recent {
                                                         let label = p.display().to_string();
                                                         if ui
-                                                            .selectable_label(
-                                                                false,
-                                                                theme::label(&label),
+                                                            .add(
+                                                                egui::Button::new(
+                                                                    theme::label(&label),
+                                                                )
+                                                                .fill(theme::menu_item_fill())
+                                                                .stroke(egui::Stroke::new(
+                                                                    1.0_f32,
+                                                                    theme::STROKE,
+                                                                ))
+                                                                .min_size(egui::vec2(
+                                                                    ui.available_width(),
+                                                                    22.0,
+                                                                )),
                                                             )
                                                             .clicked()
                                                         {
@@ -2253,7 +2325,40 @@ impl FileBrowser {
                         });
                     });
                 });
-            });
+                }; // end paint
+
+                if class == egui::ViewportClass::Embedded {
+                    egui::Window::new(window_title)
+                        .id(egui::Id::new("beautiful_file_browser"))
+                        .open(&mut open)
+                        .collapsible(false)
+                        .resizable(true)
+                        .order(egui::Order::Foreground)
+                        .default_size([1080.0, 600.0])
+                        .min_size([860.0, 460.0])
+                        .max_size([1480.0, 900.0])
+                        .constrain(true)
+                        .frame(
+                            egui::Frame::window(&vp_ctx.style())
+                                .fill(win_fill)
+                                .stroke(theme::material_stroke())
+                                .corner_radius(10.0)
+                                .inner_margin(0.0)
+                                .shadow(egui::Shadow::NONE),
+                        )
+                        .show(vp_ctx, |ui| paint(ui));
+                } else {
+                    egui::CentralPanel::default()
+                        .frame(
+                            egui::Frame::new()
+                                .fill(win_fill)
+                                .stroke(theme::material_stroke())
+                                .inner_margin(0.0),
+                        )
+                        .show(vp_ctx, |ui| paint(ui));
+                }
+            },
+        );
 
         if let Some((from, to)) = drop_section {
             if reorder_side_section(&mut self.section_order, from, to) {
@@ -2319,6 +2424,18 @@ impl FileBrowser {
             self.path_edit_focused = false;
             self.navigate_to(p, true);
         }
+        if let Some(p) = path_open_file {
+            self.path_edit = p.display().to_string();
+            if self.save_mode {
+                if let Some(name) = p.file_name() {
+                    self.file_name = name.to_string_lossy().into_owned();
+                }
+                self.select_path(p);
+            } else if p.is_file() {
+                self.select_path(p);
+                self.confirm_open();
+            }
+        }
         if let Some((p, add, range)) = select {
             self.apply_selection(p, add, range);
         }
@@ -2335,6 +2452,118 @@ impl FileBrowser {
             self.confirm_open();
         }
     }
+}
+
+fn normalize_address_bar(raw: &str) -> String {
+    let mut t = raw.trim().to_string();
+    if t.len() >= 2 {
+        let bytes = t.as_bytes();
+        let q0 = bytes[0];
+        let q1 = bytes[t.len() - 1];
+        if (q0 == b'"' && q1 == b'"') || (q0 == b'\'' && q1 == b'\'') {
+            t = t[1..t.len() - 1].trim().to_string();
+        }
+    }
+    // file:///C:/Users/... or file://localhost/C:/...
+    let lower = t.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("file:///") {
+        let orig = &t[t.len() - rest.len()..];
+        t = percent_decode_path(orig);
+        #[cfg(windows)]
+        {
+            t = t.replace('/', "\\");
+        }
+    } else if let Some(rest) = lower.strip_prefix("file://") {
+        let orig = &t[t.len() - rest.len()..];
+        let mut s = percent_decode_path(orig);
+        if let Some(stripped) = s.strip_prefix("localhost/") {
+            s = stripped.to_string();
+        }
+        #[cfg(windows)]
+        {
+            s = s.replace('/', "\\");
+        }
+        t = s;
+    }
+    // Don't strip trailing slash from drive roots ("C:\" → "C:" is not a dir).
+    let is_drive_root = {
+        #[cfg(windows)]
+        {
+            let b = t.as_bytes();
+            (b.len() == 2 && b[1] == b':')
+                || (b.len() == 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    };
+    if !is_drive_root {
+        t = t.trim_end_matches(['/', '\\']).to_string();
+    }
+    #[cfg(windows)]
+    {
+        if t.len() == 2 && t.as_bytes()[1] == b':' {
+            t.push('\\');
+        }
+    }
+    t
+}
+
+fn percent_decode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let h = |c: u8| -> Option<u8> {
+                match c {
+                    b'0'..=b'9' => Some(c - b'0'),
+                    b'a'..=b'f' => Some(c - b'a' + 10),
+                    b'A'..=b'F' => Some(c - b'A' + 10),
+                    _ => None,
+                }
+            };
+            if let (Some(hi), Some(lo)) = (h(b[i + 1]), h(b[i + 2])) {
+                out.push(char::from(hi * 16 + lo));
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+enum AddressBarAction {
+    Gallery,
+    Dir(PathBuf),
+    /// Open/select this file (parent folder becomes cwd).
+    File(PathBuf),
+}
+
+fn parse_address_bar(raw: &str) -> Result<AddressBarAction, String> {
+    let t = normalize_address_bar(raw);
+    if t.is_empty() {
+        return Err("Пустой путь".into());
+    }
+    if t.eq_ignore_ascii_case("gallery") {
+        return Ok(AddressBarAction::Gallery);
+    }
+    let p = PathBuf::from(&t);
+    if p.is_dir() {
+        return Ok(AddressBarAction::Dir(p));
+    }
+    if p.is_file() {
+        return Ok(AddressBarAction::File(p));
+    }
+    if let Some(parent) = p.parent() {
+        if parent.is_dir() && !parent.as_os_str().is_empty() {
+            return Ok(AddressBarAction::Dir(parent.to_path_buf()));
+        }
+    }
+    Err(format!("Папка не найдена: {t}"))
 }
 
 fn paint_files_nav_menu(

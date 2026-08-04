@@ -28,7 +28,9 @@ mod resources;
 mod settings;
 mod stroke_input;
 mod theme;
+mod tool_session;
 mod ui;
+mod ui_fonts;
 mod ui_kit;
 mod workspace;
 

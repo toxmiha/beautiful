@@ -53,9 +53,9 @@ impl CropAspect {
 #[derive(Clone)]
 pub struct TransformSession {
     pub layer_idx: usize,
-    /// Pre-lift tiles — Cancel restores these.
+    /// Pre-lift tiles тАФ Cancel restores these.
     pub layer_before: TileBuffer,
-    /// Post-lift (holed) tiles — Confirm composites floating onto these (no duplicate).
+    /// Post-lift (holed) tiles тАФ Confirm composites floating onto these (no duplicate).
     pub layer_holed: TileBuffer,
     pub sel_rect: beautiful_core::SelectionRect,
     pub sel_mask: Option<beautiful_core::SelectionMask>,
@@ -68,14 +68,14 @@ pub(crate) enum GradientHandle {
     End,
 }
 
-/// Live gradient edit — Apply commits undo, Cancel restores layer.
+/// Live gradient edit тАФ Apply commits undo, Cancel restores layer.
 #[derive(Clone)]
 pub struct GradientSession {
     pub layer_idx: usize,
     pub layer_before: TileBuffer,
     pub start: (f32, f32),
     pub end: (f32, f32),
-    /// First A→B drag still in progress.
+    /// First AтЖТB drag still in progress.
     pub defining: bool,
     pub(crate) drag: Option<GradientHandle>,
 }
@@ -116,12 +116,12 @@ pub(crate) enum WarpDragTarget {
         b: usize,
         t: f32,
     },
-    /// Pull patch surface at fixed UV (Mesh interior). Distort uses this as translate.
+    /// Pull patch surface at fixed UV via inward handles (interior drag).
     Interior {
         u: f32,
         v: f32,
     },
-    /// Ctrl-split already handled this press — ignore further drag.
+    /// Ctrl-split already handled this press тАФ ignore further drag.
     SplitLock,
     /// Node + direction 0..3 (+U,-U,+V,-V).
     Whisker {
@@ -148,6 +148,8 @@ pub(crate) struct FreeXform {
 
 impl FreeXform {
     pub(crate) fn from_baseline(w: u32, h: u32, x: f32, y: f32) -> Self {
+        let x = x.round();
+        let y = y.round();
         Self {
             scale_x: 1.0,
             scale_y: 1.0,
@@ -162,13 +164,11 @@ impl FreeXform {
     }
 
     pub(crate) fn half_size(&self, bw: u32, bh: u32) -> (f32, f32) {
-        // Signed halves so handles flip with the content (PS Free Transform).
-        let hw = (bw as f32 * self.scale_x.abs() * 0.5)
-            .max(0.5)
-            .copysign(if self.scale_x < 0.0 { -1.0 } else { 1.0 });
-        let hh = (bh as f32 * self.scale_y.abs() * 0.5)
-            .max(0.5)
-            .copysign(if self.scale_y < 0.0 { -1.0 } else { 1.0 });
+        // Signed halves from integer pixel output size (handles sit on the grid).
+        let ow = (bw as f32 * self.scale_x.abs()).round().max(1.0);
+        let oh = (bh as f32 * self.scale_y.abs()).round().max(1.0);
+        let hw = (ow * 0.5).copysign(if self.scale_x < 0.0 { -1.0 } else { 1.0 });
+        let hh = (oh * 0.5).copysign(if self.scale_y < 0.0 { -1.0 } else { 1.0 });
         (hw, hh)
     }
 }

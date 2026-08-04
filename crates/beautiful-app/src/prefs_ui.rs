@@ -48,6 +48,10 @@ pub struct PrefsUi {
     path_buf_docs: String,
     path_buf_addons: String,
     path_buf_resources: String,
+    /// One-time Discord Application ID entry (project setup).
+    discord_setup_id: String,
+    /// Filter text for the Interface → UI font combo.
+    font_filter: String,
 }
 
 impl Default for PrefsUi {
@@ -59,6 +63,8 @@ impl Default for PrefsUi {
             path_buf_docs: String::new(),
             path_buf_addons: String::new(),
             path_buf_resources: String::new(),
+            discord_setup_id: String::new(),
+            font_filter: String::new(),
         }
     }
 }
@@ -70,11 +76,7 @@ impl PrefsUi {
     }
 
     fn sync_path_bufs(&mut self, settings: &AppSettings) {
-        self.path_buf_docs = if settings.documents_dir.is_empty() {
-            settings.resolved_documents_dir().display().to_string()
-        } else {
-            settings.documents_dir.clone()
-        };
+        self.path_buf_docs = settings.documents_dir.clone();
         self.path_buf_addons = if settings.addons_dir.is_empty() {
             settings.resolved_addons_dir().display().to_string()
         } else {
@@ -93,6 +95,8 @@ pub struct PrefsApply {
     pub undo: bool,
     pub addons_reload: bool,
     pub close: bool,
+    /// Discord RPC settings changed — reconfigure worker.
+    pub discord: bool,
 }
 
 pub fn show_preferences(
@@ -100,12 +104,14 @@ pub fn show_preferences(
     ui_state: &mut PrefsUi,
     settings: &mut AppSettings,
     addons: &mut AddonManager,
+    rpc_status: crate::discord_rpc::RpcUiStatus,
 ) -> PrefsApply {
     let mut apply = PrefsApply {
         appearance: false,
         undo: false,
         addons_reload: false,
         close: false,
+        discord: false,
     };
     if !ui_state.open {
         return apply;
@@ -121,6 +127,7 @@ pub fn show_preferences(
         .collapsible(false)
         .resizable(false)
         .movable(true)
+        .order(egui::Order::Foreground)
         .default_pos(center - egui::vec2(400.0, 280.0))
         .default_size([800.0, 520.0])
         .min_size([720.0, 420.0])
@@ -194,10 +201,16 @@ pub fn show_preferences(
                                 ui.add_space(8.0);
                                 match ui_state.category {
                                     PrefsCategory::System => {
-                                        system_panel(ui, ui_state, settings, &mut apply);
+                                        system_panel(
+                                            ui,
+                                            ui_state,
+                                            settings,
+                                            &mut apply,
+                                            rpc_status,
+                                        );
                                     }
                                     PrefsCategory::Interface => {
-                                        interface_panel(ui, ctx, settings, &mut apply);
+                                        interface_panel(ui, ctx, settings, ui_state, &mut apply);
                                     }
                                     PrefsCategory::Input => {
                                         input_panel(ui, settings);
@@ -228,6 +241,7 @@ pub fn show_preferences(
                                         let _ = settings.save();
                                         apply.appearance = true;
                                         apply.undo = true;
+                                        apply.discord = true;
                                     }
                                 });
                             });
@@ -241,6 +255,7 @@ pub fn show_preferences(
         apply.appearance = true;
         apply.undo = true;
         apply.close = true;
+        apply.discord = true;
     }
     ui_state.open = open;
     apply
@@ -277,15 +292,41 @@ fn system_panel(
     ui_state: &mut PrefsUi,
     settings: &mut AppSettings,
     apply: &mut PrefsApply,
+    rpc_status: crate::discord_rpc::RpcUiStatus,
 ) {
-    if path_row(ui, "Documents folder", &mut ui_state.path_buf_docs).is_some()
+    crate::ui_kit::section(ui, "Save root folder");
+    crate::ui_kit::hint(
+        ui,
+        "Корневая папка для сейвов. Коллекции создают подпапки. Пусто = без фиксированного корня (Save As сам выбирает папку).",
+    );
+    if path_row(ui, "Save root folder", &mut ui_state.path_buf_docs).is_some()
         || ui.input(|i| i.key_pressed(egui::Key::Enter))
     {
         settings.documents_dir = ui_state.path_buf_docs.clone();
     }
     settings.documents_dir = ui_state.path_buf_docs.clone();
+    if !settings.documents_dir.trim().is_empty() {
+        settings.save_root_decided = true;
+    }
+    ui.horizontal(|ui| {
+        if theme::btn(ui, theme::label("Use suggested…")).clicked() {
+            let suggested = AppSettings::suggested_save_root();
+            ui_state.path_buf_docs = suggested.display().to_string();
+            settings.documents_dir = ui_state.path_buf_docs.clone();
+            settings.save_root_decided = true;
+        }
+        if theme::btn(ui, theme::label("Clear")).clicked() {
+            ui_state.path_buf_docs.clear();
+            settings.documents_dir.clear();
+            // Keep decided so we don't re-prompt after an intentional clear.
+            settings.save_root_decided = true;
+        }
+        if !settings.save_root_decided {
+            ui.label(theme::label_dim("(will ask on first save)"));
+        }
+    });
 
-    ui.add_space(6.0);
+    ui.add_space(10.0);
     let _ = path_row(ui, "Add-ons folder", &mut ui_state.path_buf_addons);
     settings.addons_dir = ui_state.path_buf_addons.clone();
 
@@ -300,14 +341,20 @@ fn system_panel(
     if settings.undo_max_steps != before {
         apply.undo = true;
     }
-    system_panel_extra_autosave(ui, settings);
+    system_panel_extra_autosave(ui, ui_state, settings, apply, rpc_status);
 }
 
 fn color_edit(ui: &mut egui::Ui, label: &str, rgb: &mut [u8; 3]) -> bool {
     crate::ui_kit::labeled_color_rgb(ui, label, rgb)
 }
 
-fn system_panel_extra_autosave(ui: &mut egui::Ui, settings: &mut AppSettings) {
+fn system_panel_extra_autosave(
+    ui: &mut egui::Ui,
+    ui_state: &mut PrefsUi,
+    settings: &mut AppSettings,
+    apply: &mut PrefsApply,
+    rpc_status: crate::discord_rpc::RpcUiStatus,
+) {
     ui.add_space(12.0);
     crate::ui_kit::section(ui, "Autosave & recovery");
     crate::ui_kit::hint(
@@ -337,31 +384,127 @@ fn system_panel_extra_autosave(ui: &mut egui::Ui, settings: &mut AppSettings) {
     crate::ui_kit::section(ui, "Discord Rich Presence");
     crate::ui_kit::hint(
         ui,
-        "Create an Application at discord.com/developers → copy Client ID. Or set env BEAUTIFUL_DISCORD_CLIENT_ID.",
+        "Как у игр: Application ID зашит в проект. В Discord → Settings → Activity Privacy включи Display current activity. Нужен Discord desktop.",
     );
-    ui.checkbox(
-        &mut settings.discord_rpc_enabled,
-        theme::label("Enable Discord Rich Presence"),
-    );
+    if ui
+        .checkbox(
+            &mut settings.discord_rpc_enabled,
+            theme::label("Показывать статус в Discord"),
+        )
+        .changed()
+    {
+        apply.discord = true;
+    }
     ui.add_enabled_ui(settings.discord_rpc_enabled, |ui| {
+        ui.label(theme::label_dim("Заголовок"));
         ui.horizontal(|ui| {
-            ui.label(theme::label_dim("Client ID"));
-            ui.add(
-                egui::TextEdit::singleline(&mut settings.discord_client_id)
-                    .desired_width(220.0)
-                    .hint_text("Application Client ID"),
-            );
+            for mode in [
+                crate::settings::DiscordTitleMode::AppName,
+                crate::settings::DiscordTitleMode::CanvasName,
+            ] {
+                if ui
+                    .selectable_label(settings.discord_title_mode == mode, theme::label(mode.label()))
+                    .clicked()
+                {
+                    settings.discord_title_mode = mode;
+                    apply.discord = true;
+                }
+            }
         });
+        if ui
+            .checkbox(
+                &mut settings.discord_show_canvas_preview,
+                theme::label("Превью холста (крупная картинка)"),
+            )
+            .on_hover_text(
+                "Уменьшенный JPEG уходит на временный хост (litterbox, 72ч), чтобы Discord мог его показать. Логотип — в углу. Без превью — большой логотип.",
+            )
+            .changed()
+        {
+            apply.discord = true;
+        }
+        ui.label(theme::label_dim(
+            "Всегда: время сессии · выбранный инструмент · логотип",
+        ));
+        if matches!(
+            rpc_status,
+            crate::discord_rpc::RpcUiStatus::MissingClientId
+        ) {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "Одноразово для проекта: создай Application «Beautiful» на discord.com/developers и вставь Application ID:",
+                )
+                .color(egui::Color32::from_rgb(220, 140, 100))
+                .size(12.0),
+            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut ui_state.discord_setup_id)
+                        .desired_width(260.0)
+                        .hint_text("Application ID"),
+                );
+                if ui.button(theme::label("Сохранить ID")).clicked() {
+                    if let Err(e) =
+                        crate::discord_rpc::save_appdata_client_id(&ui_state.discord_setup_id)
+                    {
+                        crate::action_log::log("discord", &format!("save id failed: {e}"));
+                    } else {
+                        apply.discord = true;
+                    }
+                }
+                if ui.button(theme::label("Открыть портал")).clicked() {
+                    #[cfg(windows)]
+                    {
+                        let _ = std::process::Command::new("cmd")
+                            .args([
+                                "/C",
+                                "start",
+                                "",
+                                "https://discord.com/developers/applications",
+                            ])
+                            .spawn();
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = std::process::Command::new("xdg-open")
+                            .arg("https://discord.com/developers/applications")
+                            .spawn();
+                    }
+                }
+            });
+        }
+        if ui
+            .button(theme::label("Обновить статус сейчас"))
+            .clicked()
+        {
+            apply.discord = true;
+        }
     });
+    let status_col = match rpc_status {
+        crate::discord_rpc::RpcUiStatus::Connected => egui::Color32::from_rgb(120, 200, 140),
+        crate::discord_rpc::RpcUiStatus::Error
+        | crate::discord_rpc::RpcUiStatus::MissingClientId => {
+            egui::Color32::from_rgb(220, 140, 100)
+        }
+        _ => theme::TEXT_DIM,
+    };
+    ui.label(
+        egui::RichText::new(format!("Статус: {}", rpc_status.label()))
+            .color(status_col)
+            .size(12.0),
+    );
 }
 
 fn interface_panel(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     settings: &mut AppSettings,
+    ui_state: &mut PrefsUi,
     apply: &mut PrefsApply,
 ) {
     use crate::settings::{ColorFillMode, ThemeBrightness, UiMaterial};
+    use crate::ui_fonts;
 
     ui.label(theme::heading("Window material"));
     ui.label(theme::label_dim(
@@ -438,7 +581,7 @@ fn interface_panel(
         theme::label("Smooth zoom (trackpad / continuous)"),
     )
     .on_hover_text(
-        "Off = discrete steps (stable, Photoshop-like). On = continuous; pivot stays locked so the canvas does not shake.",
+        "Off = discrete steps (stable, stepped). On = continuous; pivot stays locked so the canvas does not shake.",
     );
 
     ui.add_space(6.0);
@@ -448,6 +591,40 @@ fn interface_panel(
         .changed()
     {
         apply.appearance = true;
+        ctx.request_repaint();
+    }
+
+    ui.add_space(10.0);
+    ui.label(theme::heading("Interface scale"));
+    let native = ctx.native_pixels_per_point().unwrap_or(1.0);
+    ui.label(theme::label_dim(format!(
+        "Windows scale now: {:.0}% (pixels_per_point {:.2})",
+        native * 100.0,
+        native
+    )));
+    if ui
+        .checkbox(
+            &mut settings.ui_scale_follow_windows,
+            theme::label("Follow Windows display scale"),
+        )
+        .changed()
+    {
+        settings.apply_ui_scale(ctx);
+        ctx.request_repaint();
+    }
+    ui.label(theme::label_dim(if settings.ui_scale_follow_windows {
+        "Extra zoom on top of Windows DPI (1.0 = no extra)"
+    } else {
+        "Absolute UI scale (1.0 ≈ 100% / 96 DPI; ignores Windows DPI)"
+    }));
+    let scale_resp = ui.add(
+        egui::Slider::new(&mut settings.ui_scale, 0.75..=2.0)
+            .suffix("×")
+            .trailing_fill(true),
+    );
+    // Apply scale only after the thumb is released (avoids thrashing layout mid-drag).
+    if scale_resp.drag_stopped() || (scale_resp.changed() && !scale_resp.dragged()) {
+        settings.apply_ui_scale(ctx);
         ctx.request_repaint();
     }
 
@@ -463,6 +640,84 @@ fn interface_panel(
         let light = matches!(settings.theme_brightness, ThemeBrightness::Light);
         if ui.selectable_label(light, theme::label("Light")).clicked() {
             settings.apply_theme_brightness(ThemeBrightness::Light);
+            apply.appearance = true;
+            ctx.request_repaint();
+        }
+    });
+
+    ui.add_space(10.0);
+    ui.label(theme::heading("UI font"));
+    ui.label(theme::label_dim(
+        "Все установленные шрифты системы — применяется ко всему тексту интерфейса.",
+    ));
+    let current_font = if settings.ui_font.trim().is_empty() {
+        ui_fonts::DEFAULT_UI_FONT.to_owned()
+    } else {
+        settings.ui_font.clone()
+    };
+    ui.horizontal(|ui| {
+        ui.label(theme::label_dim("Поиск"));
+        ui.add(
+            egui::TextEdit::singleline(&mut ui_state.font_filter)
+                .desired_width(220.0)
+                .hint_text("filter fonts…"),
+        );
+        if !ui_state.font_filter.is_empty()
+            && theme::small_btn(ui, theme::label("×")).clicked()
+        {
+            ui_state.font_filter.clear();
+        }
+    });
+    let filter = ui_state.font_filter.trim().to_ascii_lowercase();
+    egui::ComboBox::from_id_salt("prefs_ui_font")
+        .selected_text(theme::dark_combo_label(format!("▾ {current_font}")))
+        .width(320.0)
+        .height(280.0)
+        .show_ui(ui, |ui| {
+            theme::apply_opaque_chrome(ui);
+            ui.set_min_width(300.0);
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    for family in ui_fonts::list_system_font_families() {
+                        if !filter.is_empty()
+                            && !family.to_ascii_lowercase().contains(&filter)
+                        {
+                            continue;
+                        }
+                        let selected = family.eq_ignore_ascii_case(&current_font);
+                        let label = if selected {
+                            format!("✓ {family}")
+                        } else {
+                            format!("  {family}")
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(label).color(theme::TEXT).size(13.0),
+                                )
+                                .fill(if selected {
+                                    theme::BG_TAB_ACTIVE
+                                } else {
+                                    theme::BG_MENU_ITEM
+                                })
+                                .min_size(egui::vec2(ui.available_width(), 22.0)),
+                            )
+                            .clicked()
+                        {
+                            settings.ui_font = family.clone();
+                            apply.appearance = true;
+                            ctx.request_repaint();
+                        }
+                    }
+                });
+        });
+    ui.horizontal(|ui| {
+        ui.label(theme::label_dim(format!(
+            "Сейчас: {current_font}  ·  AaBbCc 123 Абв"
+        )));
+        if theme::small_btn(ui, theme::label("Default")).clicked() {
+            settings.ui_font.clear();
             apply.appearance = true;
             ctx.request_repaint();
         }

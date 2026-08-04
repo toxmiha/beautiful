@@ -181,6 +181,7 @@ pub struct CanvasGpuResources {
     soft_tw: u32,
     soft_th: u32,
     soft_samp: wgpu::Sampler,
+    soft_samp_nearest: wgpu::Sampler,
     /// Soft Light FS over AABB(∪above ∪ float OBB). Soft is omitted from underlay.
     soft_vertex_buffer: wgpu::Buffer,
     /// Document-space AABB last uploaded into the current texture.
@@ -471,6 +472,14 @@ impl CanvasGpuResources {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
+        let soft_samp_nearest = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("soft_samp_nearest"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
 
         Self {
             pipeline,
@@ -505,6 +514,7 @@ impl CanvasGpuResources {
             soft_tw: 0,
             soft_th: 0,
             soft_samp,
+            soft_samp_nearest,
             soft_vertex_buffer,
             uploaded_doc: DirtyRect::empty(),
         }
@@ -876,6 +886,8 @@ impl CanvasGpuResources {
         } else {
             &self.sampler_nearest
         };
+        // Float is Nearest-baked (or nearest-sampled) for Free Transform — never linear.
+        let float_samp = &self.soft_samp_nearest;
         self.soft_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("beautiful_soft_bg"),
             layout: &self.soft_bgl,
@@ -894,7 +906,7 @@ impl CanvasGpuResources {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&self.soft_samp),
+                    resource: wgpu::BindingResource::Sampler(float_samp),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -902,7 +914,7 @@ impl CanvasGpuResources {
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: wgpu::BindingResource::Sampler(&self.soft_samp),
+                    resource: wgpu::BindingResource::Sampler(float_samp),
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,

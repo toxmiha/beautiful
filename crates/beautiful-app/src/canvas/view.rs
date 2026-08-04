@@ -13,12 +13,14 @@ impl CanvasView {
         wgpu_rs: Option<&eframe::egui_wgpu::RenderState>,
         zoom_step: f32,
         zoom_smooth: bool,
+        temp_hand_down: bool,
     ) {
         let doc_w = document.width as f32;
         let doc_h = document.height as f32;
-        let transform_tool = matches!(*tool_mut, WorkspaceTool::Transform | WorkspaceTool::Warp);
-        // Entering transform tools starts a Confirm/Cancel session (lifts once).
-        if transform_tool && document.selection.rect.is_some() {
+        // Entering Transform/Warp starts a session. Kruler only after rect select + Enter/panel.
+        if matches!(*tool_mut, WorkspaceTool::Transform | WorkspaceTool::Warp)
+            && document.selection.rect.is_some()
+        {
             let _ = state.begin_transform_session(document);
         }
         // Warp tool ↔ Mesh mode must bake Free/Distort pose first (never silent reset).
@@ -69,6 +71,15 @@ impl CanvasView {
                         if crate::theme::small_btn(ui, crate::theme::label("Применить")).clicked()
                         {
                             state.confirm_transform_session(document, tool_mut);
+                        }
+                    } else if kruler_editing(state) {
+                        if crate::theme::small_btn(ui, crate::theme::label("Отмена")).clicked()
+                        {
+                            let _ = cancel_kruler_transform(state, document);
+                        }
+                        if crate::theme::small_btn(ui, crate::theme::label("Применить")).clicked()
+                        {
+                            confirm_kruler_transform(state, document);
                         }
                     } else if document.selection.rect.is_some() {
                         if crate::theme::small_btn(ui, crate::theme::label("Deselect")).clicked() {
@@ -138,7 +149,7 @@ impl CanvasView {
                     i.smooth_scroll_delta = Vec2::ZERO;
                 });
                 if state.accept_zoom_delta(raw_y) {
-                    // Live cursor each notch (PS/SAI). Prefer hover, then interact,
+                    // Live cursor each notch (cursor-follow). Prefer hover, then interact,
                     // then last-good — never silently fall back to center mid-gesture.
                     let sample = response
                         .hover_pos()
@@ -176,8 +187,7 @@ impl CanvasView {
             }
         }
 
-        let space = ctx.input(|i| i.key_down(egui::Key::Space))
-            || matches!(tool, crate::ui::WorkspaceTool::Hand);
+        let space = temp_hand_down || matches!(tool, crate::ui::WorkspaceTool::Hand);
         let panning = response.dragged_by(PointerButton::Middle)
             || (space && response.dragged_by(PointerButton::Primary));
 
@@ -221,6 +231,7 @@ impl CanvasView {
                 | WorkspaceTool::Transform
                 | WorkspaceTool::Lasso
                 | WorkspaceTool::Warp
+                | WorkspaceTool::Kruler
                 | WorkspaceTool::Crop
         );
 
@@ -254,8 +265,8 @@ impl CanvasView {
             rotated_aabb_size(display_w, display_h, state.rotation_deg),
         );
 
-        // Ctrl+drag / Move tool: float until deselect seals (SAI/PS — not on mouse-up).
-        if !space && !panning && !state.transform_editing() {
+        // Ctrl+drag / Move tool: float until deselect seals (common — not on mouse-up).
+        if !space && !panning && !state.transform_editing() && !kruler_editing(state) {
             let ctrl = ctx.input(|i| i.modifiers.ctrl);
             let primary_held = ctx.input(|i| i.pointer.button_down(PointerButton::Primary));
             let primary_released = ctx.input(|i| i.pointer.button_released(PointerButton::Primary));
@@ -301,22 +312,24 @@ impl CanvasView {
                                             document.snapshot_selection(),
                                         )
                                     };
+                                let (sx, sy) = beautiful_core::snap_doc_xy(x, y);
                                 state.sel_pixel_move = Some(SelPixelMoveSession {
                                     layer_idx: idx,
                                     before_tiles,
                                     undo_sel,
-                                    start: (x, y),
-                                    last: (x, y),
+                                    start: (sx, sy),
+                                    last: (sx, sy),
                                     lifted: true,
                                     moved: false,
                                 });
                             } else {
+                                let (sx, sy) = beautiful_core::snap_doc_xy(x, y);
                                 state.sel_pixel_move = Some(SelPixelMoveSession {
                                     layer_idx: idx,
                                     before_tiles: document.layers[idx].tiles.clone_shared(),
                                     undo_sel: document.snapshot_selection(),
-                                    start: (x, y),
-                                    last: (x, y),
+                                    start: (sx, sy),
+                                    last: (sx, sy),
                                     lifted: false,
                                     moved: false,
                                 });
@@ -349,22 +362,42 @@ impl CanvasView {
                                         .selection
                                         .lift_from_layer(&mut document.layers[idx], idx);
                                     document.selection.rect = Some(r);
-                                    document.invalidate_selection_footprint();
+                                    // Empty float: skip footprint dirty (nothing changed on canvas).
+                                    if document
+                                        .selection
+                                        .floating
+                                        .as_ref()
+                                        .is_some_and(|f| !f.is_visually_empty())
+                                    {
+                                        document.invalidate_selection_footprint();
+                                    }
                                     sess.lifted = true;
                                     sess.moved = false;
-                                    sess.last = sess.start;
+                                    let (sx, sy) = beautiful_core::snap_doc_xy(x, y);
+                                    sess.last = (sx, sy);
                                     sel_move_dirty = true;
                                 }
                             }
                             if sess.lifted {
-                                let dx = x - sess.last.0;
-                                let dy = y - sess.last.1;
-                                // Skip sub-pixel chatter — fewer composite invalidates.
-                                if dx.abs() >= 0.5 || dy.abs() >= 0.5 {
+                                let (cx, cy) = beautiful_core::snap_doc_xy(x, y);
+                                let (lx, ly) = beautiful_core::snap_doc_xy(sess.last.0, sess.last.1);
+                                let dx = cx - lx;
+                                let dy = cy - ly;
+                                // Whole-pixel steps only — Ctrl+drag selection move.
+                                if dx != 0.0 || dy != 0.0 {
+                                    let had_pixels = document
+                                        .selection
+                                        .floating
+                                        .as_ref()
+                                        .is_some_and(|f| !f.is_visually_empty());
                                     document.move_floating_selection(dx, dy);
+                                    park_floating_to_pixels(document);
                                     sess.moved = true;
-                                    sel_move_dirty = true;
-                                    sess.last = (x, y);
+                                    sess.last = (cx, cy);
+                                    // Empty float: ants move without composite/upload wake.
+                                    if had_pixels {
+                                        sel_move_dirty = true;
+                                    }
                                 }
                             }
                         }
@@ -384,6 +417,7 @@ impl CanvasView {
                             sess.before_tiles,
                             sess.undo_sel,
                         );
+                        state.nav_pending = true;
                         state.mark_dirty();
                     } else if sess.lifted {
                         document.cancel_selection_move(
@@ -473,7 +507,10 @@ impl CanvasView {
                 || (response.is_pointer_button_down_on()
                     && ctx.input(|i| i.pointer.button_down(PointerButton::Primary)));
             if sample {
-                if let Some(pos) = response.interact_pointer_pos() {
+                if let Some(pos) = response
+                    .interact_pointer_pos()
+                    .or_else(|| response.hover_pos())
+                {
                     if let Some((x, y)) = screen_to_canvas(
                         pos,
                         rect,
@@ -482,21 +519,13 @@ impl CanvasView {
                         state.rotation_deg,
                         document.view_flip_h,
                     ) {
-                        if let Some(color) = document.eyedrop_at(x, y) {
-                            document.brush.color = color;
-                            document.stroke.wet = [
-                                color.r as f32 / 255.0,
-                                color.g as f32 / 255.0,
-                                color.b as f32 / 255.0,
-                                1.0,
-                            ];
-                        }
+                        apply_canvas_eyedrop(document, x, y);
                     }
                 }
             }
         }
 
-        // Alt+click eyedrop while on paint tools.
+        // Quick eyedrop on paint tools: Alt+LMB (hold/drag) or RMB (common-style).
         if matches!(
             tool,
             WorkspaceTool::Brush
@@ -508,26 +537,35 @@ impl CanvasView {
                 | WorkspaceTool::Smudge
         ) && !space
             && !panning
-            && response.clicked_by(PointerButton::Primary)
-            && ctx.input(|i| i.modifiers.alt)
         {
-            if let Some(pos) = response.interact_pointer_pos() {
-                if let Some((x, y)) = screen_to_canvas(
-                    pos,
-                    rect,
-                    doc_w,
-                    doc_h,
-                    state.rotation_deg,
-                    document.view_flip_h,
-                ) {
-                    if let Some(color) = document.eyedrop_at(x, y) {
-                        document.brush.color = color;
-                        document.stroke.wet = [
-                            color.r as f32 / 255.0,
-                            color.g as f32 / 255.0,
-                            color.b as f32 / 255.0,
-                            1.0,
-                        ];
+            let (alt, lmb, rmb) = ctx.input(|i| {
+                (
+                    i.modifiers.alt,
+                    i.pointer.button_down(PointerButton::Primary),
+                    i.pointer.button_down(PointerButton::Secondary),
+                )
+            });
+            let alt_sample = alt
+                && (response.clicked_by(PointerButton::Primary)
+                    || (lmb
+                        && (response.is_pointer_button_down_on() || response.hovered())));
+            let rmb_sample = response.clicked_by(PointerButton::Secondary)
+                || (rmb && (response.hovered() || response.is_pointer_button_down_on()));
+            if alt_sample || rmb_sample {
+                if let Some(pos) = response
+                    .interact_pointer_pos()
+                    .or_else(|| response.hover_pos())
+                    .or_else(|| ctx.input(|i| i.pointer.latest_pos()))
+                {
+                    if let Some((x, y)) = screen_to_canvas(
+                        pos,
+                        rect,
+                        doc_w,
+                        doc_h,
+                        state.rotation_deg,
+                        document.view_flip_h,
+                    ) {
+                        apply_canvas_eyedrop(document, x, y);
                     }
                 }
             }
@@ -801,6 +839,9 @@ impl CanvasView {
 
         let button_held =
             ctx.input(|i| i.pointer.button_down(PointerButton::Primary)) || state.lmb_down;
+        let eyedrop_hold = ctx.input(|i| {
+            i.modifiers.alt || i.pointer.button_down(PointerButton::Secondary)
+        });
         let ctrl_sel_block = ctx.input(|i| i.modifiers.ctrl)
             && document.selection.rect.is_some()
             && !matches!(
@@ -808,10 +849,12 @@ impl CanvasView {
                 WorkspaceTool::SelectionBrush | WorkspaceTool::SelectionEraser
             );
         // Keep painting while LMB held even if pointer leaves the widget.
+        // Alt / RMB = quick eyedrop — do not start or continue a stroke.
         let primary_down = can_paint
             && !space
             && !panning
             && button_held
+            && !eyedrop_hold
             && !ctrl_sel_block
             && state.sel_pixel_move.is_none()
             && (state.is_drawing || response.is_pointer_button_down_on() || state.lmb_down);
@@ -926,6 +969,8 @@ impl CanvasView {
                 // Live gradient / Free Transform: freeze underlay, paint overlay —
                 // skip composite/upload so FPS matches Gradient tool.
                 let xform_live = state.xform_live_overlay_active(document);
+                // Kruler exception: same skip as Transform overlay, own freeze flag.
+                let kruler_live = state.kruler_live_overlay_active(document);
                 // Never skip when LOD must change — otherwise mip tiles stay on the
                 // pre-lift plate while the underlay is frozen (zoom-dependent seams).
                 let want_lod = beautiful_core::lod_factor_for_document(
@@ -935,7 +980,7 @@ impl CanvasView {
                     document.height,
                 );
                 let lod_pending = want_lod != state.display_lod;
-                let skip_sync = (state.gradient_editing() || xform_live)
+                let skip_sync = (state.gradient_editing() || xform_live || kruler_live)
                     && !state.dirty
                     && !state.gpu_invalidate
                     && !lod_pending;
@@ -992,13 +1037,25 @@ impl CanvasView {
                         if document.selection.floating_overlay_only {
                             state.ensure_xform_above_tex(ctx, document);
                         }
-                        state.note_xform_underlay_synced(document);
-                        if document.selection.floating_overlay_only
-                            && !state.xform_underlay_frozen
-                        {
-                            document.composite.mark_full();
-                            state.dirty = true;
-                            ui.ctx().request_repaint();
+                        if kruler_editing(state) {
+                            // Kruler-only freeze — never sets Transform xform_underlay_frozen.
+                            state.note_kruler_underlay_synced(document);
+                            if document.selection.floating_overlay_only
+                                && !state.kruler_underlay_frozen
+                            {
+                                document.composite.mark_full();
+                                state.dirty = true;
+                                ui.ctx().request_repaint();
+                            }
+                        } else {
+                            state.note_xform_underlay_synced(document);
+                            if document.selection.floating_overlay_only
+                                && !state.xform_underlay_frozen
+                            {
+                                document.composite.mark_full();
+                                state.dirty = true;
+                                ui.ctx().request_repaint();
+                            }
                         }
                     } else if state.dirty {
                         // Underlay sync consumed force_full but GPU upload did not
@@ -1010,7 +1067,11 @@ impl CanvasView {
                     }
                 }
                 let canvas_aabb = paint_aabb;
-                let paint_rect = canvas_aabb.intersect(viewport);
+                // Intersect with UI clip so the paint callback rect matches what egui
+                // actually rasters — avoids stretch when the sheet is clipped at desk edges.
+                let paint_rect = canvas_aabb
+                    .intersect(viewport)
+                    .intersect(ui.clip_rect());
                 if paint_rect.is_positive() && !no_present {
                     let canvas_params = crate::canvas_gpu::CanvasDrawParams {
                         viewport: paint_rect,
@@ -1213,8 +1274,12 @@ impl CanvasView {
                         // Soft Light GPU: float + Soft Light in wgpu pass.
                         // Else: egui float (+ Normal above plate). Soft cube removed.
                         if !state.softlight_gpu_drew {
-                            if let Some(tex) = state.xform_live_tex.as_ref() {
-                                paint_free_transform_live_image(
+                            // Baked Nearest float drawn 1:1 in doc pixels (not stretched baseline).
+                            if let (Some(tex), Some(f)) = (
+                                state.xform_live_tex.as_ref(),
+                                document.selection.floating.as_ref(),
+                            ) {
+                                paint_selection_mask_overlay_opacity(
                                     &painter,
                                     tex.id(),
                                     canvas_center,
@@ -1222,9 +1287,10 @@ impl CanvasView {
                                     doc_w,
                                     doc_h,
                                     state.rotation_deg,
-                                    fx,
-                                    *bw,
-                                    *bh,
+                                    f.x,
+                                    f.y,
+                                    f.width,
+                                    f.height,
                                     document.floating_transform_opacity(),
                                 );
                             }
@@ -1280,17 +1346,20 @@ impl CanvasView {
                         false,
                     );
                 }
-            } else if overlay_live {
-                // Distort / Mesh: baseline tex + tessellated warp mesh (no CPU Soft cube).
-                if let (Some(tex), Some((_, bw, bh, ox, oy)), Some(pts)) = (
-                    state.xform_live_tex.as_ref(),
-                    state.transform_baseline.as_ref(),
-                    state.warp_controls.as_ref(),
-                ) {
-                    let n = state.mesh_grid_n.max(2);
-                    if !state.warp_lattice_edited {
-                        let (lx0, ly0) = pts.first().copied().unwrap_or((0.0, 0.0));
-                        paint_selection_mask_overlay(
+            } else if kruler_editing(state) {
+                // Kruler exception: CPU float tex over frozen hole (not Transform xform_live).
+                if document.selection.floating_overlay_only {
+                    let view = state.view_dirty_rect(document);
+                    if !document.transform_above_needs_backdrop() {
+                        document.ensure_transform_above_for_view(view);
+                    }
+                    state.ensure_kruler_float_tex(ctx, document);
+                    state.ensure_xform_above_tex(ctx, document);
+                    if let (Some(tex), Some(f)) = (
+                        state.kruler_float_tex.as_ref(),
+                        document.selection.floating.as_ref(),
+                    ) {
+                        paint_selection_mask_overlay_opacity(
                             &painter,
                             tex.id(),
                             canvas_center,
@@ -1298,32 +1367,65 @@ impl CanvasView {
                             doc_w,
                             doc_h,
                             state.rotation_deg,
-                            *ox + lx0,
-                            *oy + ly0,
-                            *bw,
-                            *bh,
-                        );
-                    } else {
-                        let handles = state.warp_node_handles.as_ref().map(|v| v.as_slice());
-                        paint_warp_live_mesh(
-                            &painter,
-                            tex.id(),
-                            canvas_center,
-                            egui::vec2(display_w, display_h),
-                            doc_w,
-                            doc_h,
-                            state.rotation_deg,
-                            document.view_flip_h,
-                            *ox,
-                            *oy,
-                            *bw,
-                            *bh,
-                            n,
-                            pts,
-                            handles,
+                            f.x,
+                            f.y,
+                            f.width,
+                            f.height,
                             document.floating_transform_opacity(),
                         );
                     }
+                    if !document.transform_above_needs_backdrop() {
+                        if let Some((tex, ox, oy, aw, ah, _)) = state.xform_above_tex.as_ref() {
+                            paint_selection_mask_overlay(
+                                &painter,
+                                tex.id(),
+                                canvas_center,
+                                egui::vec2(display_w, display_h),
+                                doc_w,
+                                doc_h,
+                                state.rotation_deg,
+                                *ox as f32,
+                                *oy as f32,
+                                *aw,
+                                *ah,
+                            );
+                        }
+                    }
+                }
+                if let Some((fx, bw, bh)) = kruler_handle_xform(state) {
+                    paint_free_transform_overlay(
+                        &painter,
+                        canvas_center,
+                        egui::vec2(display_w, display_h),
+                        doc_w,
+                        doc_h,
+                        state.rotation_deg,
+                        &fx,
+                        bw,
+                        bh,
+                        time,
+                    );
+                }
+            } else if overlay_live {
+                // Distort / Mesh: Nearest-baked floating drawn 1:1 (no GPU mesh stretch).
+                if let (Some(tex), Some(f)) = (
+                    state.xform_live_tex.as_ref(),
+                    document.selection.floating.as_ref(),
+                ) {
+                    paint_selection_mask_overlay_opacity(
+                        &painter,
+                        tex.id(),
+                        canvas_center,
+                        egui::vec2(display_w, display_h),
+                        doc_w,
+                        doc_h,
+                        state.rotation_deg,
+                        f.x,
+                        f.y,
+                        f.width,
+                        f.height,
+                        document.floating_transform_opacity(),
+                    );
                 }
                 if !document.transform_above_needs_backdrop() {
                     if let Some((tex, ox, oy, aw, ah, _)) = state.xform_above_tex.as_ref() {
@@ -1586,7 +1688,7 @@ impl CanvasView {
                     .unwrap_or((0.0, 0.0));
                 let n = state.mesh_grid_n.max(2);
                 let mesh_mode = state.transform_mode == TransformMode::Mesh;
-                // Both Mesh and Distort use Coons + whiskers (PS Warp).
+                // Both Mesh and Distort use Coons + whiskers (warp).
                 let handles = state.warp_node_handles.as_ref();
                 let guide_col = egui::Color32::from_rgb(28, 28, 28);
                 let stroke = egui::Stroke::new(1.35_f32, guide_col);
@@ -1668,7 +1770,7 @@ impl CanvasView {
                     }
                 }
                 // Yellow anchors: square = Independent (primary), circle = Unison (secondary).
-                // Whiskers: selected node gets all 4; neighbors show facing secondary tip (PS).
+                // Whiskers: selected node gets all 4; neighbors show facing secondary tip (common).
                 let accent = egui::Color32::from_rgb(255, 210, 40);
                 let accent_dark = egui::Color32::from_rgb(40, 30, 0);
                 let secondary_col = egui::Color32::from_rgb(220, 190, 60);
@@ -1748,7 +1850,7 @@ impl CanvasView {
                             beautiful_core::warp_anchor_kind(n, i)
                                 != beautiful_core::WarpAnchorKind::Corner
                         });
-                    // PS: circle = Unison (secondary), square = Independent (primary).
+                    // Circle = Unison (secondary), square = Independent (primary).
                     if unison {
                         painter.circle_filled(p, r, accent);
                         painter.circle_stroke(
@@ -1881,6 +1983,31 @@ impl CanvasView {
             }
         }
     }
+}
+
+fn apply_canvas_eyedrop(document: &mut Document, x: f32, y: f32) {
+    let Some(color) = document.eyedrop_at(x, y) else {
+        return;
+    };
+    let color = color.opaque();
+    match document.drawing_slot {
+        beautiful_core::DrawingColorSlot::Background => {
+            document.color_bg = color;
+        }
+        beautiful_core::DrawingColorSlot::Transparent => {
+            document.brush.color = color;
+            document.drawing_slot = beautiful_core::DrawingColorSlot::Foreground;
+        }
+        beautiful_core::DrawingColorSlot::Foreground => {
+            document.brush.color = color;
+        }
+    }
+    document.stroke.wet = [
+        color.r as f32 / 255.0,
+        color.g as f32 / 255.0,
+        color.b as f32 / 255.0,
+        1.0,
+    ];
 }
 
 /// Axis-aligned size that fully covers a `display_w×display_h` quad rotated by `rotation_deg`.

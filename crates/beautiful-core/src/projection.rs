@@ -527,6 +527,8 @@ impl Projection {
             return self.take_pending_upload_result();
         }
 
+        // Same as Dense: only expand with float when it overlaps pending dirty.
+        // Otherwise offscreen backlog re-composites the float every frame (idle CPU).
         if let Some(f) = floating {
             let mut fr = DirtyRect {
                 x0: f.x.floor().max(0.0) as u32,
@@ -537,7 +539,10 @@ impl Projection {
                     .clamp(0.0, self.dense.height as f32) as u32,
             };
             fr.clamp_to(self.dense.width, self.dense.height);
-            regions.push(fr);
+            let overlaps = regions.iter().any(|r| !r.intersect(fr).is_empty());
+            if overlaps {
+                regions.push(fr);
+            }
         }
 
         let mut now_list = Vec::new();

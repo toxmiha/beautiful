@@ -886,7 +886,7 @@ pub(crate) fn paint_free_transform_live_image(
 
 /// Industry-style live Mesh/Distort: baseline tex + tessellated warp surface.
 /// Vertices move with control points; UVs stay on the source image (no CPU raster).
-/// Density follows source pixel size (PS BezierSurface→Mesh ~px spacing), not a fixed poly count.
+/// Density follows source pixel size (BezierSurface→Mesh ~px spacing), not a fixed poly count.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_warp_live_mesh(
     painter: &egui::Painter,

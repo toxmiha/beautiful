@@ -1,6 +1,6 @@
 //! Color pickers: wheel, hue/brightness cubes, grayscale, RGB/HSB/CMYK/Lab/Web.
 
-use beautiful_core::Rgba;
+use beautiful_core::{DrawingColorSlot, Rgba};
 use eframe::egui::{self, Color32, Mesh, Pos2, Sense, Shape, Stroke, Vec2};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -93,12 +93,18 @@ pub struct ColorState {
     pub val: f32,
     pub picker: ColorPickerKind,
     pub wheel_sv: WheelSvShape,
+    /// Active Main / Sub / Transparent icon (common).
+    pub drawing_slot: DrawingColorSlot,
+    /// RGB/HSB sliders as a collapsible sub-panel under the wheel.
+    pub sliders_open: bool,
     drag: WheelDrag,
     ring_cache: Option<(u32, Mesh)>,
     /// (size_q, hue_q, shape_id, mesh)
     cube_cache: Option<(u32, u16, u8, Mesh)>,
     strip_cache: Option<(u32, u8, Mesh)>,
     web_hex: String,
+    /// Last color-wheel rect for FG/BG overlay placement.
+    last_wheel_rect: Option<egui::Rect>,
 }
 
 impl Default for ColorState {
@@ -109,11 +115,14 @@ impl Default for ColorState {
             val: 0.0,
             picker: ColorPickerKind::Wheel,
             wheel_sv: WheelSvShape::Square,
+            drawing_slot: DrawingColorSlot::Foreground,
+            sliders_open: false,
             drag: WheelDrag::None,
             ring_cache: None,
             cube_cache: None,
             strip_cache: None,
             web_hex: String::new(),
+            last_wheel_rect: None,
         }
     }
 }
@@ -127,11 +136,14 @@ impl ColorState {
             val: v,
             picker: ColorPickerKind::Wheel,
             wheel_sv: WheelSvShape::Square,
+            drawing_slot: DrawingColorSlot::Foreground,
+            sliders_open: false,
             drag: WheelDrag::None,
             ring_cache: None,
             cube_cache: None,
             strip_cache: None,
             web_hex: format!("#{:02X}{:02X}{:02X}", c.r, c.g, c.b),
+            last_wheel_rect: None,
         }
     }
 
@@ -151,12 +163,22 @@ impl ColorState {
     }
 }
 
-pub fn color_palette(ui: &mut egui::Ui, color: &mut Rgba, state: &mut ColorState) -> bool {
+pub fn color_palette(
+    ui: &mut egui::Ui,
+    fg: &mut Rgba,
+    bg: &mut Rgba,
+    state: &mut ColorState,
+) -> bool {
     let mut changed = false;
 
+    // Wheel / sliders edit the active opaque swatch (Transparent still edits Main).
+    let active = match state.drawing_slot {
+        DrawingColorSlot::Background => *bg,
+        _ => *fg,
+    };
     let wheel = state.to_rgba();
-    if wheel.r != color.r || wheel.g != color.g || wheel.b != color.b {
-        state.sync_from_rgba(*color);
+    if wheel.r != active.r || wheel.g != active.g || wheel.b != active.b {
+        state.sync_from_rgba(active);
     }
 
     ui.horizontal(|ui| {
@@ -207,87 +229,381 @@ pub fn color_palette(ui: &mut egui::Ui, color: &mut Rgba, state: &mut ColorState
     });
 
     ui.add_space(4.0);
-    let size = ui.available_width().min(220.0).max(140.0);
+
+    let write_active = |fg: &mut Rgba, bg: &mut Rgba, state: &ColorState, c: Rgba| {
+        match state.drawing_slot {
+            DrawingColorSlot::Background => *bg = c,
+            _ => *fg = c,
+        }
+    };
+
+    let mut show_slider_strip = false;
+    let mut slider_kind = ColorPickerKind::Rgb;
+
+    // Shape chrome first, then size the wheel from remaining panel space.
+    if matches!(state.picker, ColorPickerKind::Wheel) {
+        ui.horizontal(|ui| {
+            ui.label(crate::theme::label_dim("Форма"));
+            for shape in WheelSvShape::ALL {
+                let on = state.wheel_sv == shape;
+                if ui
+                    .add(
+                        egui::Button::selectable(on, crate::theme::label(shape.label()))
+                            .min_size(egui::vec2(0.0, 22.0)),
+                    )
+                    .clicked()
+                {
+                    state.wheel_sv = shape;
+                    state.cube_cache = None;
+                    state.drag = WheelDrag::None;
+                }
+            }
+        });
+        ui.add_space(2.0);
+    }
+
+    // Wheel is priority: size from THIS Color panel only (after chrome above).
+    let slider_reserve = if state.sliders_open { 108.0 } else { 26.0 };
+    let max_w = ui.available_width().max(64.0);
+    let max_h = (ui.available_height() - slider_reserve).max(80.0);
+    let size = max_w.min(max_h).clamp(96.0, 512.0);
 
     match state.picker {
         ColorPickerKind::Wheel => {
-            if circular_hsv_wheel(ui, state, size) {
-                *color = state.to_rgba();
-                changed = true;
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), size),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    if circular_hsv_wheel(ui, state, size) {
+                        write_active(fg, bg, state, state.to_rgba());
+                        changed = true;
+                    }
+                },
+            );
+            if let Some(wheel_rect) = state.last_wheel_rect {
+                match drawing_color_icons(ui, wheel_rect, *fg, *bg, state) {
+                    DrawingIconAction::SwapFgBg => {
+                        std::mem::swap(fg, bg);
+                        *fg = fg.opaque();
+                        *bg = bg.opaque();
+                        state.drawing_slot = DrawingColorSlot::Foreground;
+                        state.sync_from_rgba(*fg);
+                        changed = true;
+                    }
+                    DrawingIconAction::SlotChanged => {
+                        let sync = match state.drawing_slot {
+                            DrawingColorSlot::Background => *bg,
+                            _ => *fg,
+                        };
+                        state.sync_from_rgba(sync);
+                    }
+                    DrawingIconAction::None => {}
+                }
             }
-            if rgb_sliders(ui, color, state) {
-                changed = true;
-            }
+            show_slider_strip = true;
+            slider_kind = ColorPickerKind::Rgb;
         }
         ColorPickerKind::HueCube => {
-            if hue_sv_cube(ui, state, size) {
-                *color = state.to_rgba();
-                changed = true;
-            }
-            if hsb_sliders(ui, color, state) {
-                changed = true;
-            }
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), size),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    if hue_sv_cube(ui, state, size) {
+                        write_active(fg, bg, state, state.to_rgba());
+                        changed = true;
+                    }
+                },
+            );
+            show_slider_strip = true;
+            slider_kind = ColorPickerKind::Hsb;
         }
         ColorPickerKind::BrightCube => {
-            if bright_hs_cube(ui, state, size) {
-                *color = state.to_rgba();
-                changed = true;
-            }
-            if hsb_sliders(ui, color, state) {
-                changed = true;
-            }
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), size),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    if bright_hs_cube(ui, state, size) {
+                        write_active(fg, bg, state, state.to_rgba());
+                        changed = true;
+                    }
+                },
+            );
+            show_slider_strip = true;
+            slider_kind = ColorPickerKind::Hsb;
         }
         ColorPickerKind::Grayscale => {
             if grayscale_bar(ui, state, size) {
-                *color = state.to_rgba();
+                write_active(fg, bg, state, state.to_rgba());
                 changed = true;
             }
         }
         ColorPickerKind::Rgb => {
+            let color = match state.drawing_slot {
+                DrawingColorSlot::Background => &mut *bg,
+                _ => &mut *fg,
+            };
             if rgb_sliders(ui, color, state) {
                 changed = true;
             }
         }
         ColorPickerKind::Hsb => {
+            let color = match state.drawing_slot {
+                DrawingColorSlot::Background => &mut *bg,
+                _ => &mut *fg,
+            };
             if hsb_sliders(ui, color, state) {
                 changed = true;
             }
         }
         ColorPickerKind::Hsl => {
+            let color = match state.drawing_slot {
+                DrawingColorSlot::Background => &mut *bg,
+                _ => &mut *fg,
+            };
             if hsl_sliders(ui, color, state) {
                 changed = true;
             }
         }
         ColorPickerKind::Cmyk => {
+            let color = match state.drawing_slot {
+                DrawingColorSlot::Background => &mut *bg,
+                _ => &mut *fg,
+            };
             if cmyk_sliders(ui, color, state) {
                 changed = true;
             }
         }
         ColorPickerKind::Lab => {
+            let color = match state.drawing_slot {
+                DrawingColorSlot::Background => &mut *bg,
+                _ => &mut *fg,
+            };
             if lab_sliders(ui, color, state) {
                 changed = true;
             }
         }
         ColorPickerKind::Web => {
+            let color = match state.drawing_slot {
+                DrawingColorSlot::Background => &mut *bg,
+                _ => &mut *fg,
+            };
             if web_colors(ui, color, state) {
                 changed = true;
             }
         }
     }
 
-    // Current swatch
-    ui.add_space(4.0);
-    let (sw, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.0), Sense::hover());
-    ui.painter()
-        .rect_filled(sw, 4.0, Color32::from_rgb(color.r, color.g, color.b));
-    ui.painter().rect_stroke(
-        sw,
-        4.0,
-        Stroke::new(1.0_f32, crate::theme::STROKE),
-        egui::StrokeKind::Outside,
-    );
+    // Non-wheel pickers: FG/BG strip below the controls.
+    if !matches!(state.picker, ColorPickerKind::Wheel) {
+        ui.add_space(6.0);
+        let (row, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width().min(120.0), 56.0), Sense::hover());
+        match drawing_color_icons(ui, row, *fg, *bg, state) {
+            DrawingIconAction::SwapFgBg => {
+                std::mem::swap(fg, bg);
+                *fg = fg.opaque();
+                *bg = bg.opaque();
+                state.drawing_slot = DrawingColorSlot::Foreground;
+                state.sync_from_rgba(*fg);
+                changed = true;
+            }
+            DrawingIconAction::SlotChanged => {
+                let sync = match state.drawing_slot {
+                    DrawingColorSlot::Background => *bg,
+                    _ => *fg,
+                };
+                state.sync_from_rgba(sync);
+            }
+            DrawingIconAction::None => {}
+        }
+    }
+
+    if show_slider_strip {
+        ui.add_space(4.0);
+        let title = match slider_kind {
+            ColorPickerKind::Hsb => "HSB ползунки",
+            _ => "RGB ползунки",
+        };
+        let open_label = if state.sliders_open {
+            format!("▾ {title}")
+        } else {
+            format!("▸ {title}")
+        };
+        if ui
+            .add(
+                egui::Button::new(crate::theme::label(open_label))
+                    .fill(crate::theme::BG_MENU_ITEM)
+                    .min_size(egui::vec2(ui.available_width(), 22.0)),
+            )
+            .clicked()
+        {
+            state.sliders_open = !state.sliders_open;
+        }
+        if state.sliders_open {
+            ui.add_space(2.0);
+            let color = match state.drawing_slot {
+                DrawingColorSlot::Background => &mut *bg,
+                _ => &mut *fg,
+            };
+            match slider_kind {
+                ColorPickerKind::Hsb => {
+                    if hsb_sliders(ui, color, state) {
+                        changed = true;
+                    }
+                }
+                _ => {
+                    if rgb_sliders(ui, color, state) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
 
     changed
+}
+
+/// common Main · Sub · Transparent icons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrawingIconAction {
+    None,
+    SlotChanged,
+    SwapFgBg,
+}
+
+fn drawing_color_icons(
+    ui: &mut egui::Ui,
+    area: egui::Rect,
+    fg: Rgba,
+    bg: Rgba,
+    state: &mut ColorState,
+) -> DrawingIconAction {
+    let sq = 22.0_f32;
+    let overlap = 8.0_f32;
+    let strip_h = 14.0_f32;
+    let gap = 4.0_f32;
+    let cluster_w = sq + (sq - overlap);
+    let cluster_h = sq + (sq - overlap) + gap + strip_h;
+
+    // Bottom-left of the given area (wheel or strip row).
+    let origin = Pos2::new(area.left() + 2.0, area.bottom() - cluster_h - 2.0);
+    let fg_rect = egui::Rect::from_min_size(origin, Vec2::splat(sq));
+    let bg_rect = egui::Rect::from_min_size(
+        Pos2::new(origin.x + (sq - overlap), origin.y + (sq - overlap)),
+        Vec2::splat(sq),
+    );
+    let strip_rect = egui::Rect::from_min_size(
+        Pos2::new(origin.x, origin.y + (sq + (sq - overlap) + gap)),
+        Vec2::new(cluster_w, strip_h),
+    );
+
+    let id = ui.id().with("drawing_color_icons");
+    let fg_r = ui.interact(fg_rect, id.with("fg"), Sense::click());
+    let bg_r = ui.interact(bg_rect, id.with("bg"), Sense::click());
+    let strip_r = ui.interact(strip_rect, id.with("tr"), Sense::click());
+
+    // Paint BG first (behind), then FG on top.
+    paint_swatch_square(
+        ui,
+        bg_rect,
+        bg,
+        matches!(state.drawing_slot, DrawingColorSlot::Background),
+    );
+    paint_swatch_square(
+        ui,
+        fg_rect,
+        fg,
+        matches!(state.drawing_slot, DrawingColorSlot::Foreground),
+    );
+    paint_transparency_strip(
+        ui,
+        strip_rect,
+        matches!(state.drawing_slot, DrawingColorSlot::Transparent),
+    );
+
+    fg_r.clone().on_hover_text("Основной цвет (Foreground)");
+    bg_r.clone()
+        .on_hover_text("Фоновый цвет (Background)\nПКМ — поменять местами с основным");
+    strip_r
+        .clone()
+        .on_hover_text("Прозрачность (рисовать как ластик)");
+
+    if fg_r.secondary_clicked() || bg_r.secondary_clicked() {
+        return DrawingIconAction::SwapFgBg;
+    }
+    if fg_r.clicked() {
+        state.drawing_slot = DrawingColorSlot::Foreground;
+        return DrawingIconAction::SlotChanged;
+    }
+    if bg_r.clicked() {
+        state.drawing_slot = DrawingColorSlot::Background;
+        return DrawingIconAction::SlotChanged;
+    }
+    if strip_r.clicked() {
+        state.drawing_slot = DrawingColorSlot::Transparent;
+        return DrawingIconAction::SlotChanged;
+    }
+    DrawingIconAction::None
+}
+
+fn paint_swatch_square(ui: &mut egui::Ui, rect: egui::Rect, color: Rgba, active: bool) {
+    let rounding = 4.0;
+    ui.painter()
+        .rect_filled(rect, rounding, Color32::from_rgb(color.r, color.g, color.b));
+    // Soft dark edge.
+    ui.painter().rect_stroke(
+        rect,
+        rounding,
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 0, 0, 90)),
+        egui::StrokeKind::Outside,
+    );
+    if active {
+        // common light-blue selection ring.
+        ui.painter().rect_stroke(
+            rect.expand(1.5),
+            rounding + 1.0,
+            Stroke::new(2.0_f32, Color32::from_rgb(100, 180, 255)),
+            egui::StrokeKind::Outside,
+        );
+    }
+}
+
+fn paint_transparency_strip(ui: &mut egui::Ui, rect: egui::Rect, active: bool) {
+    let rounding = 3.0;
+    let cell = 4.0_f32;
+    let painter = ui.painter();
+    painter.rect_filled(rect, rounding, Color32::from_rgb(220, 220, 220));
+    let cols = (rect.width() / cell).ceil() as i32;
+    let rows = (rect.height() / cell).ceil() as i32;
+    for yi in 0..rows {
+        for xi in 0..cols {
+            if (xi + yi) % 2 == 0 {
+                continue;
+            }
+            let x0 = rect.left() + xi as f32 * cell;
+            let y0 = rect.top() + yi as f32 * cell;
+            let cell_r = egui::Rect::from_min_max(
+                Pos2::new(x0, y0),
+                Pos2::new((x0 + cell).min(rect.right()), (y0 + cell).min(rect.bottom())),
+            );
+            painter.rect_filled(cell_r, 0.0, Color32::from_rgb(160, 160, 160));
+        }
+    }
+    // Clip look via outer stroke.
+    painter.rect_stroke(
+        rect,
+        rounding,
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 0, 0, 100)),
+        egui::StrokeKind::Outside,
+    );
+    if active {
+        painter.rect_stroke(
+            rect.expand(1.5),
+            rounding + 1.0,
+            Stroke::new(2.0_f32, Color32::from_rgb(100, 180, 255)),
+            egui::StrokeKind::Outside,
+        );
+    }
 }
 
 fn rgb_sliders(ui: &mut egui::Ui, color: &mut Rgba, state: &mut ColorState) -> bool {
@@ -840,26 +1156,21 @@ fn interact_sv_and_strip(
 }
 
 fn circular_hsv_wheel(ui: &mut egui::Ui, state: &mut ColorState, size: f32) -> bool {
-    ui.horizontal(|ui| {
-        ui.label(crate::theme::label_dim("Форма"));
-        for shape in WheelSvShape::ALL {
-            let on = state.wheel_sv == shape;
-            if ui
-                .add(
-                    egui::Button::selectable(on, crate::theme::label(shape.label()))
-                        .min_size(egui::vec2(0.0, 22.0)),
-                )
-                .clicked()
-            {
-                state.wheel_sv = shape;
-                state.cube_cache = None;
-                state.drag = WheelDrag::None;
-            }
-        }
-    });
-    ui.add_space(2.0);
-
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click_and_drag());
+    state.last_wheel_rect = Some(rect);
+    // Icon cluster occupies bottom-left — don't start hue/SV drags there.
+    let icon_block = {
+        let sq = 22.0_f32;
+        let overlap = 8.0_f32;
+        let strip_h = 14.0_f32;
+        let gap = 4.0_f32;
+        let cluster_w = sq + (sq - overlap);
+        let cluster_h = sq + (sq - overlap) + gap + strip_h;
+        egui::Rect::from_min_size(
+            Pos2::new(rect.left() + 2.0, rect.bottom() - cluster_h - 2.0),
+            Vec2::new(cluster_w + 2.0, cluster_h + 2.0),
+        )
+    };
     let center = rect.center();
     let outer_r = size * 0.5 - 2.0;
     let inner_r = outer_r * 0.68;
@@ -1022,7 +1333,8 @@ fn circular_hsv_wheel(ui: &mut egui::Ui, state: &mut ColorState, size: f32) -> b
 
     let mut changed = false;
     if let Some(pos) = response.interact_pointer_pos() {
-        if response.is_pointer_button_down_on() {
+        let over_icons = icon_block.contains(pos);
+        if response.is_pointer_button_down_on() && !over_icons {
             let delta = pos - center;
             let dist = delta.length();
             if state.drag == WheelDrag::None {
@@ -1076,6 +1388,8 @@ fn circular_hsv_wheel(ui: &mut egui::Ui, state: &mut ColorState, size: f32) -> b
                 }
                 _ => {}
             }
+        } else if over_icons {
+            state.drag = WheelDrag::None;
         }
     }
     changed

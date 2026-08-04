@@ -31,6 +31,26 @@ impl PanelKind {
             Self::Layers => "Layers",
         }
     }
+
+    /// Compact panels: height follows content (no empty gap under the tool grid).
+    pub fn hugs_content(self) -> bool {
+        matches!(self, Self::Tools)
+    }
+
+    /// Expand to fill leftover column height (wheel / brush / overview / layers).
+    pub fn fills_panel(self) -> bool {
+        matches!(
+            self,
+            Self::Color | Self::Brush | Self::Navigator | Self::Layers
+        )
+    }
+
+    pub fn default_hug_height(self) -> f32 {
+        match self {
+            Self::Tools => 140.0,
+            _ => 120.0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -127,15 +147,21 @@ pub struct DockLayout {
     /// (side, column_idx, rect)
     #[serde(skip)]
     pub column_rects: Vec<(DockSide, usize, Rect)>,
+    /// Prior-frame content heights for hug panels (Tools/Brush).
+    #[serde(skip)]
+    pub hug_content_h: std::collections::HashMap<(u8, usize, PanelKind), f32>,
 }
 
 impl Default for DockLayout {
     fn default() -> Self {
+        let mut left = DockColumn::new(
+            vec![PanelKind::Color, PanelKind::Tools, PanelKind::Brush],
+            270.0,
+        );
+        // Color is the priority panel — larger share so Tools/Brush cannot crush the wheel.
+        left.weights = vec![2.2, 0.7, 1.1];
         Self {
-            left_columns: vec![DockColumn::new(
-                vec![PanelKind::Color, PanelKind::Tools, PanelKind::Brush],
-                270.0,
-            )],
+            left_columns: vec![left],
             right_columns: vec![DockColumn::new(
                 vec![PanelKind::Navigator, PanelKind::Layers],
                 260.0,
@@ -147,6 +173,7 @@ impl Default for DockLayout {
             content_rect: None,
             slot_rects: Vec::new(),
             column_rects: Vec::new(),
+            hug_content_h: std::collections::HashMap::new(),
         }
     }
 }
@@ -185,6 +212,34 @@ impl DockLayout {
         {
             c.width = c.width.clamp(200.0, 420.0);
             c.sync_weights();
+        }
+        // Color must stay docked — floating Color feels like a stray window on laptops.
+        self.ensure_color_docked();
+    }
+
+    /// Pull Color out of `floating` into the left dock column.
+    pub fn ensure_color_docked(&mut self) {
+        let was_floating = self.floating.iter().any(|f| f.kind == PanelKind::Color);
+        if !was_floating {
+            return;
+        }
+        self.floating.retain(|f| f.kind != PanelKind::Color);
+        let already_docked = self
+            .left_columns
+            .iter()
+            .chain(self.right_columns.iter())
+            .any(|c| c.panels.contains(&PanelKind::Color));
+        if already_docked {
+            return;
+        }
+        self.hidden.retain(|k| *k != PanelKind::Color);
+        if self.left_columns.is_empty() {
+            self.left_columns
+                .push(DockColumn::new(vec![PanelKind::Color], 270.0));
+        } else {
+            self.left_columns[0].panels.insert(0, PanelKind::Color);
+            self.left_columns[0].weights.insert(0, 1.0);
+            self.left_columns[0].sync_weights();
         }
     }
 
@@ -274,6 +329,10 @@ impl DockLayout {
     }
 
     pub fn undock_at(&mut self, kind: PanelKind, pos: [f32; 2], size: [f32; 2]) {
+        // Color stays in the dock — a floating wheel is painful on laptop layouts.
+        if kind == PanelKind::Color {
+            return;
+        }
         self.remove_from_all(kind);
         self.floating.push(FloatingPanel { kind, pos, size });
     }
@@ -742,7 +801,7 @@ pub fn panel_corner_zone(
             dirty = true;
             ui.close();
         }
-        if ui.button("Float window").clicked() {
+        if kind != PanelKind::Color && ui.button("Float window").clicked() {
             let pos = response.interact_pointer_pos().unwrap_or(rect.left_top());
             dock.undock_at(kind, [pos.x, pos.y], [280.0, 360.0]);
             dirty = true;

@@ -1,11 +1,13 @@
 //! Dark painting-app theme with WCAG-friendly text contrast.
 
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use eframe::egui::{
     self, Button, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, RichText, Stroke,
     Ui, Visuals, WidgetText,
 };
+
+use crate::ui_fonts;
 
 pub const ACCENT: Color32 = Color32::from_rgb(255, 140, 66);
 pub const ACCENT_DIM: Color32 = Color32::from_rgb(200, 100, 45);
@@ -48,6 +50,8 @@ struct ThemeLive {
     material: crate::settings::UiMaterial,
     color_fill: crate::settings::ColorFillMode,
     theme_brightness: crate::settings::ThemeBrightness,
+    /// Resolved UI typeface family (never empty after apply_settings_colors).
+    ui_font: String,
     gradient_a: Color32,
     gradient_b: Color32,
     gradient_angle_deg: f32,
@@ -67,6 +71,7 @@ impl Default for ThemeLive {
             material: crate::settings::UiMaterial::Acrylic,
             color_fill: crate::settings::ColorFillMode::Solid,
             theme_brightness: crate::settings::ThemeBrightness::Dark,
+            ui_font: ui_fonts::DEFAULT_UI_FONT.to_owned(),
             gradient_a: Color32::from_rgb(22, 24, 36),
             gradient_b: Color32::from_rgb(48, 32, 28),
             gradient_angle_deg: 135.0,
@@ -86,11 +91,15 @@ static THEME_LIVE: RwLock<ThemeLive> = RwLock::new(ThemeLive {
     material: crate::settings::UiMaterial::Acrylic,
     color_fill: crate::settings::ColorFillMode::Solid,
     theme_brightness: crate::settings::ThemeBrightness::Dark,
+    ui_font: String::new(),
     gradient_a: Color32::from_rgb(22, 24, 36),
     gradient_b: Color32::from_rgb(48, 32, 28),
     gradient_angle_deg: 135.0,
     gradient_saturation: 1.0,
 });
+
+/// Last family passed to `ctx.set_fonts` — skip rebuild while Preferences is open.
+static APPLIED_UI_FONT: Mutex<Option<String>> = Mutex::new(None);
 
 fn lift_rgb(c: Color32, delta: i16) -> Color32 {
     let lift = |v: u8| -> u8 {
@@ -334,6 +343,7 @@ pub fn apply_settings_colors(settings: &crate::settings::AppSettings) {
         t.material = settings.material;
         t.color_fill = settings.color_fill;
         t.theme_brightness = settings.theme_brightness;
+        t.ui_font = ui_fonts::normalize_ui_font_name(&settings.ui_font);
         t.gradient_a = Color32::from_rgb(
             settings.gradient_a[0],
             settings.gradient_a[1],
@@ -544,30 +554,43 @@ pub fn apply(ctx: &egui::Context) {
 }
 
 fn setup_fonts(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
-
-    #[cfg(windows)]
-    {
-        let candidates = [
-            "C:\\Windows\\Fonts\\segoeui.ttf",
-            "C:\\Windows\\Fonts\\arial.ttf",
-        ];
-        for path in candidates {
-            if let Ok(bytes) = std::fs::read(path) {
-                fonts
-                    .font_data
-                    .insert("ui_sans".to_owned(), FontData::from_owned(bytes).into());
-                fonts
-                    .families
-                    .entry(FontFamily::Proportional)
-                    .or_default()
-                    .insert(0, "ui_sans".to_owned());
-                break;
+    let wanted = THEME_LIVE
+        .read()
+        .ok()
+        .map(|t| {
+            if t.ui_font.trim().is_empty() {
+                ui_fonts::DEFAULT_UI_FONT.to_owned()
+            } else {
+                t.ui_font.clone()
             }
+        })
+        .unwrap_or_else(|| ui_fonts::DEFAULT_UI_FONT.to_owned());
+
+    if let Ok(applied) = APPLIED_UI_FONT.lock() {
+        if applied.as_ref() == Some(&wanted) {
+            return;
         }
     }
 
+    let mut fonts = FontDefinitions::default();
+    let bytes = ui_fonts::load_font_family_bytes(&wanted)
+        .or_else(ui_fonts::load_default_ui_font_bytes);
+    if let Some(bytes) = bytes {
+        fonts
+            .font_data
+            .insert("ui_sans".to_owned(), FontData::from_owned(bytes).into());
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "ui_sans".to_owned());
+        // Keep default egui fonts as fallbacks for missing glyphs.
+    }
+
     ctx.set_fonts(fonts);
+    if let Ok(mut applied) = APPLIED_UI_FONT.lock() {
+        *applied = Some(wanted);
+    }
 }
 
 /// Acrylic / mica *look* as a solid RGB fill (alpha=255).

@@ -1,4 +1,4 @@
-use beautiful_core::{BrushKind, BrushSettings, BrushShape, BrushTexture, Document, HairDirection};
+use beautiful_core::{BrushShape, BrushTexture, Document, HairDirection};
 use eframe::egui::{self, Sense};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -638,8 +638,9 @@ impl FilterUiState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum WorkspaceTool {
+    #[default]
     Brush,
     Pencil,
     PixelBrush,
@@ -664,6 +665,8 @@ pub enum WorkspaceTool {
     Move,
     Transform,
     Warp,
+    /// Rect select + Free/Distort/Mesh on CPU (stays on this tool across modes).
+    Kruler,
     Crop,
 }
 
@@ -689,6 +692,7 @@ impl WorkspaceTool {
             Self::SelectEllipse,
             Self::Transform,
             Self::Warp,
+            Self::Kruler,
             Self::Crop,
             Self::Hand,
             Self::Zoom,
@@ -719,9 +723,40 @@ impl WorkspaceTool {
             Self::Move => ToolIcon::Move,
             Self::Transform => ToolIcon::Transform,
             Self::Warp => ToolIcon::Warp,
+            Self::Kruler => ToolIcon::Kruler,
             Self::Crop => ToolIcon::Crop,
             Self::Hand => ToolIcon::Hand,
             Self::Zoom => ToolIcon::Zoom,
+        }
+    }
+
+    pub(crate) fn discord_label(self) -> &'static str {
+        match self {
+            Self::Brush => "Brush",
+            Self::Pencil => "Pencil",
+            Self::PixelBrush => "Pixel Brush",
+            Self::Airbrush => "Airbrush",
+            Self::Mixer => "Mixer",
+            Self::Eraser => "Eraser",
+            Self::SelectionBrush => "Selection Brush",
+            Self::SelectionEraser => "Selection Eraser",
+            Self::Smudge => "Smudge",
+            Self::Fill => "Fill",
+            Self::Gradient => "Gradient",
+            Self::Shape => "Shape",
+            Self::CloneStamp => "Clone Stamp",
+            Self::Wand => "Magic Wand",
+            Self::Lasso => "Lasso",
+            Self::SelectRect => "Rect Select",
+            Self::SelectEllipse => "Ellipse Select",
+            Self::Move => "Move",
+            Self::Transform => "Transform",
+            Self::Warp => "Warp",
+            Self::Kruler => "КРУЛЕР",
+            Self::Crop => "Crop",
+            Self::Hand => "Hand",
+            Self::Zoom => "Zoom",
+            Self::Eyedropper => "Eyedropper",
         }
     }
 
@@ -747,11 +782,17 @@ impl WorkspaceTool {
             Self::Move => "Move selection (removed — use Transform)",
             Self::Transform => "Free Transform (T / V)",
             Self::Warp => "Mesh Warp",
+            Self::Kruler => "КРУЛЕР — выделение + свой Transform (CPU)",
             Self::Crop => "Crop / Frame (C)",
             Self::Hand => "Hand (H)",
             Self::Zoom => "Zoom (Z)",
             Self::Eyedropper => "Eyedropper (I)",
         }
+    }
+
+    /// Transform / Warp / КРУЛЕР (в сессии) — Free·Distort·Mesh family.
+    pub fn is_xform_family(self) -> bool {
+        matches!(self, Self::Transform | Self::Warp | Self::Kruler)
     }
 
     fn long_press_group(self) -> Option<&'static [Self]> {
@@ -763,35 +804,8 @@ impl WorkspaceTool {
         }
     }
 
-    fn apply_on_select(self, document: &mut Document) {
-        match self {
-            Self::Brush => {
-                document.brush.apply_preset(BrushKind::Brush);
-                document.warm_tip_cache();
-            }
-            Self::Pencil => {
-                document.brush.apply_preset(BrushKind::Pencil);
-                document.warm_tip_cache();
-            }
-            Self::PixelBrush => {
-                document.brush = BrushSettings::preset_pixel();
-                document.brush.kind = BrushKind::Pencil;
-                document.warm_tip_cache();
-            }
-            Self::Airbrush => {
-                document.brush.apply_preset(BrushKind::Airbrush);
-                document.warm_tip_cache();
-            }
-            Self::Mixer => {
-                document.brush.apply_preset(BrushKind::Mixer);
-                document.warm_tip_cache();
-            }
-            Self::Eraser => {
-                document.brush.apply_preset(BrushKind::Eraser);
-                document.warm_tip_cache();
-            }
-            _ => {}
-        }
+    fn apply_on_select(self, document: &mut Document, session: &mut crate::tool_session::ToolSession) {
+        session.select_tool(self, document);
     }
 }
 
@@ -871,6 +885,7 @@ impl Default for ToolPages {
                         ToolSlot::Tool(WorkspaceTool::Wand),
                         ToolSlot::Tool(WorkspaceTool::Lasso),
                         ToolSlot::Tool(WorkspaceTool::SelectRect),
+                        ToolSlot::Tool(WorkspaceTool::Kruler),
                         ToolSlot::Separator,
                         ToolSlot::Tool(WorkspaceTool::Crop),
                         ToolSlot::Tool(WorkspaceTool::Hand),
@@ -1260,6 +1275,8 @@ pub fn top_menu(
                             if theme::btn(ui, theme::label("Deselect")).clicked() {
                                 if canvas.gradient_editing() {
                                     canvas.cancel_gradient_session(document);
+                                } else if crate::canvas::cancel_kruler_transform(canvas, document) {
+                                    // restored pre-lift
                                 } else if canvas.transform_editing() {
                                     canvas.cancel_transform_session(document, tool);
                                 } else {
@@ -1269,6 +1286,8 @@ pub fn top_menu(
                             if theme::btn(ui, theme::label("Commit transform")).clicked() {
                                 if canvas.gradient_editing() {
                                     canvas.confirm_gradient_session(document);
+                                } else if crate::canvas::kruler_editing(canvas) {
+                                    crate::canvas::confirm_kruler_transform(canvas, document);
                                 } else if canvas.transform_editing() {
                                     canvas.confirm_transform_session(document, tool);
                                 } else {
@@ -1945,9 +1964,18 @@ fn filter_dialog(
 }
 
 pub fn panel_color(ui: &mut egui::Ui, document: &mut Document, color_state: &mut ColorState) {
-    if palette::color_palette(ui, &mut document.brush.color, color_state) {
+    if palette::color_palette(
+        ui,
+        &mut document.brush.color,
+        &mut document.color_bg,
+        color_state,
+    ) {
         document.brush.color.a = 255;
-        let c = document.brush.color;
+        document.color_bg.a = 255;
+        let c = match color_state.drawing_slot {
+            beautiful_core::DrawingColorSlot::Background => document.color_bg,
+            _ => document.brush.color,
+        };
         document.stroke.wet = [
             c.r as f32 / 255.0,
             c.g as f32 / 255.0,
@@ -1955,6 +1983,7 @@ pub fn panel_color(ui: &mut egui::Ui, document: &mut Document, color_state: &mut
             1.0,
         ];
     }
+    document.drawing_slot = color_state.drawing_slot;
 }
 
 pub fn panel_tools(
@@ -1963,12 +1992,13 @@ pub fn panel_tools(
     tool: &mut WorkspaceTool,
     tool_pages: &mut ToolPages,
     canvas: &mut CanvasState,
+    session: &mut crate::tool_session::ToolSession,
 ) {
     let transform_lock = canvas.tool_edit_lock();
     ui.add_enabled_ui(!transform_lock, |ui| {
         tool_page_tabs(ui, tool_pages);
         ui.add_space(4.0);
-        tool_icon_grid(ui, tool, document, tool_pages, canvas);
+        tool_icon_grid(ui, tool, document, tool_pages, canvas, session);
     });
 }
 
@@ -1980,9 +2010,12 @@ pub fn panel_brush(
     tool: &mut WorkspaceTool,
 ) {
     let transform_lock = canvas.tool_edit_lock();
-    if matches!(*tool, WorkspaceTool::Transform | WorkspaceTool::Warp) || canvas.transform_editing()
+    if matches!(*tool, WorkspaceTool::Transform | WorkspaceTool::Warp)
+        || canvas.transform_editing()
     {
         transform_settings_panel(ui, document, canvas, tool);
+    } else if matches!(*tool, WorkspaceTool::Kruler) || crate::canvas::kruler_editing(canvas) {
+        kruler_settings_panel(ui, document, canvas, tool);
     } else if matches!(*tool, WorkspaceTool::Gradient) || canvas.gradient_editing() {
         gradient_settings_panel(ui, document, canvas);
     } else if matches!(*tool, WorkspaceTool::Fill) {
@@ -2046,10 +2079,13 @@ pub fn render_panel_kind(
     brush_panel: &mut BrushPanelUi,
     layer_ui: &mut LayerUiState,
     zoom_step: f32,
+    session: &mut crate::tool_session::ToolSession,
 ) {
     match kind {
         crate::dock::PanelKind::Color => panel_color(ui, document, color_state),
-        crate::dock::PanelKind::Tools => panel_tools(ui, document, tool, tool_pages, canvas),
+        crate::dock::PanelKind::Tools => {
+            panel_tools(ui, document, tool, tool_pages, canvas, session)
+        }
         crate::dock::PanelKind::Brush => panel_brush(ui, document, brush_panel, canvas, tool),
         crate::dock::PanelKind::Navigator => panel_navigator(ui, document, canvas, zoom_step),
         crate::dock::PanelKind::Layers => panel_layers(ui, document, canvas, layer_ui),
@@ -2104,11 +2140,12 @@ fn tool_icon_grid(
     document: &mut Document,
     pages: &mut ToolPages,
     _canvas: &mut CanvasState,
+    session: &mut crate::tool_session::ToolSession,
 ) {
-    const COLS: usize = 5;
     const CELL: f32 = 36.0;
     const ROW_H: f32 = 32.0;
     const SEP_H: f32 = 10.0;
+    const GAP: f32 = 4.0;
     const LONG_PRESS_SEC: f64 = 0.45;
 
     let rmb_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
@@ -2157,18 +2194,18 @@ fn tool_icon_grid(
     };
 
     let avail_w = ui.available_width().max(CELL);
+    // Columns from panel width so tools wrap to fill the dock.
+    let cols = ((avail_w + GAP) / (CELL + GAP)).floor().max(1.0) as usize;
 
     let mut i = 0usize;
     while i < slots_snapshot.len() {
-        // Collect one visual row: either a separator or up to COLS tools.
+        // Collect one visual row: either a separator or up to `cols` tools.
         if matches!(slots_snapshot[i], ToolSlot::Separator) {
             let idx = i;
             let is_src = drag_from == Some(idx);
             let is_dst = drop_over == Some(idx) && drag_from != Some(idx);
-            let (rect, resp) = ui.allocate_exact_size(
-                egui::vec2(avail_w.min(COLS as f32 * (CELL + 4.0) - 4.0), SEP_H),
-                egui::Sense::click(),
-            );
+            let (rect, resp) =
+                ui.allocate_exact_size(egui::vec2(avail_w, SEP_H), egui::Sense::click());
             let y = rect.center().y;
             let inset = 8.0;
             let col_line = if is_dst {
@@ -2202,10 +2239,10 @@ fn tool_icon_grid(
         }
 
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.spacing_mut().item_spacing.x = GAP;
             let mut placed = 0usize;
             while i < slots_snapshot.len()
-                && placed < COLS
+                && placed < cols
                 && !matches!(slots_snapshot[i], ToolSlot::Separator)
             {
                 let idx = i;
@@ -2216,6 +2253,7 @@ fn tool_icon_grid(
                 let selected = *tool == t
                     || (t == WorkspaceTool::SelectRect
                         && matches!(*tool, WorkspaceTool::Transform | WorkspaceTool::Warp));
+                // Kruler has its own slot — do not highlight SelectRect for it.
 
                 let is_src = drag_from == Some(idx);
                 let is_dst = drop_over == Some(idx) && drag_from != Some(idx);
@@ -2286,21 +2324,21 @@ fn tool_icon_grid(
 
     // Trailing empty add cell(s).
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().item_spacing.x = GAP;
         let rem = {
             let n_tools_tail = slots_snapshot
                 .iter()
                 .rev()
                 .take_while(|s| matches!(s, ToolSlot::Tool(_)))
                 .count();
-            let used = n_tools_tail % COLS;
+            let used = n_tools_tail % cols;
             if used == 0 {
                 1
             } else {
-                COLS - used
+                cols - used
             }
         };
-        for _ in 0..rem.max(1).min(COLS) {
+        for _ in 0..rem.max(1).min(cols) {
             let (rect, resp) =
                 ui.allocate_exact_size(egui::vec2(CELL, ROW_H), egui::Sense::click());
             let border = if resp.hovered() {
@@ -2333,8 +2371,8 @@ fn tool_icon_grid(
 
     if let Some(t) = select_tool {
         if !pages.long_press.open {
-            *tool = t;
-            t.apply_on_select(document);
+            t.apply_on_select(document, session);
+            *tool = session.tool;
         }
     }
 
@@ -2440,8 +2478,8 @@ fn tool_icon_grid(
                     });
             });
         if let Some(t) = picked {
-            *tool = t;
-            t.apply_on_select(document);
+            t.apply_on_select(document, session);
+            *tool = session.tool;
             dismiss = true;
         }
         if lmb_released || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -2774,10 +2812,10 @@ fn selection_settings_panel(
     });
 
     ui.add_space(10.0);
-    resample_settings_ui(ui, canvas);
+    resample_settings_ui(ui, canvas, document);
 }
 
-fn resample_settings_ui(ui: &mut egui::Ui, canvas: &mut CanvasState) {
+fn resample_settings_ui(ui: &mut egui::Ui, canvas: &mut CanvasState, document: &mut Document) {
     ui.label(
         egui::RichText::new("Resample")
             .color(egui::Color32::from_rgb(210, 210, 218))
@@ -2792,11 +2830,13 @@ fn resample_settings_ui(ui: &mut egui::Ui, canvas: &mut CanvasState) {
         beautiful_core::ResampleFilter::BicubicAutomatic,
         beautiful_core::ResampleFilter::Lanczos3,
     ];
+    let mut resample_changed = false;
     for (slot, label) in [
         (&mut canvas.resample_drag, "Dragging"),
         (&mut canvas.resample_preview, "Preview"),
         (&mut canvas.resample_final, "Final"),
     ] {
+        let before = *slot;
         egui::ComboBox::from_id_salt(label)
             .selected_text(slot.label())
             .show_ui(ui, |ui| {
@@ -2809,6 +2849,12 @@ fn resample_settings_ui(ui: &mut egui::Ui, canvas: &mut CanvasState) {
                 .color(egui::Color32::from_rgb(150, 150, 160))
                 .size(10.0),
         );
+        if *slot != before {
+            resample_changed = true;
+        }
+    }
+    if resample_changed {
+        canvas.rebake_xform_after_resample_change(document);
     }
 }
 
@@ -3115,6 +3161,123 @@ fn gradient_settings_panel(ui: &mut egui::Ui, document: &mut Document, canvas: &
     );
 }
 
+/// КРУЛЕР — прямоугольное выделение; Transform = Ctrl+LKM float + CPU scale/rotate.
+fn kruler_settings_panel(
+    ui: &mut egui::Ui,
+    document: &mut Document,
+    canvas: &mut CanvasState,
+    tool: &mut WorkspaceTool,
+) {
+    ui.label(
+        egui::RichText::new("КРУЛЕР")
+            .color(egui::Color32::from_rgb(250, 250, 252))
+            .size(15.0)
+            .strong(),
+    );
+    ui.add_space(6.0);
+    let _ = tool;
+    let editing = crate::canvas::kruler_editing(canvas);
+    if editing {
+        ui.label(
+            egui::RichText::new(
+                "Free Transform (CPU, как Ctrl+ЛКМ):\n\
+                 move / scale / rotate по пикселям в слое.\n\
+                 Enter — парк, Esc — отмена lift.",
+            )
+            .color(egui::Color32::from_rgb(170, 170, 180))
+            .size(11.0),
+        );
+    } else {
+        ui.label(
+            egui::RichText::new(
+                "Прямоугольное выделение.\n\
+                 Transform — lift + Free Transform на CPU\n\
+                 (не GPU-сессия инструмента Transform).",
+            )
+            .color(egui::Color32::from_rgb(170, 170, 180))
+            .size(11.0),
+        );
+    }
+    ui.add_space(10.0);
+    if !editing {
+        let has_sel = document.selection.rect.is_some();
+        let transform_btn = ui.add_enabled(
+            has_sel,
+            egui::Button::new(theme::label("Transform"))
+                .min_size(egui::vec2(ui.available_width(), 32.0)),
+        );
+        if transform_btn
+            .on_hover_text(if has_sel {
+                "Lift + Free Transform (CPU), остаёмся на КРУЛЕРе"
+            } else {
+                "Сначала выдели прямоугольник"
+            })
+            .clicked()
+        {
+            let _ = crate::canvas::begin_kruler_transform(canvas, document);
+        }
+    } else {
+        ui.horizontal(|ui| {
+            if theme::btn(ui, theme::label("Применить")).clicked() {
+                crate::canvas::confirm_kruler_transform(canvas, document);
+            }
+            if theme::btn(ui, theme::label("Отмена")).clicked() {
+                let _ = crate::canvas::cancel_kruler_transform(canvas, document);
+            }
+        });
+    }
+    ui.add_space(10.0);
+    ui.label(
+        egui::RichText::new("Resample")
+            .color(egui::Color32::from_rgb(210, 210, 218))
+            .size(12.0),
+    );
+    ui.label(
+        egui::RichText::new(
+            "CPU эксперимент (исключение, Transform не трогаем).\n\
+             Live = hole underlay 1× + float ColorImage.\n\
+             Move — только rect (skip sync).\n\
+             Scale/Rotate — CPU bake → tex.\n\
+             Preview / Final — bake · Применить → слой.",
+        )
+        .color(egui::Color32::from_rgb(170, 170, 180))
+        .size(11.0),
+    );
+    let filters = [
+        beautiful_core::ResampleFilter::Nearest,
+        beautiful_core::ResampleFilter::Bilinear,
+        beautiful_core::ResampleFilter::Bicubic,
+        beautiful_core::ResampleFilter::BicubicSmoother,
+        beautiful_core::ResampleFilter::BicubicSharper,
+        beautiful_core::ResampleFilter::BicubicAutomatic,
+        beautiful_core::ResampleFilter::Lanczos3,
+    ];
+    let mut resample_changed = false;
+    let mut rebake_filter = canvas.resample_drag;
+    for (slot, label) in [
+        (&mut canvas.resample_drag, "Dragging"),
+        (&mut canvas.resample_preview, "Preview"),
+        (&mut canvas.resample_final, "Final"),
+    ] {
+        let before = *slot;
+        egui::ComboBox::from_id_salt(format!("kruler_{label}"))
+            .selected_text(format!("{label}: {}", slot.label()))
+            .width(ui.available_width().max(120.0))
+            .show_ui(ui, |ui| {
+                for f in filters {
+                    ui.selectable_value(slot, f, f.label());
+                }
+            });
+        if *slot != before {
+            resample_changed = true;
+            rebake_filter = *slot;
+        }
+    }
+    if resample_changed && editing {
+        crate::canvas::rebake_kruler_after_resample_change(canvas, document, rebake_filter);
+    }
+}
+
 /// brush property sheet.
 fn transform_settings_panel(
     ui: &mut egui::Ui,
@@ -3138,25 +3301,22 @@ fn transform_settings_panel(
     let modes = [
         (
             crate::canvas::TransformMode::Free,
-            WorkspaceTool::Transform,
             "Свободное",
             "Растягивай как хочешь. Shift — пропорционально.",
         ),
         (
             crate::canvas::TransformMode::Distort,
-            WorkspaceTool::Transform,
             "Деформация",
             "Тяни углы по отдельности (Distort).",
         ),
         (
             crate::canvas::TransformMode::Mesh,
-            WorkspaceTool::Warp,
             "Сетка (Mesh)",
             "Контрольные точки сетки — локальная деформация.",
         ),
     ];
-    for (mode, _t, title, hint) in modes {
-        let on = canvas.transform_mode == mode;
+    for (mode, title, hint) in modes {
+        let on = canvas.transform_mode == mode && canvas.transform_editing();
         if ui
             .add(
                 egui::Button::selectable(on, theme::label(title))
@@ -3165,8 +3325,10 @@ fn transform_settings_panel(
             .on_hover_text(hint)
             .clicked()
         {
-            // Must bake Free↔Mesh/Distort through switch — never assign mode raw
-            // (that discarded pose / warp and looked like a reset).
+            if document.selection.rect.is_some() {
+                let _ = canvas.begin_transform_session(document);
+            }
+            // Must bake Free↔Mesh/Distort through switch — never assign mode raw.
             canvas.switch_transform_mode(document, tool, mode);
         }
         if on {
@@ -3210,26 +3372,35 @@ fn transform_settings_panel(
             .color(egui::Color32::from_rgb(210, 210, 218))
             .size(12.0),
     );
+    let filters = [
+        beautiful_core::ResampleFilter::Nearest,
+        beautiful_core::ResampleFilter::Bilinear,
+        beautiful_core::ResampleFilter::Bicubic,
+        beautiful_core::ResampleFilter::BicubicSmoother,
+        beautiful_core::ResampleFilter::BicubicSharper,
+        beautiful_core::ResampleFilter::BicubicAutomatic,
+        beautiful_core::ResampleFilter::Lanczos3,
+    ];
+    let mut resample_changed = false;
     for (slot, label) in [
         (&mut canvas.resample_drag, "Dragging"),
         (&mut canvas.resample_preview, "Preview"),
         (&mut canvas.resample_final, "Final"),
     ] {
+        let before = *slot;
         egui::ComboBox::from_id_salt(format!("transform_{label}"))
             .selected_text(slot.label())
             .show_ui(ui, |ui| {
-                for f in [
-                    beautiful_core::ResampleFilter::Nearest,
-                    beautiful_core::ResampleFilter::Bilinear,
-                    beautiful_core::ResampleFilter::Bicubic,
-                    beautiful_core::ResampleFilter::BicubicSmoother,
-                    beautiful_core::ResampleFilter::BicubicSharper,
-                    beautiful_core::ResampleFilter::BicubicAutomatic,
-                    beautiful_core::ResampleFilter::Lanczos3,
-                ] {
+                for f in filters {
                     ui.selectable_value(slot, f, f.label());
                 }
             });
+        if *slot != before {
+            resample_changed = true;
+        }
+    }
+    if resample_changed {
+        canvas.rebake_xform_after_resample_change(document);
     }
 
     ui.add_space(10.0);
@@ -3854,19 +4025,24 @@ fn paint_checkerboard(painter: &egui::Painter, rect: egui::Rect) {
 /// Quick-pick brush diameters from tiny → large (grid) with size labels.
 fn brush_size_grid(ui: &mut egui::Ui, document: &mut Document) {
     ui.label(theme::label_dim("Size presets"));
-    const COLS: usize = 6;
+    const CELL_W: f32 = 40.0;
+    const CELL_H: f32 = 44.0;
+    const GAP: f32 = 3.0;
     const SIZES: &[f32] = &[
         1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 28.0, 36.0, 48.0,
         64.0, 96.0, 128.0, 160.0, 192.0, 224.0, 256.0,
     ];
 
+    let avail_w = ui.available_width().max(CELL_W);
+    let cols = ((avail_w + GAP) / (CELL_W + GAP)).floor().max(1.0) as usize;
+
     egui::Grid::new("brush_size_grid")
-        .num_columns(COLS)
-        .spacing([3.0, 3.0])
+        .num_columns(cols)
+        .spacing([GAP, GAP])
         .show(ui, |ui| {
             for (i, &sz) in SIZES.iter().enumerate() {
                 let selected = (document.brush.size - sz).abs() < 0.26;
-                let cell = egui::vec2(40.0, 44.0);
+                let cell = egui::vec2(CELL_W, CELL_H);
                 let (rect, resp) = ui.allocate_exact_size(cell, egui::Sense::click());
                 let bg = if selected {
                     theme::BG_HOVER
@@ -3918,7 +4094,7 @@ fn brush_size_grid(ui: &mut egui::Ui, document: &mut Document) {
                     document.brush.size = sz;
                 }
                 resp.on_hover_text(format!("{sz} px"));
-                if (i + 1) % COLS == 0 {
+                if (i + 1) % cols == 0 {
                     ui.end_row();
                 }
             }
@@ -3945,7 +4121,10 @@ pub fn options_bar(
                     WorkspaceTool::Fill | WorkspaceTool::Wand => "Fill/Wand",
                     WorkspaceTool::Gradient => "Gradient",
                     WorkspaceTool::CloneStamp => "Clone Stamp",
-                    WorkspaceTool::Lasso | WorkspaceTool::SelectRect | WorkspaceTool::SelectEllipse => "Selection",
+                    WorkspaceTool::Lasso | WorkspaceTool::SelectRect | WorkspaceTool::SelectEllipse => {
+                        "Selection"
+                    }
+                    WorkspaceTool::Kruler => "КРУЛЕР",
                     WorkspaceTool::Crop => "Crop / Frame",
                     WorkspaceTool::Transform | WorkspaceTool::Warp | WorkspaceTool::Move => {
                         "Transform"
@@ -3964,17 +4143,24 @@ pub fn options_bar(
                             document.brush.size = document.brush.size.round().max(1.0);
                             document.brush.shape = BrushShape::Square;
                             document.brush.hardness = 1.0;
+                            document.brush.shape_sharpen = 1.0;
                         }
                         ui.label(theme::label_dim("Density"));
                         ui.add(
                             egui::Slider::new(&mut document.brush.density, 0.0..=1.0)
                                 .trailing_fill(true),
                         );
-                        ui.label(theme::label_dim("Hard"));
-                        ui.add(
-                            egui::Slider::new(&mut document.brush.hardness, 0.0..=1.0)
-                                .trailing_fill(true),
-                        );
+                        if !matches!(tool, WorkspaceTool::PixelBrush) {
+                            ui.label(theme::label_dim("Hard"));
+                            ui.add(
+                                egui::Slider::new(&mut document.brush.hardness, 0.0..=1.0)
+                                    .trailing_fill(true),
+                            );
+                        } else {
+                            // Pixel brush is always binary (hard square) — no AA hardness.
+                            document.brush.hardness = 1.0;
+                            document.brush.shape = BrushShape::Square;
+                        }
                     }
                     WorkspaceTool::Fill => {
                         ui.label(theme::label_dim("Tolerance"));
@@ -4065,39 +4251,53 @@ pub fn options_bar(
                     | WorkspaceTool::SelectEllipse
                     | WorkspaceTool::Move
                     | WorkspaceTool::Transform
-                    | WorkspaceTool::Warp => {
+                    | WorkspaceTool::Warp
+                    | WorkspaceTool::Kruler => {
                         ui.label(theme::label_dim("Feather"));
-                        ui.add(
+                        let feather_resp = ui.add(
                             egui::Slider::new(&mut document.feather_radius, 0..=64)
                                 .trailing_fill(true),
                         );
+                        // Apply only after release — not on every drag tick.
+                        if feather_resp.drag_stopped() && document.feather_radius > 0 {
+                            document.apply_feather();
+                        }
                         if theme::btn(ui, theme::label("Apply feather")).clicked() {
                             document.apply_feather();
                         }
-                        if matches!(tool, WorkspaceTool::Transform | WorkspaceTool::Warp) {
+                        if tool.is_xform_family() {
                             ui.separator();
                             ui.label(theme::label_dim("Resample"));
+                            let filters = [
+                                beautiful_core::ResampleFilter::Nearest,
+                                beautiful_core::ResampleFilter::Bilinear,
+                                beautiful_core::ResampleFilter::Bicubic,
+                                beautiful_core::ResampleFilter::BicubicSmoother,
+                                beautiful_core::ResampleFilter::BicubicSharper,
+                                beautiful_core::ResampleFilter::BicubicAutomatic,
+                                beautiful_core::ResampleFilter::Lanczos3,
+                            ];
+                            let mut resample_changed = false;
                             for (slot, label) in [
                                 (&mut canvas.resample_drag, "Dragging"),
                                 (&mut canvas.resample_preview, "Preview"),
                                 (&mut canvas.resample_final, "Final"),
                             ] {
+                                let before = *slot;
                                 egui::ComboBox::from_id_salt(format!("opts_{label}"))
                                     .selected_text(slot.label())
                                     .show_ui(ui, |ui| {
-                                        for f in [
-                                            beautiful_core::ResampleFilter::Nearest,
-                                            beautiful_core::ResampleFilter::Bilinear,
-                                            beautiful_core::ResampleFilter::Bicubic,
-                                            beautiful_core::ResampleFilter::BicubicSmoother,
-                                            beautiful_core::ResampleFilter::BicubicSharper,
-                                            beautiful_core::ResampleFilter::BicubicAutomatic,
-                                            beautiful_core::ResampleFilter::Lanczos3,
-                                        ] {
+                                        for f in filters {
                                             ui.selectable_value(slot, f, f.label());
                                         }
                                     });
                                 ui.label(theme::label_dim(label));
+                                if *slot != before {
+                                    resample_changed = true;
+                                }
+                            }
+                            if resample_changed {
+                                canvas.rebake_xform_after_resample_change(document);
                             }
                         }
                     }
@@ -4148,7 +4348,7 @@ pub fn layers_panel(
                 canvas.mark_dirty();
             }
         }
-        // Lock applies to all selected layers (Photoshop-style header control).
+        // Lock applies to all selected layers (common header control).
         let selection: Vec<usize> = if layer_ui.selected.is_empty() {
             vec![document.active_layer]
         } else {
@@ -4369,6 +4569,11 @@ pub fn layers_panel(
 
     egui::ScrollArea::vertical()
         .max_height(360.0)
+        .scroll_source(egui::scroll_area::ScrollSource {
+            scroll_bar: true,
+            drag: false,
+            mouse_wheel: true,
+        })
         .show(ui, |ui| {
             for (_display_i, &(idx, depth)) in display_order.iter().enumerate() {
                 let Some(layer) = document.layers.get(idx) else {
@@ -4468,7 +4673,7 @@ pub fn layers_panel(
                                 }
                             });
 
-                            // Photoshop thumbs: folder/layer content left, then link + mask.
+                            // Layer thumbs: folder/layer content left, then link + mask.
                             if is_folder {
                                 let (thumb_rect, thumb_resp) =
                                     ui.allocate_exact_size(egui::vec2(thumb, thumb), Sense::click());
@@ -4770,7 +4975,7 @@ pub fn layers_panel(
                     });
 
                 // Drop target = whole row. Top/bottom edges = sibling (can leave folder);
-                // middle of a folder = nest into it (Photoshop / CSP style).
+                // middle of a folder = nest into it (common style).
                 let hovering = row.response.dnd_hover_payload::<LayerDrag>().is_some()
                     || (egui::DragAndDrop::has_payload_of_type::<LayerDrag>(ui.ctx())
                         && row.response.contains_pointer());
@@ -5158,7 +5363,7 @@ fn layer_tool_btn(ui: &mut egui::Ui, icon: ToolIcon, tip: &str) -> egui::Respons
 }
 
 /// Cached GPU thumb (navigator-style box downsample). Slot is fixed 40×40.
-/// `active` draws a Photoshop-style bright border (content vs mask edit target).
+/// `active` draws a common bright border (content vs mask edit target).
 /// `mask` samples the layer mask grayscale thumb instead of pixels.
 fn layer_thumb_button(
     ui: &mut egui::Ui,
@@ -5271,166 +5476,193 @@ pub fn handle_shortcuts(
     document: &mut Document,
     canvas: &mut CanvasState,
     tool: &mut WorkspaceTool,
+    session: &mut crate::tool_session::ToolSession,
+    color_state: &mut ColorState,
     keymap: &crate::keymap::Keymap,
     open_prefs: &mut bool,
     zoom_step: f32,
 ) {
+    use crate::keymap::Action;
+
     let mut zoom_in = false;
     let mut zoom_out = false;
     let mut reset_view = false;
-    let mut preset: Option<BrushKind> = None;
+    let mut pick_tool: Option<WorkspaceTool> = None;
     let mut need_repaint = false;
+    let mut swapped_colors = false;
+    let mut reset_colors = false;
+    let mut do_undo = false;
+    let mut do_redo = false;
+    let mut do_deselect = false;
+    let mut do_new_layer = false;
+    let mut do_delete_sel = false;
+    let mut brush_size_delta = 0.0_f32;
+    let mut reapply_theme = false;
 
     ctx.input(|input| {
-        if keymap.pressed(input, crate::keymap::Action::Preferences) {
+        if keymap.pressed(input, Action::Preferences) {
             *open_prefs = true;
         }
-        if input.key_pressed(egui::Key::B) {
-            preset = Some(BrushKind::Brush);
-            *tool = WorkspaceTool::Brush;
+        if keymap.pressed(input, Action::ReapplyTheme) {
+            reapply_theme = true;
         }
-        if input.key_pressed(egui::Key::P) {
-            preset = Some(BrushKind::Pencil);
-            *tool = WorkspaceTool::Pencil;
+        if keymap.pressed(input, Action::SwapFgBg) {
+            swapped_colors = true;
         }
-        if input.key_pressed(egui::Key::A) {
-            preset = Some(BrushKind::Airbrush);
-            *tool = WorkspaceTool::Airbrush;
+        if keymap.pressed(input, Action::ResetColors) {
+            reset_colors = true;
         }
-        if input.key_pressed(egui::Key::U) {
-            preset = Some(BrushKind::Mixer);
-            *tool = WorkspaceTool::Mixer;
-        }
-        if input.key_pressed(egui::Key::E) {
-            preset = Some(BrushKind::Eraser);
-            *tool = WorkspaceTool::Eraser;
-        }
-        if input.key_pressed(egui::Key::S) && !input.modifiers.ctrl {
-            *tool = WorkspaceTool::Smudge;
-        }
-        if input.key_pressed(egui::Key::G) && input.modifiers.shift {
-            *tool = WorkspaceTool::Gradient;
-        } else if input.key_pressed(egui::Key::G) {
-            *tool = WorkspaceTool::Fill;
-        }
-        if input.key_pressed(egui::Key::F) {
-            *tool = WorkspaceTool::Shape;
-        }
-        if input.key_pressed(egui::Key::C) && !input.modifiers.ctrl {
-            if input.modifiers.shift {
-                *tool = WorkspaceTool::CloneStamp;
-            } else {
-                *tool = WorkspaceTool::Crop;
+
+        // Remappable tools — modifiers come from keymap bindings.
+        let tool_map = [
+            (Action::Brush, WorkspaceTool::Brush),
+            (Action::Pencil, WorkspaceTool::Pencil),
+            (Action::Airbrush, WorkspaceTool::Airbrush),
+            (Action::Mixer, WorkspaceTool::Mixer),
+            (Action::Eraser, WorkspaceTool::Eraser),
+            (Action::SelectionBrush, WorkspaceTool::SelectionBrush),
+            (Action::SelectionEraser, WorkspaceTool::SelectionEraser),
+            (Action::Smudge, WorkspaceTool::Smudge),
+            (Action::Fill, WorkspaceTool::Fill),
+            (Action::Gradient, WorkspaceTool::Gradient),
+            (Action::Shape, WorkspaceTool::Shape),
+            (Action::Crop, WorkspaceTool::Crop),
+            (Action::CloneStamp, WorkspaceTool::CloneStamp),
+            (Action::Wand, WorkspaceTool::Wand),
+            (Action::Lasso, WorkspaceTool::Lasso),
+            (Action::Hand, WorkspaceTool::Hand),
+            (Action::Zoom, WorkspaceTool::Zoom),
+            (Action::Eyedropper, WorkspaceTool::Eyedropper),
+            (Action::SelectRect, WorkspaceTool::SelectRect),
+            (Action::Transform, WorkspaceTool::Transform),
+        ];
+        for (action, t) in tool_map {
+            if keymap.pressed(input, action) {
+                pick_tool = Some(t);
             }
         }
-        if input.key_pressed(egui::Key::W) {
-            *tool = WorkspaceTool::Wand;
+
+        if keymap.pressed(input, Action::Undo) {
+            do_undo = true;
         }
-        if input.key_pressed(egui::Key::L) && !input.modifiers.ctrl {
-            *tool = WorkspaceTool::Lasso;
+        if keymap.pressed(input, Action::Redo) || keymap.pressed(input, Action::RedoAlternate) {
+            do_redo = true;
         }
-        if input.key_pressed(egui::Key::H) {
-            *tool = WorkspaceTool::Hand;
+        if keymap.pressed(input, Action::Deselect) {
+            do_deselect = true;
         }
-        if input.key_pressed(egui::Key::Z) && !input.modifiers.ctrl {
-            *tool = WorkspaceTool::Zoom;
+        if keymap.pressed(input, Action::NewLayer) {
+            do_new_layer = true;
         }
-        if input.key_pressed(egui::Key::I) {
-            *tool = WorkspaceTool::Eyedropper;
-        }
-        if input.key_pressed(egui::Key::R) {
-            *tool = WorkspaceTool::SelectRect;
-        }
-        if input.key_pressed(egui::Key::V) && !input.modifiers.ctrl {
-            *tool = WorkspaceTool::Transform;
-        }
-        if input.key_pressed(egui::Key::T) {
-            *tool = WorkspaceTool::Transform;
-        }
-        if input.key_pressed(egui::Key::F5) {
-            theme::apply(ctx);
-        }
-        if input.modifiers.ctrl && input.key_pressed(egui::Key::Z) && !input.modifiers.shift {
-            // Folder color is not historied — block undo so Ctrl+Z does not undo
-            // an unrelated paint while the user thinks they are reversing a folder tint.
-            if document.active_is_folder() {
-                // notice drained by app chrome
-                document.require_paintable("Отмена (Ctrl+Z)");
-            } else if canvas.cancel_sel_pixel_move(document) {
-                canvas.clear_drawing_gesture(document);
-                canvas.mark_dirty();
-                canvas.invalidate_nav();
-                need_repaint = true;
-            } else {
-                document.undo();
-                canvas.clear_drawing_gesture(document);
-                canvas.mark_dirty();
-                canvas.invalidate_nav();
-                need_repaint = true;
-            }
-        }
-        if input.modifiers.ctrl
-            && (input.key_pressed(egui::Key::Y)
-                || (input.modifiers.shift && input.key_pressed(egui::Key::Z)))
+        if keymap.pressed(input, Action::DeleteSelection)
+            || keymap.pressed(input, Action::DeleteSelectionAlternate)
         {
-            if document.active_is_folder() {
-                document.require_paintable("Повтор (Ctrl+Y)");
-            } else {
-                document.redo();
-                canvas.clear_drawing_gesture(document);
-                canvas.mark_dirty();
-                canvas.invalidate_nav();
-                need_repaint = true;
-            }
+            do_delete_sel = true;
         }
-        if input.modifiers.ctrl && input.key_pressed(egui::Key::D) {
-            document.deselect();
+        if keymap.pressed(input, Action::BrushSizeDown) {
+            brush_size_delta -= 2.0;
         }
-        if input.modifiers.ctrl && input.key_pressed(egui::Key::L) {
-            let _ = document.add_layer();
+        if keymap.pressed(input, Action::BrushSizeUp) {
+            brush_size_delta += 2.0;
         }
-        if input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace) {
-            if document.selection.rect.is_some() || document.selection.floating.is_some() {
-                if document.selection.floating.is_none() {
-                    if let Some(rect) = document.selection.rect {
-                        let idx = document.active_layer;
-                        document
-                            .selection
-                            .lift_from_layer(&mut document.layers[idx], idx);
-                        document.selection.rect = Some(rect);
-                    }
-                }
-                // Drop floating pixels; hole stays (cut). Abandon park undo.
-                document.sel_float_undo = None;
-                document.selection.floating = None;
-                document.selection.floating_layer = None;
-                document.end_transform_sandwich();
-                document.selection.clear();
-                document.invalidate_full();
-            }
-        }
-        if input.key_pressed(egui::Key::OpenBracket) {
-            document.brush.size = (document.brush.size - 2.0).max(1.0);
-        }
-        if input.key_pressed(egui::Key::CloseBracket) {
-            document.brush.size = (document.brush.size + 2.0).min(512.0);
-        }
-        if input.modifiers.ctrl
-            && (input.key_pressed(egui::Key::Plus) || input.key_pressed(egui::Key::Equals))
-        {
+        if keymap.pressed(input, Action::ZoomIn) {
             zoom_in = true;
         }
-        if input.modifiers.ctrl && input.key_pressed(egui::Key::Minus) {
+        if keymap.pressed(input, Action::ZoomOut) {
             zoom_out = true;
         }
-        if input.modifiers.ctrl && input.key_pressed(egui::Key::Num0) {
+        if keymap.pressed(input, Action::ZoomReset) {
             reset_view = true;
         }
     });
 
-    if let Some(kind) = preset {
-        document.brush.apply_preset(kind);
-        document.warm_tip_cache();
+    if reapply_theme {
+        theme::apply(ctx);
+    }
+
+    if do_undo {
+        if document.active_is_folder() {
+            document.require_paintable("Отмена");
+        } else if canvas.cancel_sel_pixel_move(document) {
+            canvas.clear_drawing_gesture(document);
+            canvas.mark_dirty();
+            canvas.invalidate_nav();
+            need_repaint = true;
+        } else {
+            document.undo();
+            canvas.clear_drawing_gesture(document);
+            canvas.mark_dirty();
+            canvas.invalidate_nav();
+            need_repaint = true;
+        }
+    }
+    if do_redo {
+        if document.active_is_folder() {
+            document.require_paintable("Повтор");
+        } else {
+            document.redo();
+            canvas.clear_drawing_gesture(document);
+            canvas.mark_dirty();
+            canvas.invalidate_nav();
+            need_repaint = true;
+        }
+    }
+    if do_deselect {
+        document.deselect();
+    }
+    if do_new_layer {
+        let _ = document.add_layer();
+    }
+    if do_delete_sel {
+        if document.selection.rect.is_some() || document.selection.floating.is_some() {
+            if document.selection.floating.is_none() {
+                if let Some(rect) = document.selection.rect {
+                    let idx = document.active_layer;
+                    document
+                        .selection
+                        .lift_from_layer(&mut document.layers[idx], idx);
+                    document.selection.rect = Some(rect);
+                }
+            }
+            document.sel_float_undo = None;
+            document.selection.floating = None;
+            document.selection.floating_layer = None;
+            document.end_transform_sandwich();
+            document.selection.clear();
+            document.invalidate_full();
+        }
+    }
+    if brush_size_delta != 0.0 {
+        document.brush.size = (document.brush.size + brush_size_delta).clamp(1.0, 512.0);
+    }
+
+    if let Some(t) = pick_tool {
+        t.apply_on_select(document, session);
+        *tool = session.tool;
+    }
+
+    if swapped_colors {
+        std::mem::swap(&mut document.brush.color, &mut document.color_bg);
+        document.brush.color.a = 255;
+        document.color_bg.a = 255;
+        document.drawing_slot = beautiful_core::DrawingColorSlot::Foreground;
+        color_state.drawing_slot = beautiful_core::DrawingColorSlot::Foreground;
+        color_state.sync_from_rgba(document.brush.color);
+        let c = document.brush.color;
+        document.stroke.wet = [
+            c.r as f32 / 255.0,
+            c.g as f32 / 255.0,
+            c.b as f32 / 255.0,
+            1.0,
+        ];
+    }
+    if reset_colors {
+        document.brush.color = beautiful_core::Rgba::BLACK;
+        document.color_bg = beautiful_core::Rgba::WHITE;
+        document.drawing_slot = beautiful_core::DrawingColorSlot::Foreground;
+        color_state.drawing_slot = beautiful_core::DrawingColorSlot::Foreground;
+        color_state.sync_from_rgba(document.brush.color);
+        document.stroke.wet = [0.0, 0.0, 0.0, 1.0];
     }
 
     let view_center = canvas.last_viewport.center();

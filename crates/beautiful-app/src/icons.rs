@@ -20,6 +20,7 @@ pub enum ToolIcon {
     Transform,
     Distort,
     Warp,
+    Kruler,
     Crop,
     FlipH,
     FlipV,
@@ -284,6 +285,15 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: ToolIcon, color: Color32
                 painter.rect_filled(Rect::from_center_size(corner, Vec2::splat(s * 0.16)), 1.0, color);
             }
             painter.circle_filled(r.center(), s * 0.06, color);
+        }
+        ToolIcon::Kruler => {
+            // Dashed rect (select) + solid corner ticks (transform).
+            let r = Rect::from_center_size(c, Vec2::splat(s * 0.88));
+            dashed_rect(painter, r, color);
+            let tick = s * 0.18;
+            for corner in [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()] {
+                painter.rect_filled(Rect::from_center_size(corner, Vec2::splat(tick)), 0.0, color);
+            }
         }
         ToolIcon::Distort => {
             let pts = [

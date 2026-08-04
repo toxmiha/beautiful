@@ -36,7 +36,7 @@ mod warp;
 pub use brush::{BrushKind, BrushSettings, BrushShape, BrushTexture, HairDirection, StrokeState};
 pub use color::{
     linear_to_srgb, load_premul_linear, make_src_premul, source_over_premul, srgb_to_linear,
-    store_premul_linear, Rgba,
+    store_premul_linear, DrawingColorSlot, Rgba,
 };
 pub use composite::{
     composite_region_packed_into, CompositeCache, DirtyRect, FloatingBlit, SyncResult,
@@ -80,11 +80,12 @@ pub use preview::{
 };
 pub use psd::{export_psd_layered, load_psd};
 pub use resample::{
-    apply_free_transform_rgba, flip_layer_horizontal, flip_layer_vertical, resample_bilinear,
-    resample_lanczos3, resample_nearest, ResampleFilter,
+    apply_free_transform_rgba, flip_layer_horizontal, flip_layer_vertical, free_transform_output_size,
+    resample_bilinear, resample_lanczos3, resample_nearest, ResampleFilter,
 };
 pub use selection::{
-    outline_from_mask, FloatingSelection, Selection, SelectionCombine, SelectionMask, SelectionRect,
+    outline_from_mask, snap_doc_xy, FloatingSelection, Selection, SelectionCombine, SelectionMask,
+    SelectionRect,
 };
 pub use shape::{
     arrow_head, dash_visible, ellipse_sdf, ellipse_stroke, poly_dash_dist, poly_sdf, rect_sdf,

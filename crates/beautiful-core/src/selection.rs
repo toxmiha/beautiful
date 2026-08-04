@@ -63,6 +63,12 @@ pub struct SelectionRect {
     pub y1: f32,
 }
 
+/// Document-space point snapped to the pixel under the cursor (top-left of cell).
+#[inline]
+pub fn snap_doc_xy(x: f32, y: f32) -> (f32, f32) {
+    (x.floor(), y.floor())
+}
+
 impl SelectionRect {
     pub fn from_points(a: (f32, f32), b: (f32, f32)) -> Self {
         Self {
@@ -71,6 +77,27 @@ impl SelectionRect {
             x1: a.0.max(b.0),
             y1: a.1.max(b.1),
         }
+    }
+
+    /// Marquee AABB snapped to integer pixel edges (inclusive start, exclusive end).
+    /// Same-pixel click → 1×1. Stable while the pointer stays inside a pixel.
+    pub fn from_points_pixels(a: (f32, f32), b: (f32, f32)) -> Self {
+        Self::from_points(a, b).snap_to_pixels()
+    }
+
+    /// Quantize to whole document pixels.
+    pub fn snap_to_pixels(self) -> Self {
+        let x0 = self.x0.min(self.x1).floor();
+        let y0 = self.y0.min(self.y1).floor();
+        let mut x1 = self.x0.max(self.x1).ceil();
+        let mut y1 = self.y0.max(self.y1).ceil();
+        if x1 - x0 < 1.0 {
+            x1 = x0 + 1.0;
+        }
+        if y1 - y0 < 1.0 {
+            y1 = y0 + 1.0;
+        }
+        Self { x0, y0, x1, y1 }
     }
 
     pub fn width(&self) -> f32 {
@@ -293,6 +320,71 @@ pub struct FloatingSelection {
     pub rotation_deg: f32,
 }
 
+impl FloatingSelection {
+    /// No opaque samples — move must not dirty composite (empty AABB still ate FPS).
+    #[inline]
+    pub fn is_visually_empty(&self) -> bool {
+        self.width == 0 || self.height == 0 || self.pixels.is_empty()
+    }
+
+    /// Shrink buffer to opaque bbox (+1px pad). Empty → 0×0 (ants keep selection shape).
+    pub fn trim_transparent_borders(&mut self) {
+        let w = self.width;
+        let h = self.height;
+        if w == 0 || h == 0 || self.pixels.len() < (w as usize) * (h as usize) * 4 {
+            self.pixels.clear();
+            self.width = 0;
+            self.height = 0;
+            return;
+        }
+        let mut min_x = w;
+        let mut min_y = h;
+        let mut max_x = 0u32;
+        let mut max_y = 0u32;
+        let mut any = false;
+        for y in 0..h {
+            for x in 0..w {
+                let a = self.pixels[((y * w + x) * 4 + 3) as usize];
+                if a != 0 {
+                    any = true;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x + 1);
+                    max_y = max_y.max(y + 1);
+                }
+            }
+        }
+        if !any {
+            self.pixels.clear();
+            self.width = 0;
+            self.height = 0;
+            return;
+        }
+        let pad = 1u32;
+        let x0 = min_x.saturating_sub(pad);
+        let y0 = min_y.saturating_sub(pad);
+        let x1 = (max_x + pad).min(w);
+        let y1 = (max_y + pad).min(h);
+        if x0 == 0 && y0 == 0 && x1 == w && y1 == h {
+            return;
+        }
+        let nw = x1 - x0;
+        let nh = y1 - y0;
+        let mut out = vec![0u8; (nw as usize) * (nh as usize) * 4];
+        for row in 0..nh {
+            let src = (((y0 + row) * w + x0) * 4) as usize;
+            let dst = (row * nw * 4) as usize;
+            let bytes = (nw * 4) as usize;
+            out[dst..dst + bytes].copy_from_slice(&self.pixels[src..src + bytes]);
+        }
+        self.pixels = out;
+        self.width = nw;
+        self.height = nh;
+        self.x += x0 as f32;
+        self.y += y0 as f32;
+    }
+}
+
 impl Default for Selection {
     fn default() -> Self {
         Self {
@@ -335,11 +427,15 @@ impl Selection {
         self.lasso_points.clear();
     }
 
-    /// Live marquee drag: update AABB only — avoid reallocating `w×h` mask every
-    /// pointer move (large marquees were spiking CPU and freezing the app).
-    /// Clears `mask` so overlay (rect) and clip (mask) cannot diverge.
+    /// Live marquee drag: update pixel-snapped AABB only — avoid reallocating `w×h`
+    /// mask every pointer move. Clears `mask` so overlay and clip cannot diverge.
     pub fn set_rect_live(&mut self, rect: SelectionRect) {
+        let rect = rect.snap_to_pixels();
         if rect.width() < 1.0 || rect.height() < 1.0 {
+            return;
+        }
+        // No-op if still on the same pixel footprint (cheap while dragging).
+        if self.rect == Some(rect) && self.mask.is_none() {
             return;
         }
         self.rect = Some(rect);
@@ -351,9 +447,10 @@ impl Selection {
 
     /// Materialize a solid mask from `rect` (call on marquee release).
     pub fn finalize_rect_mask(&mut self) {
-        let Some(rect) = self.rect else {
+        let Some(rect) = self.rect.map(SelectionRect::snap_to_pixels) else {
             return;
         };
+        self.rect = Some(rect);
         if rect.width() < 1.0 || rect.height() < 1.0 {
             return;
         }
@@ -784,6 +881,10 @@ impl Selection {
             y: y0 as f32,
             rotation_deg: 0.0,
         });
+        // Drop empty padding from AABB — empty/sparse lifts no longer dirty huge ROI.
+        if let Some(f) = self.floating.as_mut() {
+            f.trim_transparent_borders();
+        }
         self.floating_layer = Some(layer_idx);
     }
 
@@ -891,7 +992,7 @@ impl Selection {
         };
         let src = f.pixels.clone();
         let (pix, ow, oh, ox, oy) =
-            mesh_warp_rgba_ex(&src, f.width, f.height, grid_n, controls, None, false, 8);
+            mesh_warp_rgba_ex(&src, f.width, f.height, grid_n, controls, None, ResampleFilter::Bilinear, 8);
         f.pixels = pix;
         f.width = ow;
         f.height = oh;
@@ -918,7 +1019,7 @@ impl Selection {
         y: f32,
         grid_n: usize,
         controls: &[(f32, f32)],
-        nearest: bool,
+        filter: ResampleFilter,
         resync_mask: bool,
     ) {
         self.mesh_warp_floating_from_ex(
@@ -930,7 +1031,7 @@ impl Selection {
             grid_n,
             controls,
             None,
-            nearest,
+            filter,
             resync_mask,
             6,
         );
@@ -946,7 +1047,7 @@ impl Selection {
         grid_n: usize,
         controls: &[(f32, f32)],
         node_handles: Option<&[[Option<(f32, f32)>; 4]]>,
-        nearest: bool,
+        filter: ResampleFilter,
         resync_mask: bool,
         subdiv: u32,
     ) {
@@ -960,7 +1061,7 @@ impl Selection {
             grid_n,
             controls,
             node_handles,
-            nearest,
+            filter,
             subdiv,
         );
         f.pixels = pix;
@@ -1162,3 +1263,52 @@ pub fn outline_from_mask(mask: &SelectionMask) -> Vec<(f32, f32)> {
     }
     slim
 }
+
+#[cfg(test)]
+mod float_trim_tests {
+    use super::FloatingSelection;
+
+    #[test]
+    fn trim_empty_becomes_zero_size() {
+        let mut f = FloatingSelection {
+            pixels: vec![0u8; 16 * 16 * 4],
+            width: 16,
+            height: 16,
+            x: 10.0,
+            y: 20.0,
+            rotation_deg: 0.0,
+        };
+        f.trim_transparent_borders();
+        assert!(f.is_visually_empty());
+        assert_eq!(f.width, 0);
+        assert_eq!(f.height, 0);
+    }
+
+    #[test]
+    fn trim_keeps_opaque_island() {
+        let w = 32u32;
+        let h = 32u32;
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        // Opaque 2×2 at (8,9)
+        for (x, y) in [(8u32, 9u32), (9, 9), (8, 10), (9, 10)] {
+            let i = ((y * w + x) * 4) as usize;
+            pixels[i..i + 4].copy_from_slice(&[10, 20, 30, 255]);
+        }
+        let mut f = FloatingSelection {
+            pixels,
+            width: w,
+            height: h,
+            x: 100.0,
+            y: 200.0,
+            rotation_deg: 0.0,
+        };
+        f.trim_transparent_borders();
+        assert!(!f.is_visually_empty());
+        // pad 1 → 4×4 around the 2×2
+        assert_eq!(f.width, 4);
+        assert_eq!(f.height, 4);
+        assert_eq!(f.x, 100.0 + 7.0);
+        assert_eq!(f.y, 200.0 + 8.0);
+    }
+}
+

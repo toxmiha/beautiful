@@ -125,8 +125,12 @@ pub enum ThemeBrightness {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
-    /// Empty = use default under app_dir.
+    /// User-chosen root folder for canvas saves. Empty = not configured.
     pub documents_dir: String,
+    /// True after the user accepted or declined the first-save root prompt
+    /// (or set a root in Preferences). Prevents re-asking.
+    #[serde(default)]
+    pub save_root_decided: bool,
     pub addons_dir: String,
     pub resources_dir: String,
     pub undo_max_steps: usize,
@@ -143,11 +147,22 @@ pub struct AppSettings {
     /// Panel/chrome opacity independent of DWM strength (0.2 = airy, 1 = solid).
     #[serde(default = "default_ui_opacity")]
     pub ui_opacity: f32,
+    /// Extra UI zoom on top of Windows DPI when `ui_scale_follow_windows` is true.
+    /// Absolute pixels-per-point (1.0 ≈ 96 DPI) when follow is false.
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
+    /// When true, egui keeps OS DPI and multiplies by `ui_scale` (zoom_factor).
+    /// When false, `ui_scale` replaces OS DPI as pixels_per_point.
+    #[serde(default = "default_true")]
+    pub ui_scale_follow_windows: bool,
     /// Solid tint vs Discord-style two-stop gradient.
     #[serde(default)]
     pub color_fill: ColorFillMode,
     #[serde(default)]
     pub theme_brightness: ThemeBrightness,
+    /// Interface typeface family name (e.g. "Segoe UI"). Empty = Segoe UI.
+    #[serde(default)]
+    pub ui_font: String,
     /// Global UI chrome / panel / menu base color (solid mode + gradient midpoint).
     #[serde(default = "default_app_color")]
     pub app_color: [u8; 3],
@@ -194,19 +209,45 @@ pub struct AppSettings {
     /// How many autosave versions to keep per session.
     #[serde(default = "default_autosave_keep")]
     pub autosave_keep_versions: usize,
-    /// Discord Rich Presence (requires Discord desktop + Application Client ID).
-    #[serde(default)]
+    /// Discord Rich Presence (requires Discord desktop). Client ID is project-owned.
+    #[serde(default = "default_true")]
     pub discord_rpc_enabled: bool,
-    /// Discord Application Client ID from https://discord.com/developers/applications
-    /// (or set env `BEAUTIFUL_DISCORD_CLIENT_ID`).
+    /// Legacy field — ignored (Client ID is baked / one-time appdata).
     #[serde(default)]
     pub discord_client_id: String,
+    /// What to show as the main Discord line.
+    #[serde(default)]
+    pub discord_title_mode: DiscordTitleMode,
+    /// Upload a small canvas thumb as the large Discord image (temporary public host).
+    #[serde(default)]
+    pub discord_show_canvas_preview: bool,
+}
+
+/// Main Discord Rich Presence title line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordTitleMode {
+    /// Show "Beautiful".
+    #[default]
+    AppName,
+    /// Show the open canvas / document name.
+    CanvasName,
+}
+
+impl DiscordTitleMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AppName => "Название приложения",
+            Self::CanvasName => "Название холста",
+        }
+    }
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             documents_dir: String::new(),
+            save_root_decided: false,
             addons_dir: String::new(),
             resources_dir: String::new(),
             undo_max_steps: 50,
@@ -215,8 +256,11 @@ impl Default for AppSettings {
             material: UiMaterial::Acrylic,
             ui_transparency: true,
             ui_opacity: default_ui_opacity(),
+            ui_scale: default_ui_scale(),
+            ui_scale_follow_windows: true,
             color_fill: ColorFillMode::Solid,
             theme_brightness: ThemeBrightness::Dark,
+            ui_font: String::new(),
             app_color: default_app_color(),
             gradient_a: default_gradient_a(),
             gradient_b: default_gradient_b(),
@@ -237,8 +281,10 @@ impl Default for AppSettings {
             autosave_enabled: true,
             autosave_interval_mins: default_autosave_mins(),
             autosave_keep_versions: default_autosave_keep(),
-            discord_rpc_enabled: false,
+            discord_rpc_enabled: true,
             discord_client_id: String::new(),
+            discord_title_mode: DiscordTitleMode::AppName,
+            discord_show_canvas_preview: false,
         }
     }
 }
@@ -265,6 +311,10 @@ fn default_app_color() -> [u8; 3] {
 
 fn default_ui_opacity() -> f32 {
     0.85
+}
+
+fn default_ui_scale() -> f32 {
+    1.0
 }
 
 fn default_gradient_a() -> [u8; 3] {
@@ -322,6 +372,11 @@ impl AppSettings {
             s.material = UiMaterial::Solid;
         }
         s.acrylic_enabled = s.material.uses_dwm_backdrop();
+        // Existing documents_dir means the user already has a save root.
+        if !s.documents_dir.trim().is_empty() {
+            s.save_root_decided = true;
+        }
+        s.keymap.ensure_complete();
         s.clamp();
         s
     }
@@ -346,8 +401,11 @@ impl AppSettings {
         self.material = d.material;
         self.ui_transparency = d.ui_transparency;
         self.ui_opacity = d.ui_opacity;
+        self.ui_scale = d.ui_scale;
+        self.ui_scale_follow_windows = d.ui_scale_follow_windows;
         self.color_fill = d.color_fill;
         self.theme_brightness = d.theme_brightness;
+        self.ui_font = d.ui_font;
         self.app_color = d.app_color;
         self.gradient_a = d.gradient_a;
         self.gradient_b = d.gradient_b;
@@ -419,18 +477,68 @@ impl AppSettings {
     }
 
     pub fn ensure_dirs(&self) {
-        let _ = std::fs::create_dir_all(self.resolved_documents_dir());
+        if let Some(root) = self.configured_save_root() {
+            let _ = std::fs::create_dir_all(root);
+        }
         let _ = std::fs::create_dir_all(self.resolved_addons_dir());
         let _ = std::fs::create_dir_all(self.resolved_resources_dir());
     }
 
+    /// User-configured save root, if any. Does not invent AppData defaults.
+    pub fn configured_save_root(&self) -> Option<PathBuf> {
+        let trimmed = self.documents_dir.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(trimmed))
+        }
+    }
+
+    /// Friendly default for the first-save prompt: Pictures/Beautiful → Documents/Beautiful → ~/Beautiful.
+    pub fn suggested_save_root() -> PathBuf {
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from);
+        if let Some(home) = home {
+            for folder in ["Pictures", "Изображения", "Documents", "Документы"] {
+                let base = home.join(folder);
+                if base.is_dir() {
+                    return base.join("Beautiful");
+                }
+            }
+            return home.join("Beautiful");
+        }
+        Self::app_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("documents")
+    }
+
+    pub fn accept_save_root(&mut self, path: PathBuf) -> Result<(), String> {
+        let path = if path.as_os_str().is_empty() {
+            Self::suggested_save_root()
+        } else {
+            path
+        };
+        std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+        self.documents_dir = path.display().to_string();
+        self.save_root_decided = true;
+        self.save()
+    }
+
+    pub fn decline_save_root(&mut self) -> Result<(), String> {
+        self.save_root_decided = true;
+        self.save()
+    }
+
+    /// Legacy/internal documents path (AppData fallback when unset).
+    #[allow(dead_code)]
     pub fn resolved_documents_dir(&self) -> PathBuf {
-        if self.documents_dir.trim().is_empty() {
+        if let Some(root) = self.configured_save_root() {
+            root
+        } else {
             Self::app_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("documents")
-        } else {
-            PathBuf::from(&self.documents_dir)
         }
     }
 
@@ -454,10 +562,23 @@ impl AppSettings {
         }
     }
 
+    /// Effective UI scale multiplier applied via egui (zoom_factor or ppp).
+    pub fn apply_ui_scale(&self, ctx: &eframe::egui::Context) {
+        let scale = self.ui_scale.clamp(0.75, 2.0);
+        if self.ui_scale_follow_windows {
+            // Keep OS DPI (pixels_per_point from winit); user scale is zoom_factor.
+            ctx.set_zoom_factor(scale);
+        } else {
+            ctx.set_zoom_factor(1.0);
+            ctx.set_pixels_per_point(scale);
+        }
+    }
+
     pub fn clamp(&mut self) {
         self.undo_max_steps = self.undo_max_steps.clamp(10, 200);
         self.acrylic_strength = self.acrylic_strength.clamp(0.0, 1.0);
         self.ui_opacity = self.ui_opacity.clamp(0.2, 1.0);
+        self.ui_scale = self.ui_scale.clamp(0.75, 2.0);
         self.gradient_angle_deg = self.gradient_angle_deg.rem_euclid(360.0);
         self.gradient_saturation = self.gradient_saturation.clamp(0.0, 2.0);
         self.pressure_sensitivity = self.pressure_sensitivity.clamp(0.1, 3.0);

@@ -85,11 +85,11 @@ _Статусы сверены с кодом: 2026-08-01._
 | Фича | Status |
 |------|--------|
 | Phase A ядро (кисть, стабилизатор, слои, UI) | Done |
-| Save/load TXMH, PNG/JPEG, PSD, SAI2 import | Done |
+| Save/load TXMH, PNG/JPEG, PSD, peer2 import | Done |
 | Undo/history | Done (края: mask/некоторые ops) |
 | Mesh / Distort / Free Transform | Done (polish crash/split) |
 | Correction layers + layer masks | Done |
-| Blend modes (PS/Krita-ish) | Done |
+| Blend modes (Krita-ish) | Done |
 | Navigator, docks, gallery home | Done |
 | WinTab fallback | Todo (сейчас Windows Ink / egui pressure) |
 | Белый квадрат / acrylic workspace | Open bug (`WHITE_SQUARE_HANDOFF.md`) |

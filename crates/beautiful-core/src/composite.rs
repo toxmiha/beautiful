@@ -319,7 +319,7 @@ impl CompositeCache {
         let aabb = DirtyRect::union_all(list.iter().copied());
         let aabb_area = (aabb.width() as u64).saturating_mul(aabb.height() as u64);
         // Dense paint → one AABB is cheaper than thousands of tiny composites.
-        // Sparse strokes → keep tiles so we don't reblend empty holes (SAI-like).
+        // Sparse strokes → keep tiles so we don't reblend empty holes (sparse-tile).
         if list.len() > 768 || parts_area.saturating_mul(2) >= aabb_area {
             self.dirty.union(aabb);
         } else {
@@ -452,6 +452,11 @@ impl CompositeCache {
             };
         }
 
+        // Only expand dirty with the float AABB when it overlaps pending work.
+        // Unconditional push re-composited the whole float every frame while any
+        // offscreen backlog existed → sticky ~80% CPU when zoomed onto the float
+        // (Kruler / selection). composite_region_into already blits float into
+        // each dirty rect that intersects it.
         if let Some(f) = floating {
             let mut fr = DirtyRect {
                 x0: f.x.floor().max(0.0) as u32,
@@ -462,7 +467,10 @@ impl CompositeCache {
                     .clamp(0.0, self.height as f32) as u32,
             };
             fr.clamp_to(self.width, self.height);
-            regions.push(fr);
+            let overlaps = regions.iter().any(|r| !r.intersect(fr).is_empty());
+            if overlaps {
+                regions.push(fr);
+            }
         }
 
         let (now_list, defer) = if let Some(view) = view_clip {

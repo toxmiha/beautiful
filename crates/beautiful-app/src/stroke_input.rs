@@ -8,7 +8,53 @@
 
 use eframe::egui::{self, Event, PointerButton, Pos2, RawInput, Vec2};
 
-use beautiful_core::Document;
+use beautiful_core::{BrushKind, Document, DrawingColorSlot, Rgba};
+
+/// Snapshot so FG / BG / Transparent can temporarily rewrite brush for one paint call.
+struct DrawingSlotSnap {
+    color: Rgba,
+    kind: BrushKind,
+    wet: [f32; 4],
+    wet_active: bool,
+}
+
+impl DrawingSlotSnap {
+    fn apply(document: &mut Document) -> Self {
+        let snap = Self {
+            color: document.brush.color,
+            kind: document.brush.kind,
+            wet: document.stroke.wet,
+            wet_active: document.stroke.active,
+        };
+        match document.drawing_slot {
+            DrawingColorSlot::Foreground => {}
+            DrawingColorSlot::Background => {
+                let c = document.color_bg.opaque();
+                document.brush.color = c;
+                if !document.stroke.active {
+                    document.stroke.wet = [
+                        c.r as f32 / 255.0,
+                        c.g as f32 / 255.0,
+                        c.b as f32 / 255.0,
+                        1.0,
+                    ];
+                }
+            }
+            DrawingColorSlot::Transparent => {
+                document.brush.kind = BrushKind::Eraser;
+            }
+        }
+        snap
+    }
+
+    fn restore(self, document: &mut Document) {
+        document.brush.color = self.color;
+        document.brush.kind = self.kind;
+        if !self.wet_active && !document.stroke.active {
+            document.stroke.wet = self.wet;
+        }
+    }
+}
 
 /// Converts raw relative `MouseMoved` into screen-space deltas using
 /// absolute `PointerMoved` as ground truth.
@@ -325,7 +371,7 @@ impl TrajectoryBuilder {
     }
 }
 
-/// Paint all samples in one commit (Aseprite-style: intertwine then dab).
+/// Paint all samples in one commit (batch path samples, then dab).
 ///
 /// Engine `spacing_acc` fills gaps. Do **not** call `paint_polyline` per sample —
 /// that was ~20 commits/frame in the action log (~20 Hz viscous brush).
@@ -359,6 +405,14 @@ pub fn paint_samples_mode(
         return false;
     }
 
+    let snap = DrawingSlotSnap::apply(document);
+    let mode = match mode {
+        PaintMode::Mask { erase } => PaintMode::Mask {
+            erase: erase || matches!(document.drawing_slot, DrawingColorSlot::Transparent),
+        },
+        other => other,
+    };
+
     let chain = {
         let _t = crate::perf::Scope::new(crate::perf::Category::Stroke, "pipe.trajectory");
         let mut chain: Vec<(f32, f32, f32)> = Vec::with_capacity(samples.len() + 1);
@@ -380,6 +434,7 @@ pub fn paint_samples_mode(
     };
 
     if chain.is_empty() {
+        snap.restore(document);
         return false;
     }
 
@@ -426,6 +481,7 @@ pub fn paint_samples_mode(
             !chain.is_empty()
         }
     };
+    snap.restore(document);
     crate::perf::drain_core_probes();
 
     if let Some(&last) = chain.last() {
@@ -454,7 +510,12 @@ pub fn pressure_from_raw(raw: &RawInput, pen_fallback: f32) -> f32 {
     }
 }
 
-pub fn apply_raw_button_state(raw: &RawInput, lmb_down: &mut bool, space_down: &mut bool) {
+pub fn apply_raw_button_state(
+    raw: &RawInput,
+    lmb_down: &mut bool,
+    space_down: &mut bool,
+    hand_key: Option<(egui::Key, bool, bool)>,
+) {
     for ev in &raw.events {
         match ev {
             Event::PointerButton {
@@ -463,10 +524,17 @@ pub fn apply_raw_button_state(raw: &RawInput, lmb_down: &mut bool, space_down: &
                 ..
             } => *lmb_down = *pressed,
             Event::Key {
-                key: egui::Key::Space,
+                key,
                 pressed,
+                modifiers,
                 ..
-            } => *space_down = *pressed,
+            } => {
+                if let Some((hand_key, ctrl, alt)) = hand_key {
+                    if *key == hand_key && modifiers.ctrl == ctrl && modifiers.alt == alt {
+                        *space_down = *pressed;
+                    }
+                }
+            }
             _ => {}
         }
     }

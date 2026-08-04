@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 pub enum Action {
     Undo,
     Redo,
+    RedoAlternate,
     Deselect,
     NewLayer,
     DeleteSelection,
+    DeleteSelectionAlternate,
     Brush,
     Pencil,
     Airbrush,
@@ -38,15 +40,26 @@ pub enum Action {
     ZoomReset,
     Preferences,
     ReapplyTheme,
+    SwapFgBg,
+    ResetColors,
+    Save,
+    Open,
+    NewDocument,
+    Copy,
+    Paste,
+    TempHand,
+    ToggleProfiler,
 }
 
 impl Action {
     pub const ALL: &'static [Action] = &[
         Action::Undo,
         Action::Redo,
+        Action::RedoAlternate,
         Action::Deselect,
         Action::NewLayer,
         Action::DeleteSelection,
+        Action::DeleteSelectionAlternate,
         Action::Brush,
         Action::Pencil,
         Action::Airbrush,
@@ -74,15 +87,26 @@ impl Action {
         Action::ZoomReset,
         Action::Preferences,
         Action::ReapplyTheme,
+        Action::SwapFgBg,
+        Action::ResetColors,
+        Action::Save,
+        Action::Open,
+        Action::NewDocument,
+        Action::Copy,
+        Action::Paste,
+        Action::TempHand,
+        Action::ToggleProfiler,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Undo => "Undo",
             Self::Redo => "Redo",
+            Self::RedoAlternate => "Redo (alternate)",
             Self::Deselect => "Deselect",
             Self::NewLayer => "New layer",
             Self::DeleteSelection => "Delete selection",
+            Self::DeleteSelectionAlternate => "Delete selection (alternate)",
             Self::Brush => "Brush",
             Self::Pencil => "Pencil",
             Self::Airbrush => "Airbrush",
@@ -110,6 +134,15 @@ impl Action {
             Self::ZoomReset => "Zoom 100% / fit reset",
             Self::Preferences => "Preferences",
             Self::ReapplyTheme => "Reapply theme",
+            Self::SwapFgBg => "Swap FG / BG",
+            Self::ResetColors => "Reset colors B/W",
+            Self::Save => "Save",
+            Self::Open => "Open",
+            Self::NewDocument => "New document",
+            Self::Copy => "Copy",
+            Self::Paste => "Paste",
+            Self::TempHand => "Temporary hand (hold)",
+            Self::ToggleProfiler => "Profiler",
         }
     }
 }
@@ -190,10 +223,27 @@ impl Keymap {
     }
 
     pub fn set_binding(&mut self, action: Action, binding: KeyBinding) {
+        // One combo → one action: clear the same binding from others.
+        self.bindings
+            .retain(|(a, b)| *a == action || *b != binding);
         if let Some(slot) = self.binding_mut(action) {
             *slot = binding;
         } else {
             self.bindings.push((action, binding));
+        }
+    }
+
+    /// Fill any missing actions from defaults (old settings.json migrations).
+    pub fn ensure_complete(&mut self) {
+        for action in Action::ALL {
+            if self.binding(*action).is_none() {
+                if let Some((_, b)) = default_bindings()
+                    .into_iter()
+                    .find(|(a, _)| a == action)
+                {
+                    self.bindings.push((*action, b));
+                }
+            }
         }
     }
 
@@ -204,10 +254,51 @@ impl Keymap {
         let Some(key) = str_to_key(&b.key) else {
             return false;
         };
-        if !input.key_pressed(key) {
+        // Ctrl+= and Ctrl++ are the same physical key on many layouts.
+        let key_hit = if matches!(key, Key::Equals) {
+            input.key_pressed(Key::Equals) || input.key_pressed(Key::Plus)
+        } else {
+            input.key_pressed(key)
+        };
+        if !key_hit {
             return false;
         }
+        // Modifier check against the bound key identity (Equals), not Plus.
         b.matches(key, input.modifiers)
+    }
+
+    /// Held key (Space-style temp hand). Shift is allowed as an extra modifier
+    /// when the binding itself does not require Shift (45° constrain while panning).
+    pub fn key_down(&self, input: &egui::InputState, action: Action) -> bool {
+        let Some(b) = self.binding(action) else {
+            return false;
+        };
+        let Some(key) = str_to_key(&b.key) else {
+            return false;
+        };
+        if !input.key_down(key) {
+            return false;
+        }
+        if input.modifiers.ctrl != b.ctrl || input.modifiers.alt != b.alt {
+            return false;
+        }
+        if b.shift && !input.modifiers.shift {
+            return false;
+        }
+        true
+    }
+
+    /// Bound egui key for an action (for raw-input Space tracking).
+    pub fn bound_key(&self, action: Action) -> Option<Key> {
+        self.binding(action)
+            .and_then(|b| str_to_key(&b.key))
+    }
+
+    /// Key + ctrl/alt for hold-style actions (TempHand).
+    pub fn hold_key_mods(&self, action: Action) -> Option<(Key, bool, bool)> {
+        let b = self.binding(action)?;
+        let key = str_to_key(&b.key)?;
+        Some((key, b.ctrl, b.alt))
     }
 
     pub fn reset_defaults(&mut self) {
@@ -220,11 +311,16 @@ fn default_bindings() -> Vec<(Action, KeyBinding)> {
     vec![
         (Undo, KeyBinding::new(Key::Z, true, false, false)),
         (Redo, KeyBinding::new(Key::Y, true, false, false)),
+        (RedoAlternate, KeyBinding::new(Key::Z, true, true, false)),
         (Deselect, KeyBinding::new(Key::D, true, false, false)),
         (NewLayer, KeyBinding::new(Key::L, true, false, false)),
         (
             DeleteSelection,
             KeyBinding::new(Key::Delete, false, false, false),
+        ),
+        (
+            DeleteSelectionAlternate,
+            KeyBinding::new(Key::Backspace, false, false, false),
         ),
         (Brush, KeyBinding::new(Key::B, false, false, false)),
         (Pencil, KeyBinding::new(Key::P, false, false, false)),
@@ -259,6 +355,15 @@ fn default_bindings() -> Vec<(Action, KeyBinding)> {
         (ZoomReset, KeyBinding::new(Key::Num0, true, false, false)),
         (Preferences, KeyBinding::new(Key::Comma, true, false, false)),
         (ReapplyTheme, KeyBinding::new(Key::F5, false, false, false)),
+        (SwapFgBg, KeyBinding::new(Key::X, false, false, false)),
+        (ResetColors, KeyBinding::new(Key::D, false, false, false)),
+        (Save, KeyBinding::new(Key::S, true, false, false)),
+        (Open, KeyBinding::new(Key::O, true, false, false)),
+        (NewDocument, KeyBinding::new(Key::N, true, false, false)),
+        (Copy, KeyBinding::new(Key::C, true, false, false)),
+        (Paste, KeyBinding::new(Key::V, true, false, false)),
+        (TempHand, KeyBinding::new(Key::Space, false, false, false)),
+        (ToggleProfiler, KeyBinding::new(Key::F12, false, false, false)),
     ]
 }
 

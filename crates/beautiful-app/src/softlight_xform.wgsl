@@ -122,15 +122,18 @@ fn sample_float(doc: vec2<f32>) -> vec4<f32> {
     if bw < 1.0 || bh < 1.0 {
         return vec4<f32>(0.0);
     }
+    // Sample in whole document pixels (pixel-art Free Transform).
+    let px = floor(doc.x) + 0.5;
+    let py = floor(doc.y) + 0.5;
     let sx = u.free_scale.x;
     let sy = u.free_scale.y;
-    let hw = max(abs(sx) * bw * 0.5, 0.5) * select(-1.0, 1.0, sx >= 0.0);
-    let hh = max(abs(sy) * bh * 0.5, 0.5) * select(-1.0, 1.0, sy >= 0.0);
+    let hw = max(round(abs(sx) * bw) * 0.5, 0.5) * select(-1.0, 1.0, sx >= 0.0);
+    let hh = max(round(abs(sy) * bh) * 0.5, 0.5) * select(-1.0, 1.0, sy >= 0.0);
     if abs(hw) < 1e-6 || abs(hh) < 1e-6 {
         return vec4<f32>(0.0);
     }
-    let rx = doc.x - u.free_center.x;
-    let ry = doc.y - u.free_center.y;
+    let rx = px - u.free_center.x;
+    let ry = py - u.free_center.y;
     let c = u.free_sincos.y;
     let s = u.free_sincos.x;
     let lx = c * rx + s * ry;
@@ -140,8 +143,11 @@ fn sample_float(doc: vec2<f32>) -> vec4<f32> {
     if uu < -1.0 || uu > 1.0 || vv < -1.0 || vv > 1.0 {
         return vec4<f32>(0.0);
     }
-    let fx = (uu + 1.0) * 0.5;
-    let fy = (vv + 1.0) * 0.5;
+    // Nearest texel center in baseline/baked float.
+    let tx = floor(((uu + 1.0) * 0.5) * bw);
+    let ty = floor(((vv + 1.0) * 0.5) * bh);
+    let fx = (clamp(tx, 0.0, bw - 1.0) + 0.5) / bw;
+    let fy = (clamp(ty, 0.0, bh - 1.0) + 0.5) / bh;
     var f = textureSampleLevel(float_tex, float_samp, vec2<f32>(fx, fy), 0.0);
     f.a = f.a * u.float_params.x;
     return f;

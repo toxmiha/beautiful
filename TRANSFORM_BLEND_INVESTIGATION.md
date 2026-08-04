@@ -133,7 +133,7 @@ Fast path (Normal above only): frozen underlay + GPU float pose + cached transpa
 | **Krita** transform mask + Instant Preview | Confirmed | Асинхронная/LOD-подобная регенерация projection; forced instant preview для тяжёлых tool. |
 | **GIMP** | Confirmed (ранее) | composited preview часто optional/off |
 | **Skia / WebRender** | Confirmed | `mix-blend-mode` требует изоляции + корректный backdrop |
-| **PS / CSP / SAI / Procreate** | Hypothesis | закрытые GPU stack; не использовать как «доказанный алгоритм» |
+| **closed peers (hypothesis only)** | Hypothesis | закрытые GPU stack; не использовать как «доказанный алгоритм» |
 
 **Сравнение с Beautiful (без выбора решения):**
 

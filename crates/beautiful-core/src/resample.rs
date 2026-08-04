@@ -241,6 +241,26 @@ pub(crate) fn sample_bicubic(src: &[u8], w: u32, h: u32, x: f32, y: f32) -> [u8;
     sample_bicubic_a(src, w, h, x, y, -0.5)
 }
 
+/// Point sample with a transform/warp resample filter.
+pub fn sample_with_filter(
+    filter: ResampleFilter,
+    src: &[u8],
+    w: u32,
+    h: u32,
+    x: f32,
+    y: f32,
+) -> [u8; 4] {
+    match filter {
+        ResampleFilter::Nearest => sample_nearest(src, w, h, x, y),
+        ResampleFilter::Bilinear => sample_bilinear(src, w, h, x, y),
+        ResampleFilter::BicubicSmoother => sample_bicubic_a(src, w, h, x, y, -0.25),
+        ResampleFilter::BicubicSharper => sample_bicubic_a(src, w, h, x, y, -1.0),
+        ResampleFilter::Bicubic
+        | ResampleFilter::BicubicAutomatic
+        | ResampleFilter::Lanczos3 => sample_bicubic(src, w, h, x, y),
+    }
+}
+
 fn resample_bicubic_a(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32, a: f32) -> Vec<u8> {
     let mut out = vec![0u8; (dw * dh * 4) as usize];
     if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
@@ -280,6 +300,22 @@ pub(crate) fn resample_rgba(
     }
 }
 
+/// Scale side length without an artificial max factor (only min size / overflow guard).
+fn free_scaled_dim(side: u32, scale: f32) -> u32 {
+    let v = (side as f64) * (scale as f64);
+    if !v.is_finite() {
+        return 1;
+    }
+    let r = v.round();
+    if r < 1.0 {
+        1
+    } else if r > (u32::MAX as f64) {
+        u32::MAX
+    } else {
+        r as u32
+    }
+}
+
 /// Build free-transform pixels from a baseline: signed scale (neg = flip), then rotate.
 ///
 /// Returns `(pixels, width, height)` centered conceptually — caller places by center.
@@ -297,10 +333,10 @@ pub fn apply_free_transform_rgba(
     }
     let flip_h = scale_x < 0.0;
     let flip_v = scale_y < 0.0;
-    let sx = scale_x.abs().clamp(0.01, 32.0);
-    let sy = scale_y.abs().clamp(0.01, 32.0);
-    let dw = ((sw as f32 * sx).round() as u32).max(1);
-    let dh = ((sh as f32 * sy).round() as u32).max(1);
+    let sx = scale_x.abs().max(0.01);
+    let sy = scale_y.abs().max(0.01);
+    let dw = free_scaled_dim(sw, sx);
+    let dh = free_scaled_dim(sh, sy);
     let mut pixels = resample_rgba(src, sw, sh, dw, dh, filter);
     if flip_h {
         flip_pixels_h(&mut pixels, dw, dh);
@@ -311,11 +347,134 @@ pub fn apply_free_transform_rgba(
     if rotation_deg.abs() < 0.05 {
         return (pixels, dw, dh);
     }
-    let (baked, nw, nh, _ox, _oy) = rotate_rgba(&pixels, dw, dh, rotation_deg);
+    let (baked, nw, nh, _ox, _oy) =
+        rotate_rgba_with_filter(&pixels, dw, dh, rotation_deg, filter);
     (baked, nw, nh)
 }
 
+/// Output size of [`apply_free_transform_rgba`] (scale then rotate AABB).
+pub fn free_transform_output_size(
+    sw: u32,
+    sh: u32,
+    scale_x: f32,
+    scale_y: f32,
+    rotation_deg: f32,
+) -> (u32, u32) {
+    if sw == 0 || sh == 0 {
+        return (1, 1);
+    }
+    let sx = scale_x.abs().max(0.01);
+    let sy = scale_y.abs().max(0.01);
+    let dw = free_scaled_dim(sw, sx);
+    let dh = free_scaled_dim(sh, sy);
+    if rotation_deg.abs() < 0.05 {
+        return (dw, dh);
+    }
+    // Cardinal nearest uses exact swap; AABB ceil matches for 90/180/270 too.
+    rotate_bounds_size(dw, dh, rotation_deg)
+}
+
+fn rotate_bounds_size(w: u32, h: u32, deg: f32) -> (u32, u32) {
+    let rad = deg.to_radians();
+    let (s, c) = rad.sin_cos();
+    let cx = w as f32 * 0.5;
+    let cy = h as f32 * 0.5;
+    let corners = [
+        (0.0f32, 0.0),
+        (w as f32, 0.0),
+        (w as f32, h as f32),
+        (0.0, h as f32),
+    ];
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for (x, y) in corners {
+        let dx = x - cx;
+        let dy = y - cy;
+        let rx = c * dx - s * dy;
+        let ry = s * dx + c * dy;
+        min_x = min_x.min(rx);
+        max_x = max_x.max(rx);
+        min_y = min_y.min(ry);
+        max_y = max_y.max(ry);
+    }
+    (
+        (max_x - min_x).ceil().max(1.0) as u32,
+        (max_y - min_y).ceil().max(1.0) as u32,
+    )
+}
+
 pub(crate) fn rotate_rgba(src: &[u8], w: u32, h: u32, deg: f32) -> (Vec<u8>, u32, u32, f32, f32) {
+    rotate_rgba_with_filter(src, w, h, deg, ResampleFilter::Bilinear)
+}
+
+fn rotate_exact_cardinal(
+    src: &[u8],
+    w: u32,
+    h: u32,
+    turns_cw: u32,
+) -> Option<(Vec<u8>, u32, u32, f32, f32)> {
+    let turns = turns_cw % 4;
+    if turns == 0 {
+        return None;
+    }
+    let (nw, nh) = if turns % 2 == 1 { (h, w) } else { (w, h) };
+    let mut out = vec![0u8; (nw * nh * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let si = ((y * w + x) * 4) as usize;
+            if si + 4 > src.len() {
+                continue;
+            }
+            let (dx, dy) = match turns {
+                1 => (h - 1 - y, x),           // 90° CW
+                2 => (w - 1 - x, h - 1 - y),   // 180°
+                3 => (y, w - 1 - x),           // 270° CW
+                _ => continue,
+            };
+            let di = ((dy * nw + dx) * 4) as usize;
+            out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+        }
+    }
+    Some((out, nw, nh, 0.0, 0.0))
+}
+
+pub(crate) fn rotate_rgba_with_filter(
+    src: &[u8],
+    w: u32,
+    h: u32,
+    deg: f32,
+    filter: ResampleFilter,
+) -> (Vec<u8>, u32, u32, f32, f32) {
+    if w == 0 || h == 0 {
+        return (vec![0; 4], 1, 1, 0.0, 0.0);
+    }
+    // Pixel-art: exact remaps for cardinal angles (no float sample).
+    if matches!(filter, ResampleFilter::Nearest) {
+        let r = deg.rem_euclid(360.0);
+        let near = |a: f32| (r - a).abs() < 0.5 || (r - a - 360.0).abs() < 0.5;
+        let turns = if near(0.0) {
+            0
+        } else if near(90.0) {
+            1
+        } else if near(180.0) {
+            2
+        } else if near(270.0) {
+            3
+        } else {
+            4
+        };
+        if turns < 4 {
+            if turns == 0 {
+                return (src.to_vec(), w, h, 0.0, 0.0);
+            }
+            if let Some(exact) = rotate_exact_cardinal(src, w, h, turns) {
+                return exact;
+            }
+        }
+    }
+
     let rad = deg.to_radians();
     let (s, c) = rad.sin_cos();
     let corners = [
@@ -352,7 +511,7 @@ pub(crate) fn rotate_rgba(src: &[u8], w: u32, h: u32, deg: f32) -> (Vec<u8>, u32
             if sx < -1.0 || sy < -1.0 || sx > w as f32 || sy > h as f32 {
                 continue;
             }
-            let sample = sample_bilinear(src, w, h, sx, sy);
+            let sample = sample_with_filter(filter, src, w, h, sx, sy);
             let di = ((py * nw + px) * 4) as usize;
             out[di..di + 4].copy_from_slice(&sample);
         }

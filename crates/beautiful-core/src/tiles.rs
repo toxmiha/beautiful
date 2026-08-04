@@ -772,6 +772,55 @@ impl PaintTileMap {
     }
 }
 
+/// Per-tile stroke coverage (0–1), used for density = stroke opacity.
+#[derive(Debug, Clone, Default)]
+pub struct CoverageTileMap {
+    tiles: HashMap<TileKey, Arc<Vec<f32>>>,
+}
+
+impl CoverageTileMap {
+    pub fn clear(&mut self) {
+        self.tiles.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tiles.is_empty()
+    }
+
+    pub fn ensure_mut(&mut self, key: TileKey) -> &mut [f32] {
+        let entry = self
+            .tiles
+            .entry(key)
+            .or_insert_with(|| Arc::new(vec![0.0; TILE_PIXELS]));
+        Arc::make_mut(entry).as_mut_slice()
+    }
+
+    pub fn take_tiles(&mut self, keys: &[TileKey]) -> Vec<(TileKey, Arc<Vec<f32>>)> {
+        let mut out = Vec::with_capacity(keys.len());
+        for &key in keys {
+            if let Some(arc) = self.tiles.remove(&key) {
+                out.push((key, arc));
+            }
+        }
+        out
+    }
+
+    pub fn put_tiles(&mut self, items: Vec<(TileKey, Arc<Vec<f32>>)>) {
+        for (key, arc) in items {
+            self.tiles.insert(key, arc);
+        }
+    }
+
+    /// Ensure zeroed coverage tiles exist for `keys` (for parallel take).
+    pub fn ensure_keys(&mut self, keys: &[TileKey]) {
+        for &key in keys {
+            self.tiles
+                .entry(key)
+                .or_insert_with(|| Arc::new(vec![0.0; TILE_PIXELS]));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -124,7 +124,7 @@ pub struct BrushSettings {
     pub min_size_pct: f32,
     /// Edge hardness 0 soft … 1 hard.
     pub hardness: f32,
-    /// Density / opacity 0–1.
+    /// Density / stroke opacity 0–1. Airbrush uses it as per-dab flow.
     pub density: f32,
     /// Min density at zero pressure 0–1.
     pub min_density: f32,
@@ -293,7 +293,8 @@ impl BrushSettings {
         brush.pressure_density = false;
         brush.pressure_blending = false;
         brush.pressure_dilution = false;
-        brush.spacing = 0.35;
+        // Engine ignores this for pixel-art (Bresenham); keep 1.0 for UI/docs.
+        brush.spacing = 1.0;
         brush.shape = BrushShape::Square;
         brush.shape_sharpen = 1.0;
         brush.hair = 0.0;
@@ -343,10 +344,10 @@ impl BrushSettings {
             hardness: 0.55,
             density: 0.45,
             min_density: 0.05,
-            blending: 0.35,
-            dilution: 0.15,
-            persistence: 0.65,
-            keep_opacity: true,
+            blending: 0.0,
+            dilution: 0.0,
+            persistence: 0.0,
+            keep_opacity: false,
             pressure_size: true,
             pressure_density: true,
             pressure_blending: true,
@@ -421,6 +422,12 @@ impl BrushSettings {
         self.kind = kind;
     }
 
+    /// Hard square tip (pixel art): binary coverage, no AA fringe.
+    #[inline]
+    pub fn is_pixel_art(&self) -> bool {
+        self.shape == BrushShape::Square && self.hardness >= 0.999
+    }
+
     pub fn effective_size(&self, pressure: f32) -> f32 {
         let p = pressure.clamp(0.0, 1.0);
         let min = (self.size * self.min_size_pct.clamp(0.0, 1.0)).max(0.5);
@@ -481,6 +488,8 @@ pub struct StrokeState {
     pub spacing_acc: f32,
     /// True after the initial dab on pointer-down.
     pub stamped: bool,
+    /// Last integer pixel stamped by the pixel-art path (dedupe + Bresenham).
+    pub last_pixel: Option<(i32, i32)>,
 }
 
 impl Default for StrokeState {
@@ -501,6 +510,7 @@ impl StrokeState {
             active: false,
             spacing_acc: 0.0,
             stamped: false,
+            last_pixel: None,
         }
     }
 
@@ -514,11 +524,13 @@ impl StrokeState {
         self.active = true;
         self.spacing_acc = 0.0;
         self.stamped = false;
+        self.last_pixel = None;
     }
 
     pub fn end(&mut self) {
         self.active = false;
         self.spacing_acc = 0.0;
         self.stamped = false;
+        self.last_pixel = None;
     }
 }

@@ -1,4 +1,4 @@
-//! Below/above active composite cache for live strokes (CSP/Krita backdrop pattern).
+//! Below/above active composite cache for live strokes (Krita backdrop pattern).
 //!
 //! At stroke start we flatten `layers[0..active]` + background into a packed ROI
 //! (`below`). When safe (Normal blend, no clip-to-below above active), we also

@@ -1,7 +1,7 @@
 //! Soft/hard circular brush tip — baked 2D dab mask (Krita/MyPaint-style).
 //!
 //! Soft falloff is a cosine profile that reaches **exactly 0 at the geometric
-//! radius** (Photoshop / Krita convention: brush diameter = visible support).
+//! radius** (Krita convention: brush diameter = visible support).
 //! A 1px AA fringe past `r` only anti-aliases an already-zero toe — it never
 //! truncates residual coverage (the old Gaussian toe was clipped at ~5% α).
 //!
@@ -202,7 +202,7 @@ impl TipCache {
         }
 
         // Soft skirt: raised cosine from core → r (exactly 0 at r).
-        // Equivalent to Photoshop/Krita "soft round" diameter = brush size.
+        // Equivalent to Krita "soft round" diameter = brush size.
         if d >= r {
             return 0.0;
         }

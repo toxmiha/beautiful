@@ -16,9 +16,12 @@ use crate::shape::{
 use crate::stroke_stack::StrokeStack;
 use crate::tip::TipCache;
 use crate::visibility_cache::VisibilityBackdrop;
-use crate::{blend_over, BrushSettings, Layer, Rgba, Selection, Stabilizer, StrokeState, TileBuffer};
+use crate::{
+    blend_over, BrushSettings, DrawingColorSlot, Layer, Rgba, Selection, Stabilizer, StrokeState,
+    TileBuffer,
+};
 
-/// Where a dragged layer lands relative to the hover row (Photoshop-style).
+/// Where a dragged layer lands relative to the hover row (common).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayerDropPlace {
     /// Visually above the target row — sibling with the same parent.
@@ -52,6 +55,9 @@ pub struct Document {
     /// Background swatch (gradient FG→BG, classic dual color).
     #[serde(default = "default_color_bg")]
     pub color_bg: Rgba,
+    /// Which color icon is active for painting / the color wheel (FG · BG · Transparent).
+    #[serde(skip)]
+    pub drawing_slot: DrawingColorSlot,
     /// Gradient tool options.
     #[serde(default)]
     pub gradient: GradientOptions,
@@ -93,11 +99,11 @@ pub struct Document {
     /// Opacity/blend/clip: same sandwich path (plates keyed by content_revision).
     #[serde(skip)]
     property_fast_idx: Option<usize>,
-    /// Free Transform / Move: sandwich plates + floating middle (PS/CSP-style live).
+    /// Free Transform / Move: sandwich plates + floating middle (live-transform live).
     #[serde(skip)]
     transform_sandwich_idx: Option<usize>,
     /// Soft Light GPU underlay: omit non-Normal above only (Normals/opacity stay).
-    /// Soft Light CPU: leave false so Soft Light + Normal stay in underlay (SAI);
+    /// Soft Light CPU: leave false so Soft Light + Normal stay in underlay (local dirty);
     /// live overlay corrects Soft Light∩float only.
     #[serde(skip)]
     pub transform_omit_blend_above: bool,
@@ -149,6 +155,7 @@ impl Document {
             fill: FillOptions::default(),
             feather_radius: 0,
             color_bg: Rgba::WHITE,
+            drawing_slot: DrawingColorSlot::Foreground,
             gradient: GradientOptions::default(),
             shape: ShapeOptions::default(),
             stage: None,
@@ -456,7 +463,7 @@ impl Document {
             self.history.end_stroke(layer, self.width, self.height);
             // Drop float scratch — write-through flush keeps it warm during the
             // stroke; holding it idle scales RAM/CPU with brush footprint.
-            layer.paint_tiles.clear();
+            layer.clear_stroke_scratch();
         }
         if let Some(layer) = self.layers.get(idx) {
             self.history.end_mask_stroke(layer, self.width, self.height);
@@ -745,7 +752,7 @@ impl Document {
         }
     }
 
-    /// Park Ctrl+Move: keep hole + floating until deselect seals (SAI/PS-style).
+    /// Park Ctrl+Move: keep hole + floating until deselect seals (park-until-deselect).
     pub fn park_selection_float(
         &mut self,
         layer_idx: usize,
@@ -1138,7 +1145,7 @@ impl Document {
                     dirty = DirtyRect::full(self.width, self.height);
                     continue;
                 }
-                // Prefer per-tile dirty (SAI-like): avoid reblending empty holes
+                // Prefer per-tile dirty (sparse-tile): avoid reblending empty holes
                 // inside the coarse content_bounds AABB.
                 let n = layer.tiles.painted_tile_count();
                 if n == 0 {
@@ -1261,8 +1268,12 @@ impl Document {
     }
 
     /// Current floating-selection footprint, padded for filtered edges.
+    /// Visually empty float (lifted empty selection) → `None` so moves skip composite.
     pub fn floating_selection_dirty_rect(&self) -> Option<DirtyRect> {
         let f = self.selection.floating.as_ref()?;
+        if f.is_visually_empty() {
+            return None;
+        }
         const PAD: f32 = 8.0;
         Some(DirtyRect {
             x0: (f.x - PAD).floor().max(0.0) as u32,
@@ -1313,7 +1324,7 @@ impl Document {
         self.revision = self.revision.wrapping_add(1);
     }
 
-    /// Enable PS/CSP-style live transform / Ctrl+Move: warm sandwich plates, floating in middle.
+    /// Enable live-transform live transform / Ctrl+Move: warm sandwich plates, floating in middle.
     /// Drag frames use [`Self::touch_transform_display`] + [`Self::try_sync_transform_sandwich`]
     /// (O(ROI) below memcpy + float + above), not a full stack composite.
     pub fn begin_transform_sandwich(&mut self, layer_idx: usize) {
@@ -1600,6 +1611,16 @@ impl Document {
     }
 
     pub fn move_floating_selection(&mut self, dx: f32, dy: f32) {
+        let empty = self
+            .selection
+            .floating
+            .as_ref()
+            .is_some_and(|f| f.is_visually_empty());
+        // Empty lift: ants still move; no composite/upload (was melting FPS on void AABB).
+        if empty {
+            self.selection.move_floating(dx, dy);
+            return;
+        }
         let Some(old) = self.floating_selection_dirty_rect() else {
             return;
         };
@@ -1839,7 +1860,7 @@ impl Document {
         let radius = (self.brush.size * 0.5 * (0.35 + 0.65 * pressure.clamp(0.0, 1.0))).max(0.5);
         let hardness = self.brush.hardness.clamp(0.0, 1.0);
         let density = self.brush.density.clamp(0.05, 1.0) * pressure.clamp(0.05, 1.0);
-        // Foreground luminance → mask gray (PS-like).
+        // Foreground luminance → mask gray.
         let c = self.brush.color;
         let target = ((c.r as u16 + c.g as u16 + c.b as u16) / 3) as u8;
         let dirty = {
@@ -2538,7 +2559,7 @@ impl Document {
 
         // Plates cover the dirty OBB only — NOT the whole viewport.
         // Keep pad tight: Soft Light transform updates old∪new float every move;
-        // 256px pad was rebuilding huge plates and killing FPS (unlike SAI local dirty).
+        // 256px pad was rebuilding huge plates and killing FPS (unlike local dirty).
         let pad = if apply.width().saturating_mul(apply.height()) > 1_000_000 {
             64
         } else {
@@ -2913,7 +2934,7 @@ impl Document {
                 layer.width = nw;
                 layer.height = nh;
                 layer.tiles.resize_empty(nw, nh);
-                layer.paint_tiles.clear();
+                layer.clear_stroke_scratch();
                 continue;
             }
             if layer.is_adjustment() {
@@ -3655,7 +3676,7 @@ impl Document {
         })
     }
 
-    /// Paste RGBA as a new layer, pixels centered on the canvas (Photoshop/Krita).
+    /// Paste RGBA as a new layer, pixels centered on the canvas (Krita).
     /// Not a floating selection — baked into layer tiles immediately.
     pub fn paste_rgba_as_new_layer(&mut self, width: u32, height: u32, pixels: Vec<u8>) -> bool {
         if width == 0 || height == 0 || pixels.len() < (width * height * 4) as usize {
@@ -4450,7 +4471,7 @@ impl Document {
     }
 
     /// pick the topmost visible paintable layer with opaque pixels at (x,y).
-    /// Photoshop / SAI / Krita Auto-Select: top→bottom, bbox + alpha threshold.
+    /// common paint-app Auto-Select: top→bottom, bbox + alpha threshold.
     pub fn pick_layer_at(&mut self, x: f32, y: f32) -> bool {
         const ALPHA_THRESHOLD: u8 = 5;
         let xi = x.floor() as i32;
@@ -4591,7 +4612,7 @@ impl Document {
                 layer.width = nw;
                 layer.height = nh;
                 layer.tiles.resize_empty(nw, nh);
-                layer.paint_tiles.clear();
+                layer.clear_stroke_scratch();
                 continue;
             }
             if layer.is_adjustment() {

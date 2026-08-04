@@ -48,6 +48,10 @@ pub struct FileState {
     pub path: Option<PathBuf>,
     pub show_new_dialog: bool,
     pub show_save_as: bool,
+    /// First-ever save: propose creating a root save folder.
+    pub show_save_root_prompt: bool,
+    /// Editable path shown in the save-root prompt.
+    pub save_root_prompt_path: String,
     pub new_canvas: NewCanvasDialog,
     pub save_as_format: ExportFormat,
     pub status: Option<String>,
@@ -179,6 +183,8 @@ impl Default for FileState {
             path: None,
             show_new_dialog: false,
             show_save_as: false,
+            show_save_root_prompt: false,
+            save_root_prompt_path: String::new(),
             new_canvas: NewCanvasDialog::default(),
             save_as_format: ExportFormat::Txmh,
             status: None,
@@ -962,6 +968,145 @@ impl FileState {
         format!("untitled.{ext}")
     }
 
+    /// Folder under the configured save root (collection subfolder when set).
+    pub fn suggested_save_dir(&self, settings: &AppSettings) -> Option<PathBuf> {
+        let root = settings.configured_save_root()?;
+        let collection = self
+            .pending_meta
+            .as_ref()
+            .map(|m| m.collection.trim())
+            .filter(|c| {
+                !c.is_empty() && *c != COLLECTION_RECENT && *c != COLLECTION_ALL
+            });
+        if let Some(coll) = collection {
+            let safe: String = coll
+                .chars()
+                .map(|c| if r#"<>:"/\|?*"#.contains(c) { '_' } else { c })
+                .collect::<String>()
+                .trim()
+                .to_owned();
+            if !safe.is_empty() {
+                let sub = root.join(safe);
+                let _ = std::fs::create_dir_all(&sub);
+                return Some(sub);
+            }
+        }
+        let _ = std::fs::create_dir_all(&root);
+        Some(root)
+    }
+
+    pub fn begin_save_root_prompt(&mut self, settings: &AppSettings) {
+        self.show_save_as = false;
+        self.show_save_root_prompt = true;
+        if self.save_root_prompt_path.trim().is_empty() {
+            self.save_root_prompt_path = settings
+                .configured_save_root()
+                .unwrap_or_else(AppSettings::suggested_save_root)
+                .display()
+                .to_string();
+        }
+    }
+
+    /// Draw first-save root prompt. Returns true when the caller should open Save As.
+    pub fn show_save_root_prompt_ui(
+        &mut self,
+        ctx: &egui::Context,
+        settings: &mut AppSettings,
+    ) -> bool {
+        if !self.show_save_root_prompt {
+            return false;
+        }
+        let mut accept = false;
+        let mut decline = false;
+        let center = ctx.content_rect().center();
+        let frame = egui::Frame::window(&ctx.style())
+            .fill(theme::menu_fill())
+            .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+            .corner_radius(10.0)
+            .inner_margin(egui::Margin::same(14))
+            .shadow(egui::Shadow {
+                offset: [0, 8],
+                blur: 24,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(160),
+            });
+        egui::Window::new("Корневая папка сейвов")
+            .collapsible(false)
+            .resizable(false)
+            .movable(true)
+            .order(egui::Order::Foreground)
+            .default_pos(center - egui::vec2(240.0, 120.0))
+            .frame(frame)
+            .show(ctx, |ui| {
+                theme::apply_opaque_chrome(ui);
+                ui.set_min_width(440.0);
+                ui.label(theme::label(
+                    "Beautiful может хранить холсты в одной корневой папке.",
+                ));
+                ui.add_space(4.0);
+                ui.label(theme::label_dim(
+                    "Коллекции создают подпапки внутри корня. Путь можно позже изменить в Preferences → System.",
+                ));
+                ui.add_space(10.0);
+                ui.label(theme::label_dim("Папка:"));
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.save_root_prompt_path)
+                            .desired_width(320.0)
+                            .text_color(theme::TEXT),
+                    );
+                    if theme::menu_btn(ui, theme::label("Обзор…")).clicked() {
+                        let mut dlg = rfd::FileDialog::new();
+                        let start = PathBuf::from(self.save_root_prompt_path.trim());
+                        if start.is_dir() {
+                            dlg = dlg.set_directory(&start);
+                        } else if let Some(parent) = start.parent().filter(|p| p.is_dir()) {
+                            dlg = dlg.set_directory(parent);
+                        }
+                        if let Some(p) = dlg.pick_folder() {
+                            self.save_root_prompt_path = p.display().to_string();
+                        }
+                    }
+                });
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if theme::menu_btn(ui, theme::label("Согласиться")).clicked() {
+                        accept = true;
+                    }
+                    if theme::menu_btn(ui, theme::label("Отказаться")).clicked() {
+                        decline = true;
+                    }
+                });
+            });
+
+        if accept {
+            let path = {
+                let trimmed = self.save_root_prompt_path.trim();
+                if trimmed.is_empty() {
+                    AppSettings::suggested_save_root()
+                } else {
+                    PathBuf::from(trimmed)
+                }
+            };
+            match settings.accept_save_root(path) {
+                Ok(()) => {
+                    self.show_save_root_prompt = false;
+                    self.show_save_as = true;
+                    return true;
+                }
+                Err(e) => {
+                    self.set_status(format!("Не удалось создать папку: {e}"), true);
+                }
+            }
+        } else if decline {
+            let _ = settings.decline_save_root();
+            self.show_save_root_prompt = false;
+            self.show_save_as = true;
+            return true;
+        }
+        false
+    }
+
     pub fn export_dialog(&mut self, document: &mut Document, format: ExportFormat) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter(format.label(), &[format.extension()])
@@ -1092,6 +1237,7 @@ impl FileState {
                 .collapsible(false)
                 .resizable(false)
                 .movable(true)
+                .order(egui::Order::Foreground)
                 .default_pos(center - egui::vec2(150.0, 40.0))
                 .frame(frame)
                 .show(ctx, |ui| {
@@ -1129,6 +1275,7 @@ impl FileState {
                 .collapsible(false)
                 .resizable(false)
                 .movable(true)
+                .order(egui::Order::Foreground)
                 .default_pos(center - egui::vec2(150.0, 40.0))
                 .frame(frame)
                 .show(ctx, |ui| {
@@ -1165,6 +1312,7 @@ impl FileState {
                 .collapsible(false)
                 .resizable(false)
                 .movable(true)
+                .order(egui::Order::Foreground)
                 .default_pos(center - egui::vec2(180.0, 80.0))
                 .frame(frame)
                 .show(ctx, |ui| {

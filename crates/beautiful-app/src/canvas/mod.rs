@@ -94,6 +94,9 @@ pub struct CanvasState {
     pub resample_drag: beautiful_core::ResampleFilter,
     pub resample_preview: beautiful_core::ResampleFilter,
     pub resample_final: beautiful_core::ResampleFilter,
+    /// Bumped on every Free/Warp CPU bake so Soft Light GPU reuploads float tex
+    /// even when pose size stays the same (integer scale steps / filter change).
+    xform_bake_gen: u64,
     /// Primary button held (tracked across frames from raw events).
     pub lmb_down: bool,
     /// Space held (pan modifier) from raw key events.
@@ -127,13 +130,15 @@ pub struct CanvasState {
     xform_live_tex: Option<TextureHandle>,
     /// Re-upload live tex from floating (after warp resample).
     xform_live_stale: bool,
+    /// Zoom used for `xform_live_tex` filter bucket (NEAREST vs LINEAR).
+    xform_live_filter_zoom: f32,
     /// Layers above the transform slot (frozen plate), painted after the float.
     xform_above_tex: Option<(TextureHandle, u32, u32, u32, u32, u64)>,
     /// Skip Soft Light GPU re-upload while float/Soft Light pixels & ROI are unchanged.
     /// `(content_revision, float_w, float_h, atlas_w, atlas_h, clip_qx0, clip_qy0, clip_qx1, clip_qy1)`.
     softlight_gpu_upload_key: Option<(u64, u32, u32, u32, u32, u32, u32, u32, u32)>,
-    /// Float tex uploaded for this content_revision + size (don't reupload float on atlas-only moves).
-    softlight_gpu_float_key: Option<(u64, u32, u32)>,
+    /// Float tex uploaded for this baked pose (rev + size + pose bits).
+    softlight_gpu_float_key: Option<(u64, u32, u32, u32, u32, u32, u32, u32)>,
     /// Expand-only Soft∪float clip for this transform session (prevents z-order flicker).
     softlight_clip_frozen: Option<beautiful_core::DirtyRect>,
     /// Soft Light GPU pass armed for this frame (skip egui float).
@@ -156,6 +161,13 @@ pub struct CanvasState {
     gpu_invalidate: bool,
     /// Ctrl+drag selection pixel move (not Free Transform).
     sel_pixel_move: Option<SelPixelMoveSession>,
+    /// КРУЛЕР Free Transform (Ctrl+LKM float + CPU bake — no GPU overlay session).
+    pub kruler_xform: Option<KrulerXformSession>,
+    /// Kruler-only: underlay (hole) uploaded once; drag skips sync (does not touch Transform flags).
+    kruler_underlay_frozen: bool,
+    /// Kruler-only float ColorImage tex (separate from `xform_live_tex`).
+    kruler_float_tex: Option<TextureHandle>,
+    kruler_float_stale: bool,
     /// Selection shape before marquee/lasso gesture (for undo).
     sel_gesture_before: Option<SelectionSnap>,
     /// Base mask for Add/Subtract live preview.
@@ -212,6 +224,7 @@ impl Default for CanvasState {
             resample_drag: beautiful_core::ResampleFilter::Bilinear,
             resample_preview: beautiful_core::ResampleFilter::BicubicAutomatic,
             resample_final: beautiful_core::ResampleFilter::BicubicAutomatic,
+            xform_bake_gen: 0,
             lmb_down: false,
             space_down: false,
             stroke_input_done: false,
@@ -230,6 +243,7 @@ impl Default for CanvasState {
             selection_mask_texture: None,
             xform_live_tex: None,
             xform_live_stale: false,
+            xform_live_filter_zoom: 0.0,
             xform_above_tex: None,
             softlight_gpu_upload_key: None,
             softlight_gpu_float_key: None,
@@ -244,6 +258,10 @@ impl Default for CanvasState {
             editing_mask: false,
             gpu_invalidate: false,
             sel_pixel_move: None,
+            kruler_xform: None,
+            kruler_underlay_frozen: false,
+            kruler_float_tex: None,
+            kruler_float_stale: false,
             sel_gesture_before: None,
             sel_combine_base: None,
             sel_combine_op: SelectionCombine::Replace,
@@ -266,11 +284,67 @@ impl CanvasState {
         self.warp_proxy = None;
     }
 
+    fn resample_filter_key(f: beautiful_core::ResampleFilter) -> u32 {
+        match f {
+            beautiful_core::ResampleFilter::Nearest => 0,
+            beautiful_core::ResampleFilter::Bilinear => 1,
+            beautiful_core::ResampleFilter::Bicubic => 2,
+            beautiful_core::ResampleFilter::BicubicSmoother => 3,
+            beautiful_core::ResampleFilter::BicubicSharper => 4,
+            beautiful_core::ResampleFilter::BicubicAutomatic => 5,
+            beautiful_core::ResampleFilter::Lanczos3 => 6,
+        }
+    }
+
+    /// Soft Light GPU caches float by key — bump so same-size rebakes reupload.
+    pub fn note_xform_bake(&mut self) {
+        self.xform_bake_gen = self.xform_bake_gen.wrapping_add(1);
+        self.xform_live_stale = true;
+        self.softlight_gpu_float_key = None;
+    }
+
+    /// Re-run live bake after Resample panel change (Dragging/Preview/Final).
+    pub fn rebake_xform_after_resample_change(&mut self, document: &mut Document) {
+        if kruler_editing(self) {
+            rebake_kruler_after_resample_change(self, document, self.resample_drag);
+            return;
+        }
+        if !self.transform_editing() {
+            return;
+        }
+        let keep_overlay = document.selection.floating_overlay_only;
+        match self.transform_mode {
+            TransformMode::Free => {
+                let posed = self.free_xform.as_ref().is_some_and(|fx| {
+                    (fx.scale_x - 1.0).abs() > 1e-4
+                        || (fx.scale_y - 1.0).abs() > 1e-4
+                        || fx.rotation_deg.abs() > 1e-3
+                });
+                if posed {
+                    crate::canvas::transform_free::refresh_free_transform_preview(
+                        self,
+                        document,
+                        self.resample_drag,
+                    );
+                }
+            }
+            TransformMode::Distort | TransformMode::Mesh => {
+                if self.warp_lattice_edited || self.warp_controls.is_some() {
+                    crate::canvas::transform_warp::refresh_warp_preview_full(self, document);
+                }
+            }
+        }
+        if keep_overlay {
+            document.selection.floating_overlay_only = true;
+        }
+    }
+
     #[allow(dead_code)]
     pub fn clear_free_xform(&mut self) {
         self.free_xform = None;
         self.xform_live_tex = None;
         self.xform_live_stale = false;
+        self.xform_live_filter_zoom = 0.0;
         self.xform_above_tex = None;
         self.softlight_gpu_upload_key = None;
         self.softlight_gpu_float_key = None;
@@ -298,29 +372,39 @@ impl CanvasState {
         document.release_transform_plates();
     }
 
-    /// Upload baseline once for Free pose quad / Mesh warp mesh (same source tex).
-    pub fn ensure_xform_live_tex(&mut self, ctx: &Context, _document: &Document) {
-        if self.xform_live_tex.is_some() && !self.xform_live_stale {
+    /// Upload live Free Transform tex from the **baked** floating buffer (Nearest).
+    /// Drawing is 1 doc-px → screen mapping — never stretch the baseline.
+    pub fn ensure_xform_live_tex(&mut self, ctx: &Context, document: &Document) {
+        let filter_changed = self.xform_live_tex.is_some()
+            && texture_filter_bucket(self.zoom)
+                != texture_filter_bucket(self.xform_live_filter_zoom);
+        if self.xform_live_tex.is_some() && !self.xform_live_stale && !filter_changed {
             return;
         }
-        let Some((pix, w, h, _, _)) = self.transform_baseline.as_ref() else {
+        let (pix, w, h) = if let Some(f) = document.selection.floating.as_ref() {
+            if f.width == 0 || f.height == 0 || f.pixels.len() < (f.width as usize) * (f.height as usize) * 4
+            {
+                return;
+            }
+            (&f.pixels, f.width, f.height)
+        } else if let Some((pix, w, h, _, _)) = self.transform_baseline.as_ref() {
+            if *w == 0 || *h == 0 || pix.len() < (*w as usize) * (*h as usize) * 4 {
+                return;
+            }
+            (pix, *w, *h)
+        } else {
             return;
         };
-        if *w == 0 || *h == 0 || pix.len() < (*w as usize) * (*h as usize) * 4 {
-            return;
-        }
-        let image = ColorImage::from_rgba_unmultiplied([*w as usize, *h as usize], pix);
-        let opts = TextureOptions {
-            magnification: TextureFilter::Linear,
-            minification: TextureFilter::Linear,
-            ..TextureOptions::LINEAR
-        };
+        let image = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], pix);
+        // Always NEAREST for transform preview — pixel grid must stay crisp.
+        let opts = TextureOptions::NEAREST;
         if let Some(tex) = self.xform_live_tex.as_mut() {
             tex.set(image, opts);
         } else {
             self.xform_live_tex = Some(ctx.load_texture("xform_live", image, opts));
         }
         self.xform_live_stale = false;
+        self.xform_live_filter_zoom = self.zoom;
     }
 
     /// Sync frozen "layers above" plate for correct z-order over the live float.
@@ -355,7 +439,7 @@ impl CanvasState {
     }
 
     /// Soft/Hard Light live: CPU only SoftLight∩(old∪new) — not the whole float.
-    /// Soft Light outside the float stays in the frozen underlay (SAI-style dirty).
+    /// Soft Light outside the float stays in the frozen underlay (local dirty).
     /// Path A Overlay / B GPU InStack Soft Light / C fallback (no CPU Soft cube).
     pub fn transform_blend_path_label(&self, document: &Document) -> &'static str {
         if !document.transform_live_blend_needed() {
@@ -721,14 +805,15 @@ impl CanvasState {
                         fx.scale_x,
                         fx.scale_y,
                         fx.rotation_deg,
-                        self.resample_final,
+                        self.resample_preview,
                     );
                     if let Some(f) = document.selection.floating.as_mut() {
                         f.pixels = pixels;
                         f.width = nw;
                         f.height = nh;
-                        f.x = fx.center_x - nw as f32 * 0.5;
-                        f.y = fx.center_y - nh as f32 * 0.5;
+                        f.x = (fx.center_x - nw as f32 * 0.5).round();
+                        f.y = (fx.center_y - nh as f32 * 0.5).round();
+                        f.rotation_deg = 0.0;
                     }
                 }
             }
@@ -752,16 +837,79 @@ impl CanvasState {
             (Some(fx), Some(b)) => (fx, b),
             _ => return None,
         };
+        // Prefer Nearest-baked floating drawn 1:1. Fall back to baseline + GPU pose
+        // only when bake size does not match the current Free pose yet.
+        let posed = (fx.scale_x - 1.0).abs() > 1e-4
+            || (fx.scale_y - 1.0).abs() > 1e-4
+            || fx.rotation_deg.abs() > 1e-3;
+        let (ew, eh) = beautiful_core::free_transform_output_size(
+            *bw,
+            *bh,
+            fx.scale_x,
+            fx.scale_y,
+            fx.rotation_deg,
+        );
+        let (float_pix, float_w, float_h, center, scale, rot) =
+            if let Some(f) = document.selection.floating.as_ref() {
+                let pixels_ok = f.width > 0
+                    && f.height > 0
+                    && f.pixels.len() >= (f.width as usize) * (f.height as usize) * 4;
+                // Identity: floating buffer is the cutout. Posed: require bake size.
+                let use_baked = pixels_ok
+                    && if posed {
+                        f.width == ew && f.height == eh
+                    } else {
+                        true
+                    };
+                if use_baked {
+                    (
+                        f.pixels.as_slice(),
+                        f.width,
+                        f.height,
+                        (f.x + f.width as f32 * 0.5, f.y + f.height as f32 * 0.5),
+                        (1.0_f32, 1.0_f32),
+                        0.0_f32,
+                    )
+                } else {
+                    (
+                        base.as_slice(),
+                        *bw,
+                        *bh,
+                        (fx.center_x, fx.center_y),
+                        (fx.scale_x, fx.scale_y),
+                        fx.rotation_deg,
+                    )
+                }
+            } else {
+                (
+                    base.as_slice(),
+                    *bw,
+                    *bh,
+                    (fx.center_x, fx.center_y),
+                    (fx.scale_x, fx.scale_y),
+                    fx.rotation_deg,
+                )
+            };
         let layers = self.instack_gpu_layers(document)?;
         let (descs, count, atlas_w, atlas_h) = Self::instack_gpu_descs(&layers)?;
         let clip = self.instack_session_clip(document)?;
         // Expand-only: Soft∪float grows sticky (stops Path B flicker at 8192 edge).
         self.softlight_clip_frozen = Some(clip);
-        let float_key = (document.content_revision, *bw, *bh);
+        // Invalidate float tex when bake content changes (same size ≠ same pixels).
+        let float_key = (
+            document.content_revision,
+            float_w,
+            float_h,
+            fx.scale_x.to_bits(),
+            fx.scale_y.to_bits(),
+            fx.rotation_deg.to_bits(),
+            self.xform_bake_gen as u32,
+            Self::resample_filter_key(self.resample_drag),
+        );
         let atlas_key = (
             document.content_revision,
-            *bw,
-            *bh,
+            float_w,
+            float_h,
             atlas_w,
             atlas_h,
             clip.x0,
@@ -778,7 +926,7 @@ impl CanvasState {
                     "instack_gpu",
                     &format!(
                         "upload float={}x{} atlas={}x{} layers={} clip={}x{}..{}x{} float_up={} atlas_up={}",
-                        bw, bh, atlas_w, atlas_h, count, clip.x0, clip.y0, clip.x1, clip.y1,
+                        float_w, float_h, atlas_w, atlas_h, count, clip.x0, clip.y0, clip.x1, clip.y1,
                         need_float, need_atlas
                     ),
                 );
@@ -789,7 +937,11 @@ impl CanvasState {
             };
             if !crate::canvas_gpu::sync_softlight_sources_partial(
                 rs,
-                if need_float { Some((base.as_slice(), *bw, *bh)) } else { None },
+                if need_float {
+                    Some((float_pix, float_w, float_h))
+                } else {
+                    None
+                },
                 atlas.as_ref().map(|a| (a.as_slice(), atlas_w, atlas_h)),
             ) {
                 crate::action_log::log("instack_gpu", "sync_softlight_sources failed");
@@ -807,11 +959,11 @@ impl CanvasState {
         Some(crate::canvas_gpu::SoftLightXformParams {
             doc_w: document.width as f32,
             doc_h: document.height as f32,
-            free_center: (fx.center_x, fx.center_y),
-            free_scale: (fx.scale_x, fx.scale_y),
-            free_rot_deg: fx.rotation_deg,
-            baseline_w: *bw as f32,
-            baseline_h: *bh as f32,
+            free_center: center,
+            free_scale: scale,
+            free_rot_deg: rot,
+            baseline_w: float_w as f32,
+            baseline_h: float_h as f32,
             float_opacity: document.floating_transform_opacity(),
             float_mode: Self::blend_mode_gpu_u(document.floating_transform_blend_mode())
                 .unwrap_or(5),
@@ -853,6 +1005,73 @@ impl CanvasState {
         self.transform_session.is_some()
             && document.selection.floating_overlay_only
             && self.xform_underlay_frozen
+    }
+
+    /// Kruler exception: frozen hole underlay + CPU float egui overlay (no Transform session).
+    pub fn kruler_live_overlay_active(&self, document: &Document) -> bool {
+        self.kruler_xform.is_some()
+            && document.selection.floating_overlay_only
+            && self.kruler_underlay_frozen
+            && self.transform_session.is_none()
+    }
+
+    /// Upload Kruler float tex from baked floating pixels (CPU). Move only repositions paint rect.
+    pub fn ensure_kruler_float_tex(&mut self, ctx: &Context, document: &Document) {
+        if self.kruler_float_tex.is_some() && !self.kruler_float_stale {
+            return;
+        }
+        let Some(f) = document.selection.floating.as_ref() else {
+            return;
+        };
+        if f.width == 0
+            || f.height == 0
+            || f.pixels.len() < (f.width as usize) * (f.height as usize) * 4
+        {
+            return;
+        }
+        let image = ColorImage::from_rgba_unmultiplied(
+            [f.width as usize, f.height as usize],
+            &f.pixels,
+        );
+        let opts = TextureOptions::NEAREST;
+        if let Some(tex) = self.kruler_float_tex.as_mut() {
+            tex.set(image, opts);
+        } else {
+            self.kruler_float_tex = Some(ctx.load_texture("kruler_float", image, opts));
+        }
+        self.kruler_float_stale = false;
+    }
+
+    pub fn note_kruler_underlay_synced(&mut self, document: &Document) {
+        if self.kruler_xform.is_none()
+            || !document.selection.floating_overlay_only
+            || self.kruler_underlay_frozen
+        {
+            return;
+        }
+        let idx = document
+            .selection
+            .floating_layer
+            .unwrap_or(document.active_layer)
+            .min(document.layers.len().saturating_sub(1));
+        if document.transform_above_needs_backdrop() {
+            self.kruler_underlay_frozen = true;
+            return;
+        }
+        let has_above = document.layers.iter().enumerate().any(|(i, layer)| {
+            i > idx && layer.visible && !layer.is_folder && layer.opacity > 0.0
+        });
+        if has_above && self.xform_above_tex.is_none() {
+            self.dirty = true;
+            return;
+        }
+        self.kruler_underlay_frozen = true;
+    }
+
+    pub fn clear_kruler_overlay_state(&mut self) {
+        self.kruler_underlay_frozen = false;
+        self.kruler_float_tex = None;
+        self.kruler_float_stale = false;
     }
 
     /// Bake Free pose into floating + baseline so Distort/Mesh inherit the result.
@@ -1062,9 +1281,9 @@ impl CanvasState {
         self.gradient_session.is_some()
     }
 
-    /// Transform or gradient session — other tools locked.
+    /// Transform / gradient / КРУЛЕР Free Transform — other tools locked.
     pub fn tool_edit_lock(&self) -> bool {
-        self.transform_editing() || self.gradient_editing()
+        self.transform_editing() || self.gradient_editing() || kruler_editing(self)
     }
 
     pub fn mirror_gradient(&mut self, document: &mut Document) {
@@ -1206,7 +1425,7 @@ impl CanvasState {
         self.xform_live_stale = false;
         self.xform_above_tex = None;
         let mesh_mode = matches!(*tool, WorkspaceTool::Warp)
-            || (matches!(*tool, WorkspaceTool::Transform)
+            || (tool.is_xform_family()
                 && matches!(
                     self.transform_mode,
                     TransformMode::Distort | TransformMode::Mesh
@@ -1231,7 +1450,7 @@ impl CanvasState {
                     n,
                     &pts,
                     handles.as_ref().map(|v| v.as_slice()),
-                    false,
+                    self.resample_final,
                     true,
                     subdiv,
                 );
@@ -1406,11 +1625,17 @@ impl CanvasState {
         tool: WorkspaceTool,
         raw: &egui::RawInput,
         wgpu_rs: Option<&eframe::egui_wgpu::RenderState>,
+        temp_hand: Option<(egui::Key, bool, bool)>,
     ) -> bool {
         self.stroke_input_done = false;
         // Allow deferred thumbs to rebuild on the frame *after* stroke release.
         self.thumbs_deferred = false;
-        crate::stroke_input::apply_raw_button_state(raw, &mut self.lmb_down, &mut self.space_down);
+        crate::stroke_input::apply_raw_button_state(
+            raw,
+            &mut self.lmb_down,
+            &mut self.space_down,
+            temp_hand,
+        );
 
         // Press started off-canvas (UI / panels / workspace surround) — don't paint until release.
         let pressed = raw.events.iter().any(|e| {
@@ -1735,7 +1960,7 @@ impl CanvasState {
         self.coarsen_hold_until = Some(std::time::Instant::now() + Self::COARSEN_HOLD);
     }
 
-    /// Resolve zoom pivot for this notch: use live cursor (PS/SAI), fall back to
+    /// Resolve zoom pivot for this notch: use live cursor (cursor-follow), fall back to
     /// last-good screen point. Do **not** freeze the pivot for hundreds of ms —
     /// that made zoom-in then zoom-out walk the canvas when the mouse moved.
     pub fn resolve_zoom_pivot(&mut self, cursor: Option<egui::Pos2>) -> Option<egui::Pos2> {
@@ -1801,6 +2026,9 @@ impl CanvasState {
 
     /// Cancel in-progress or parked Ctrl+Move (restore pre-lift pixels). True if handled.
     pub fn cancel_sel_pixel_move(&mut self, document: &mut Document) -> bool {
+        if cancel_kruler_transform(self, document) {
+            return true;
+        }
         if let Some(sess) = self.sel_pixel_move.take() {
             if sess.lifted {
                 document.end_transform_sandwich();
@@ -1971,7 +2199,7 @@ impl CanvasState {
 
     /// Viewport footprint in document space (may extend past the canvas).
     ///
-    /// Like Photoshop's Navigator red box: full viewport AABB, not clamped to the
+    /// Like the Navigator red box: full viewport AABB, not clamped to the
     /// document. Clamping corners independently collapsed the rect into a line/point
     /// when the view hung off an edge; skipping out-of-doc corners via
     /// [`screen_to_canvas`] did the same.
@@ -2345,7 +2573,9 @@ impl CanvasState {
                 || self.thumbs_deferred
                 || self.opacity_dragging
                 || self.gradient_editing()
-                || self.transform_editing())
+                || self.transform_editing()
+                || kruler_editing(self)
+                || self.sel_pixel_move.is_some())
         {
             return self.nav_thumb.as_ref().map(|t| t.id());
         }
@@ -2471,7 +2701,7 @@ impl CanvasState {
         self.mask_thumbs.clear();
     }
 
-    /// Photoshop-style grayscale mask thumbnail.
+    /// common grayscale mask thumbnail.
     pub fn ensure_mask_thumb(
         &mut self,
         ctx: &Context,
@@ -2610,6 +2840,7 @@ mod coords;
 mod overlays;
 mod selection_input;
 mod transform_free;
+mod kruler;
 mod transform_warp;
 /// LOD: bilinear when zoomed out (hides pixel grid), nearest when zoomed in.
 mod types;
@@ -2619,6 +2850,7 @@ pub(crate) use coords::*;
 pub(crate) use overlays::*;
 pub(crate) use selection_input::*;
 pub(crate) use transform_free::*;
+pub(crate) use kruler::*;
 pub(crate) use transform_warp::*;
 pub(crate) use types::*;
 pub use coords::ZOOM_STEP;

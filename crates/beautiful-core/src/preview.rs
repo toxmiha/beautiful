@@ -1,7 +1,7 @@
 //! Gallery / OS-style previews from the document file itself (no AppData thumbs).
 //!
 //! - `.txmh` — `preview.jpg` ZIP member (written on save)
-//! - `.psd` — Image Resource 1036 (Photoshop thumbnail JPEG)
+//! - `.psd` — Image Resource 1036 (PSD embedded thumbnail JPEG)
 //! - raster — downsample the image file
 //!
 //! Never `fs::read` the whole document for TXMH/PSD — that thrashes RAM when
@@ -170,7 +170,7 @@ fn extract_psd_thumbnail_jpeg_from_path(path: &Path) -> Option<Vec<u8>> {
     extract_psd_thumbnail_jpeg_from_resources(&resources)
 }
 
-/// Photoshop Image Resource 1036 (or legacy 1033) → JPEG payload (from full PSD bytes).
+/// PSD Image Resource 1036 (or legacy 1033) → JPEG payload (from full PSD bytes).
 pub fn extract_psd_thumbnail_jpeg(psd: &[u8]) -> Option<Vec<u8>> {
     if psd.len() < 26 || &psd[0..4] != b"8BPS" {
         return None;

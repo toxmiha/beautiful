@@ -1,7 +1,5 @@
 /target
-/dist/*.pdb
-/dist/*.exe
-/dist/Beautiful-Alpha/
+/dist/
 /logs/
 /backup/
 **/.cursor/

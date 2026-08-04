@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::mask_tiles::AlphaTileMap;
-use crate::tiles::{PaintTileMap, TileBuffer, TileKey, TILE_BYTES};
+use crate::tiles::{CoverageTileMap, PaintTileMap, TileBuffer, TileKey, TILE_BYTES};
 
 /// Coverage contributed by enabled masks on every containing folder.
 ///
@@ -97,6 +97,12 @@ pub struct Layer {
     /// Touched-tile float scratch (premultiplied linear). Not serialized.
     #[serde(skip)]
     pub paint_tiles: PaintTileMap,
+    /// Layer pixels at stroke start (COW Arc tiles). Density recomposites from this.
+    #[serde(skip)]
+    pub stroke_baseline: Option<TileBuffer>,
+    /// Per-pixel stroke coverage 0–1 for opacity-style density. Not serialized.
+    #[serde(skip)]
+    pub stroke_cov: CoverageTileMap,
     pub width: u32,
     pub height: u32,
     pub visible: bool,
@@ -113,10 +119,10 @@ pub struct Layer {
     /// TXMH v4 still serializes as dense `mask.zst` via [`AlphaTileMap::to_dense`].
     #[serde(skip)]
     pub mask: Option<AlphaTileMap>,
-    /// When false, mask exists but does not affect composite (like PS disable).
+    /// When false, mask exists but does not affect composite (disabled mask).
     #[serde(default = "default_true_folder")]
     pub mask_enabled: bool,
-    /// Photoshop-style link between layer pixels and mask (move/transform together).
+    /// common link between layer pixels and mask (move/transform together).
     #[serde(default = "default_true_folder")]
     pub mask_linked: bool,
     #[serde(default)]
@@ -236,6 +242,8 @@ impl From<LayerSerde> for Layer {
             name: s.name,
             tiles,
             paint_tiles: PaintTileMap::default(),
+            stroke_baseline: None,
+            stroke_cov: CoverageTileMap::default(),
             width: s.width,
             height: s.height,
             visible: s.visible,
@@ -263,6 +271,8 @@ impl Clone for Layer {
             name: self.name.clone(),
             tiles: self.tiles.clone_shared(),
             paint_tiles: PaintTileMap::default(),
+            stroke_baseline: None,
+            stroke_cov: CoverageTileMap::default(),
             width: self.width,
             height: self.height,
             visible: self.visible,
@@ -306,7 +316,7 @@ pub enum BlendMode {
     HardLight,
     Difference,
     Exclusion,
-    /// Linear Dodge (Add) — Photoshop / Krita.
+    /// Linear Dodge (Add) — Krita.
     LinearDodge,
     LinearBurn,
     VividLight,
@@ -450,6 +460,8 @@ impl Layer {
             name: name.into(),
             tiles: TileBuffer::new(width, height),
             paint_tiles: PaintTileMap::default(),
+            stroke_baseline: None,
+            stroke_cov: CoverageTileMap::default(),
             width,
             height,
             visible: true,
@@ -489,6 +501,8 @@ impl Layer {
             name: name.into(),
             tiles: TileBuffer::new(width, height),
             paint_tiles: PaintTileMap::default(),
+            stroke_baseline: None,
+            stroke_cov: CoverageTileMap::default(),
             width,
             height,
             visible: true,
@@ -526,7 +540,7 @@ impl Layer {
 
     pub fn clear(&mut self) {
         self.tiles.clear();
-        self.paint_tiles.clear();
+        self.clear_stroke_scratch();
     }
 
     /// Painted tile AABB in document space (None if empty / folder).
@@ -538,7 +552,14 @@ impl Layer {
     }
 
     pub fn invalidate_paint_f(&mut self) {
+        self.clear_stroke_scratch();
+    }
+
+    /// Drop float paint scratch + stroke opacity state (end of stroke / abort).
+    pub fn clear_stroke_scratch(&mut self) {
         self.paint_tiles.clear();
+        self.stroke_cov.clear();
+        self.stroke_baseline = None;
     }
 
     /// Flatten to dense RGBA (I/O / legacy helpers). Expensive on huge docs.
@@ -551,7 +572,7 @@ impl Layer {
 
     /// Replace layer contents from a dense RGBA buffer.
     pub fn set_pixels_dense(&mut self, dense: Vec<u8>) {
-        self.paint_tiles.clear();
+        self.clear_stroke_scratch();
         // Crop / expand update `layer.width` before blit — tiles must match or
         // blit_from_dense reads the dense buffer with the wrong stride and corrupts the canvas.
         if self.tiles.width != self.width || self.tiles.height != self.height {
@@ -590,7 +611,7 @@ impl Layer {
         self.width = w;
         self.height = h;
         self.tiles.resize_empty(w, h);
-        self.paint_tiles.clear();
+        self.clear_stroke_scratch();
     }
 
     /// Approx painted tile RAM for this layer.
@@ -785,7 +806,7 @@ pub fn blend_over(dst: &mut [u8], src: &[u8], src_a: f32, mode: BlendMode) {
     if out_a <= 0.0 {
         return;
     }
-    // Fast path: Soft/Hard Light via 8-bit LUTs (CSP/PS-style channel tables).
+    // Fast path: Soft/Hard Light via 8-bit LUTs (common-style channel tables).
     if matches!(mode, BlendMode::SoftLight | BlendMode::HardLight) && src_a >= 0.999 && dst_a >= 0.999
     {
         let table = match mode {

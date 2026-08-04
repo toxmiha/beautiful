@@ -1,15 +1,15 @@
 //! Mesh / FFD / Coons warp evaluation and rasterization.
 
-use crate::resample::{sample_bicubic, sample_bilinear, sample_nearest};
+use crate::resample::{sample_with_filter, ResampleFilter};
 
-/// Industry-style tessellation density (Photoshop Smart Object warp uses ~25px
+/// Industry-style tessellation density (typical mesh warp uses ~25px
 /// between subdivision lines when converting BezierSurface → Mesh).
 ///
 /// Returns total samples across the full lattice (not per cell).
 pub fn warp_live_tess_steps(src_w: u32, src_h: u32, grid_n: usize) -> usize {
     let n = grid_n.max(2);
     let long = src_w.max(src_h).max(1) as f32;
-    // ~12 doc-px per segment for live preview (smoother than PS's 25 apply default;
+    // ~12 doc-px per segment for live preview (smoother than a typical 25px apply default;
     // still cheap enough for egui Mesh).
     const PX_PER_SEG: f32 = 12.0;
     let steps = (long / PX_PER_SEG).ceil() as usize;
@@ -39,14 +39,14 @@ pub fn mesh_warp_rgba(
     sh: u32,
     grid_n: usize,
     controls: &[(f32, f32)],
-    nearest: bool,
+    filter: ResampleFilter,
 ) -> (Vec<u8>, u32, u32, f32, f32) {
-    mesh_warp_rgba_ex(src, sw, sh, grid_n, controls, None, nearest, 6)
+    mesh_warp_rgba_ex(src, sw, sh, grid_n, controls, None, filter, 6)
 }
 
 /// Same as [`mesh_warp_rgba`] with explicit tessellation density (`subdiv` 2..=48).
 ///
-/// - `node_handles = None` → **bilinear FFD** + inverse-map raster + bicubic (Mesh).
+/// - `node_handles = None` → **bilinear FFD** + inverse-map raster (Mesh).
 /// - `Some(...)` → Coons Bezier forward tessellation (Distort).
 ///
 /// Prefer [`warp_bake_cell_subdiv`] over a fixed constant — industry warps
@@ -58,7 +58,7 @@ pub fn mesh_warp_rgba_ex(
     grid_n: usize,
     controls: &[(f32, f32)],
     node_handles: Option<&[[Option<(f32, f32)>; 4]]>,
-    nearest: bool,
+    filter: ResampleFilter,
     subdiv: u32,
 ) -> (Vec<u8>, u32, u32, f32, f32) {
     let n = grid_n.max(2);
@@ -120,7 +120,7 @@ pub fn mesh_warp_rgba_ex(
             .into_par_iter()
             .map(|(cx, cy)| {
                 raster_ffd_cell_inverse(
-                    src, sw, sh, controls, n, cx, cy, nearest, origin_x, origin_y, ow, oh,
+                    src, sw, sh, controls, n, cx, cy, filter, origin_x, origin_y, ow, oh,
                 )
             })
             .collect()
@@ -138,7 +138,7 @@ pub fn mesh_warp_rgba_ex(
                     cx,
                     cy,
                     subdiv,
-                    nearest,
+                    filter,
                     origin_x,
                     origin_y,
                     ow,
@@ -464,7 +464,7 @@ pub fn split_warp_crosswise(
     Some((new_pts, new_hs, new_n))
 }
 
-/// Insert one vertical (`axis=0`) or horizontal (`axis=1`) control line (PS directional split).
+/// Insert one vertical (`axis=0`) or horizontal (`axis=1`) control line (directional split).
 pub fn split_warp_axis(
     controls: &[(f32, f32)],
     node_handles: &[[Option<(f32, f32)>; 4]],
@@ -694,7 +694,7 @@ pub fn apply_warp_whisker_drag(
     }
 }
 
-/// Facing handle on a neighbor toward `selected` (secondary whisker in PS).
+/// Facing handle on a neighbor toward `selected` (secondary whisker ).
 /// Returns `(neighbor_idx, dir)` where dir is 0=+U,1=-U,2=+V,3=-V.
 pub fn adjacent_secondary_whiskers(grid_n: usize, selected: usize) -> [(usize, u8); 4] {
     let n = grid_n.max(2);
@@ -948,7 +948,7 @@ pub fn nearest_warp_bezier_edge(
     best
 }
 
-/// Bend a Bezier edge by moving its two handles; endpoints stay fixed (PS grid-line drag).
+/// Bend a Bezier edge by moving its two handles; endpoints stay fixed (grid-line drag).
 /// Influence is localized along the edge by `t` (click near an end mostly moves that handle).
 pub fn bend_warp_edge_handles(
     controls: &[(f32, f32)],
@@ -1443,7 +1443,7 @@ fn raster_bicubic_cell(
     cx: usize,
     cy: usize,
     subdiv: usize,
-    nearest: bool,
+    filter: ResampleFilter,
     origin_x: f32,
     origin_y: f32,
     ow: u32,
@@ -1490,11 +1490,11 @@ fn raster_bicubic_cell(
             let i11 = i01 + 1;
             raster_textured_triangle(
                 &mut local, lw, lh, lox as f32, loy as f32, pts[i00], pts[i10], pts[i11],
-                srcs[i00], srcs[i10], srcs[i11], src, sw, sh, nearest,
+                srcs[i00], srcs[i10], srcs[i11], src, sw, sh, filter,
             );
             raster_textured_triangle(
                 &mut local, lw, lh, lox as f32, loy as f32, pts[i00], pts[i11], pts[i01],
-                srcs[i00], srcs[i11], srcs[i01], src, sw, sh, nearest,
+                srcs[i00], srcs[i11], srcs[i01], src, sw, sh, filter,
             );
         }
     }
@@ -1504,7 +1504,7 @@ fn raster_bicubic_cell(
     (local, lw, lh, ox, oy)
 }
 
-/// Inverse-map one FFD cell (Stage 4) and sample with bicubic (Stage 5).
+/// Inverse-map one FFD cell (Stage 4) and sample with the chosen filter (Stage 5).
 fn raster_ffd_cell_inverse(
     src: &[u8],
     sw: u32,
@@ -1513,7 +1513,7 @@ fn raster_ffd_cell_inverse(
     n: usize,
     cx: usize,
     cy: usize,
-    nearest: bool,
+    filter: ResampleFilter,
     origin_x: f32,
     origin_y: f32,
     ow: u32,
@@ -1557,11 +1557,7 @@ fn raster_ffd_cell_inverse(
             let v = cy as f32 + fv;
             let sx = u / n1 * swf;
             let sy = v / n1 * shf;
-            let sample = if nearest {
-                sample_nearest(src, sw, sh, sx, sy)
-            } else {
-                sample_bicubic(src, sw, sh, sx, sy)
-            };
+            let sample = sample_with_filter(filter, src, sw, sh, sx, sy);
             let di = ((py * lw + px) * 4) as usize;
             local[di..di + 4].copy_from_slice(&sample);
         }
@@ -1587,7 +1583,7 @@ fn raster_textured_triangle(
     src: &[u8],
     sw: u32,
     sh: u32,
-    nearest: bool,
+    filter: ResampleFilter,
 ) {
     let min_x = p0.0.min(p1.0).min(p2.0).floor() as i32;
     let max_x = p0.0.max(p1.0).max(p2.0).ceil() as i32;
@@ -1617,11 +1613,7 @@ fn raster_textured_triangle(
             }
             let sx = w0 * s0.0 + w1 * s1.0 + w2 * s2.0;
             let sy = w0 * s0.1 + w1 * s1.1 + w2 * s2.1;
-            let sample = if nearest {
-                sample_nearest(src, sw, sh, sx, sy)
-            } else {
-                sample_bilinear(src, sw, sh, sx, sy)
-            };
+            let sample = sample_with_filter(filter, src, sw, sh, sx, sy);
             let di = ((oy as u32 * ow + ox as u32) * 4) as usize;
             out[di..di + 4].copy_from_slice(&sample);
         }
