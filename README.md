@@ -19,7 +19,7 @@ Get the latest Windows build from **[Releases](https://github.com/toxmiha/beauti
 |---|---|
 | Stage | **Alpha 0.4.7** |
 | Stability | Unstable — bugs are expected |
-| Tools progress | About **~7%** of planned tools implemented |
+| Tools progress | About **~70%** of planned tools implemented |
 | License | [MIT](LICENSE) |
 | Audience | Early / beta testers |
 
