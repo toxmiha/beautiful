@@ -84,7 +84,7 @@ fn main() -> eframe::Result {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Beautiful · v3-hotpath")
+            .with_title("Beautiful · Alpha 0.4.7")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([960.0, 640.0])
             .with_transparent(!opaque),
