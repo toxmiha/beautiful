@@ -1,8 +1,36 @@
+**Language:** English | [Русский](README.ru.md)
+
 # Beautiful
 
-Lightweight digital painting app in Rust.
+**Beautiful** is an open-source digital painting app.
 
-**Status:** Phase A done; save/undo/warp/filters/gallery shipped. Live tracker: [`ROADMAP.md`](ROADMAP.md).
+> **Alpha** — not stable. Expect bugs and unfinished tools. This build is published on GitHub for **beta testers** who want to try early builds and help with feedback.
+
+A **beta** release is planned later.
+
+## Status
+
+| | |
+|---|---|
+| Stage | **Alpha** |
+| Stability | Unstable — bugs are expected |
+| Tools progress | About **~7%** of planned tools implemented |
+| License | [MIT](LICENSE) |
+| Audience | Early / beta testers |
+
+## What it is
+
+- A program for **drawing and painting**
+- **Full UI customization** — rearrange and personalize the interface
+- **Addons** supported
+- **Open source** (MIT)
+
+## What’s next
+
+- Finish and rework the **brush system**
+- Continue **performance / optimization** work
+- Grow the toolset toward a fuller painting workflow
+- Move from alpha toward a **beta** release
 
 ## Stack
 
@@ -39,15 +67,7 @@ cargo run -p beautiful-app --release
 | Eraser | `E` |
 | New layer | `Ctrl+L` |
 
-Draw with pen or mouse (left button). Pressure bar shown in the status line.
-
-## Roadmap (high level)
-
-- [x] Phase A — canvas, brush, stabilizer, layers, UI
-- [x] Phase B — save/load (TXMH/PNG/JPEG/PSD), undo _(WinTab still open)_
-- [ ] Phase C — animation timeline + onion skin
-- [x] Phase D — mesh / distort / free transform _(polish)_
-- [~] Phase E — custom features _(see `ROADMAP.md` P0–P4)_
+Draw with pen or mouse (left button). Pressure is shown in the status line.
 
 ## Project layout
 
@@ -57,25 +77,8 @@ crates/
   beautiful-app/    eframe desktop app
 ```
 
-## Diagnostics MCP
+More detail: [`ROADMAP.md`](ROADMAP.md).
 
-Project MCP server `beautiful-diagnostics` lets the agent run compile checks without guessing.
+## License
 
-| Tool | What it does |
-|------|----------------|
-| `cargo_check` | Structured Rust errors with `file:line` |
-| `cargo_build` | Full build + linker errors |
-| `cargo_test` | Unit tests |
-| `project_info` | Toolchain + workspace crates |
-
-Config: `.cursor/mcp.json`  
-Server: `tools/beautiful-mcp/server.mjs`
-
-After adding/changing MCP config, reload MCP in Cursor (**Settings → MCP → refresh**, or restart Cursor).
-
-## Tablet setup (XP-Pen Artist 16 Pro Gen 2)
-
-1. Install the latest driver from [xp-pen.com](https://www.xp-pen.com/)
-2. Enable **Windows Ink** in driver settings if pressure is missing
-3. Calibrate the display in the driver panel
-4. Map tablet buttons to `B`, `E`, `Ctrl+Z` in the driver
+MIT — see [LICENSE](LICENSE).
