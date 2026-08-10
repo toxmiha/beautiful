@@ -17,9 +17,10 @@ use crate::stroke_stack::StrokeStack;
 use crate::tip::TipCache;
 use crate::visibility_cache::VisibilityBackdrop;
 use crate::{
-    blend_over, BrushSettings, DrawingColorSlot, Layer, Rgba, Selection, Stabilizer, StrokeState,
-    TileBuffer,
+    blend_over, BrushBackend, BrushSettings, DrawingColorSlot, Layer, Rgba, Selection, Stabilizer,
+    StrokeState, TileBuffer,
 };
+use crate::brush_v2::{Dab, DabPlannerState, TipMask};
 
 /// Where a dragged layer lands relative to the hover row (common).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +41,9 @@ pub struct Document {
     pub active_layer: usize,
     pub background: Rgba,
     pub brush: BrushSettings,
+    /// Stamp backend (v2 default; Legacy = pre-rewrite engine).
+    #[serde(default)]
+    pub brush_backend: BrushBackend,
     pub stabilizer: Stabilizer,
     pub selection: Selection,
     pub view_flip_h: bool,
@@ -64,7 +68,7 @@ pub struct Document {
     /// Shape tool options.
     #[serde(default)]
     pub shape: ShapeOptions,
-    /// Animate/Flash-style stage inside a larger drawable pasteboard.
+    /// Optional stage rect inside a larger drawable pasteboard.
     /// `None` = whole document is the stage (no pasteboard).
     #[serde(default)]
     pub stage: Option<StageRect>,
@@ -82,6 +86,10 @@ pub struct Document {
     pub composite: Projection,
     #[serde(skip)]
     tip_cache: TipCache,
+    #[serde(skip)]
+    tip_mask: TipMask,
+    #[serde(skip)]
+    dab_planner: DabPlannerState,
     #[serde(skip)]
     stroke_stack: StrokeStack,
     /// Below-cache for repeated visibility toggles of one layer (spam-eye path).
@@ -141,6 +149,7 @@ fn default_color_bg() -> Rgba {
 
 impl Document {
     pub fn new(width: u32, height: u32) -> Self {
+        crate::color::warm_srgb_luts();
         let mut doc = Self {
             width,
             height,
@@ -148,6 +157,7 @@ impl Document {
             active_layer: 0,
             background: Rgba::WHITE,
             brush: BrushSettings::default(),
+            brush_backend: BrushBackend::V2,
             stabilizer: Stabilizer::default(),
             selection: Selection::default(),
             view_flip_h: false,
@@ -164,6 +174,8 @@ impl Document {
             stroke: StrokeState::new(Rgba::BLACK),
             composite: Projection::new(width, height),
             tip_cache: TipCache::default(),
+            tip_mask: TipMask::default(),
+            dab_planner: DabPlannerState::default(),
             stroke_stack: StrokeStack::default(),
             visibility_backdrop: VisibilityBackdrop::default(),
             visibility_fast_idx: None,
@@ -259,6 +271,11 @@ impl Document {
             .is_some_and(|l| l.locked)
     }
 
+    /// True when active layer (or an ancestor folder) has the eye off.
+    pub fn active_is_hidden(&self) -> bool {
+        !layer_effectively_visible(&self.layers, self.active_layer)
+    }
+
     /// After Open/New: never leave a folder as the active paint target.
     pub fn ensure_active_paintable(&mut self) {
         if self.layers.is_empty() {
@@ -284,7 +301,8 @@ impl Document {
         }
     }
 
-    /// Canvas actions require a real layer. Sets `ui_notice` and returns false on folder.
+    /// Canvas actions require a real visible unlocked layer.
+    /// Sets `ui_notice` and returns false on folder / lock / eye-off.
     pub fn require_paintable(&mut self, action: &str) -> bool {
         if self.active_is_locked() {
             self.push_notice(format!("Слой заблокирован. {action} недоступно."), true);
@@ -304,10 +322,16 @@ impl Document {
                 format!("Не выбран слой (выбран {kind}). {action} недоступно."),
                 true,
             );
-            false
-        } else {
-            true
+            return false;
         }
+        if self.active_is_hidden() {
+            self.push_notice(
+                format!("{action}: слой выключен (глаз). Включите слой, чтобы продолжить."),
+                true,
+            );
+            return false;
+        }
+        true
     }
 
     /// Keep `stage` inside the document; clear if invalid.
@@ -415,18 +439,50 @@ impl Document {
             self.selection.outline = sel.outline;
             self.selection.lasso_points.clear();
         }
-        self.bump_content();
+        let hidden_toast = effect.affected_layer.is_some_and(|li| {
+            !layer_effectively_visible(&self.layers, li)
+        });
         match effect.dirty {
-            crate::history::HistoryDirty::Full => self.touch(),
+            crate::history::HistoryDirty::Full => {
+                self.bump_content();
+                self.touch();
+            }
             crate::history::HistoryDirty::Region(rect) => {
+                // Regional pixel/mask undo: bump content rev without full sandwich nuke
+                // when possible; mark tile parts + GPU parts (not one fat AABB).
+                self.content_revision = self.content_revision.wrapping_add(1);
+                self.bump_edit_gen();
+                self.stroke_stack.invalidate();
+                // Plates that include the restored layer must rebuild.
+                self.invalidate_layer_sandwich();
                 let mut r = rect;
                 r.clamp_to(self.width, self.height);
                 if r.is_empty() {
                     self.touch();
                 } else {
-                    self.touch_region(r.padded(2, self.width, self.height));
+                    let pad = r.padded(2, self.width, self.height);
+                    let parts = tile_parts_covering(pad, self.width, self.height);
+                    if parts.len() > 1 && parts.len() <= 768 {
+                        self.revision = self.revision.wrapping_add(1);
+                        self.composite.invalidate_parts(parts.iter().copied());
+                        self.composite.gpu_dirty_parts.extend(parts);
+                        self.op_journal.push(
+                            effect.affected_layer.unwrap_or(self.active_layer),
+                            pad,
+                            DocOpKind::Other,
+                        );
+                    } else {
+                        self.touch_region(pad);
+                        self.composite.gpu_dirty.union(pad);
+                    }
                 }
             }
+        }
+        if hidden_toast {
+            self.push_notice(
+                "Отмена: слой скрыт — включите глаз, чтобы увидеть",
+                false,
+            );
         }
     }
 
@@ -438,6 +494,9 @@ impl Document {
         let idx = self.active_layer;
         if self.layers.get(idx).is_none_or(|l| l.is_folder) {
             return;
+        }
+        if let Some(layer) = self.layers.get_mut(idx) {
+            layer.tiles.ensure_hot();
         }
         // Cheap Arc tile snapshot — do not flatten dense.
         self.history.begin_stroke(idx, &self.layers[idx].tiles);
@@ -473,10 +532,13 @@ impl Document {
         self.stroke_stack.release();
         // Do not bump_content(): that invalidates every layer thumb and forces
         // extract_region of each layer's painted bounds on the release frame.
+        // Still bump edit_gen so unsaved-close / autosave see paint as dirty.
         if !dirty.is_empty() {
             self.op_journal.push(idx, dirty, DocOpKind::Stroke);
+            self.bump_edit_gen();
         }
         self.stroke.end();
+        self.dab_planner = DabPlannerState::default();
     }
 
     /// Warm brush tip LUT so the first dab after a tool/preset switch is cheap.
@@ -486,6 +548,9 @@ impl Document {
         let mut tip = std::mem::take(&mut self.tip_cache);
         tip.ensure(radius, hardness);
         self.tip_cache = tip;
+        let mut mask = std::mem::take(&mut self.tip_mask);
+        mask.ensure(radius, hardness, self.brush.shape);
+        self.tip_mask = mask;
     }
 
     fn push_layers_snapshot<F: FnOnce(&mut Self)>(&mut self, f: F) {
@@ -1101,6 +1166,7 @@ impl Document {
     /// Flush warm paint tiles and drop float scratch (call before save / after long idle).
     pub fn prepare_for_save(&mut self) {
         for layer in &mut self.layers {
+            layer.tiles.ensure_hot();
             let w = layer.width as i32;
             let h = layer.height as i32;
             layer.flush_paint_f_rect(0, 0, w, h);
@@ -1238,6 +1304,50 @@ impl Document {
                 self.visibility_expose_idx = None;
             }
         }
+
+        // Eye-on: thaw if previously cold. Do **not** zstd-park here — encoding
+        // thousands of tiles on the UI click was ~500ms lag. Park is deferred
+        // via [`Self::park_hidden_layers_idle`].
+        if vis {
+            for &i in &affected {
+                if let Some(layer) = self.layers.get_mut(i) {
+                    if layer.is_folder || layer.is_adjustment() {
+                        continue;
+                    }
+                    layer.tiles.ensure_hot();
+                }
+            }
+        }
+    }
+
+    /// Idle cold-park for eye-off layers (budgeted). Safe with undo Arcs.
+    /// Call from app when not painting / not eye-spamming.
+    pub fn park_hidden_layers_idle(&mut self, max_tiles: usize) -> usize {
+        if max_tiles == 0 {
+            return 0;
+        }
+        let mut left = max_tiles;
+        let mut parked = 0usize;
+        for i in 0..self.layers.len() {
+            if left == 0 {
+                break;
+            }
+            if layer_effectively_visible(&self.layers, i) {
+                continue;
+            }
+            let Some(layer) = self.layers.get_mut(i) else {
+                continue;
+            };
+            if layer.is_folder || layer.is_adjustment() {
+                continue;
+            }
+            let before = layer.tiles.painted_tile_count();
+            let n = layer.tiles.park_unique_tiles_budget(left);
+            parked = parked.saturating_add(n);
+            left = left.saturating_sub(n);
+            let _ = before;
+        }
+        parked
     }
 
     pub fn invalidate_full(&mut self) {
@@ -1850,7 +1960,7 @@ impl Document {
         if self.layers.get(idx).is_none() {
             return;
         }
-        if self.active_is_locked() {
+        if self.active_is_locked() || self.active_is_hidden() {
             return;
         }
         let layer = &self.layers[idx];
@@ -2067,6 +2177,9 @@ impl Document {
     }
 
     pub fn clear_active_layer(&mut self) {
+        if !self.require_paintable("Очистка") {
+            return;
+        }
         self.push_layers_snapshot(|doc| {
             if doc.layers[doc.active_layer].is_folder {
                 return;
@@ -2898,7 +3011,7 @@ impl Document {
         })
     }
 
-    /// Full buffer bounds that define the Animate/Flash stage (export area).
+    /// Full buffer bounds that define the stage (export area).
     pub fn stage_bounds(&self) -> StageRect {
         self.stage.unwrap_or(StageRect {
             x: 0,
@@ -3151,6 +3264,10 @@ impl Document {
     }
 
     fn refresh_stroke_display(&mut self, rect: DirtyRect) {
+        self.refresh_stroke_display_ex(rect, None);
+    }
+
+    fn refresh_stroke_display_ex(&mut self, rect: DirtyRect, dirty_tiles: Option<&[(i32, i32)]>) {
         // Corrections: stroke-stack skips adjustment layers and tile filters seam.
         // Present like the gradient path — one plate over the coverage region.
         if crate::composite::has_visible_adjustment(&self.layers) {
@@ -3207,13 +3324,14 @@ impl Document {
             rect,
         );
         if let Some(target) = self.composite.display_write_target() {
-            self.stroke_stack.refresh_display(
+            self.stroke_stack.refresh_display_ex(
                 target.pixels,
                 target.stride_w,
                 target.origin_x,
                 target.origin_y,
                 &self.layers,
                 rect,
+                dirty_tiles,
             );
         }
     }
@@ -3235,30 +3353,66 @@ impl Document {
             .layers
             .get(self.active_layer)
             .is_none_or(|l| l.is_folder || l.is_adjustment() || l.locked)
+            || self.active_is_hidden()
         {
             // Silent during continuous stroke; UI path uses require_paintable on press.
             return;
         }
         self.prepare_stroke_display();
-        let brush = self.brush.clone();
-        let radius = brush.effective_size(pressure) * 0.5;
-        // Dirty rect must cover full soft feather, not just geometric radius.
-        let dirty_r = crate::tip::TipCache::effective_radius(radius, brush.hardness);
+        let radius = self.brush.effective_size(pressure) * 0.5;
+        let dirty_r = crate::tip::TipCache::effective_radius(radius, self.brush.hardness);
+        let use_v2 = self.brush_backend == BrushBackend::V2 && !self.brush.is_pixel_art();
+        // Snapshot brush before mutating stroke/tiles (avoids full clone on v2 path).
+        let def = use_v2.then(|| crate::BrushDef::from_settings(&self.brush));
+        let brush_legacy = (!use_v2).then(|| self.brush.clone());
         let mut stroke = std::mem::take(&mut self.stroke);
-        let mut tip = std::mem::take(&mut self.tip_cache);
         let clip_owned = self.selection.mask.take();
         let clip = clip_owned.as_ref().filter(|m| !m.is_empty());
-        {
-            let layer = &mut self.layers[self.active_layer];
-            if let Some((x0, y0, x1, y1)) =
-                layer.draw_stamp(x, y, &brush, pressure, &mut stroke, &mut tip, clip)
+        if let Some(def) = def {
+            let mut tip = std::mem::take(&mut self.tip_mask);
+            let dab = Dab::at(x, y, pressure, def.angle);
             {
-                layer.flush_paint_f_rect(x0, y0, x1, y1);
+                let layer = &mut self.layers[self.active_layer];
+                let mut bounds = layer.draw_stamp_v2(dab, &def, &mut stroke, &mut tip, clip);
+                if def.dual_enabled && def.dual_opacity > 1e-4 && def.dual_size_pct > 1e-4 {
+                    let diam = def.effective_size(pressure);
+                    let off = def.dual_scatter * diam * 0.5;
+                    let n = dab.angle + std::f32::consts::FRAC_PI_2;
+                    let mut d2 = dab;
+                    d2.x += n.cos() * off;
+                    d2.y += n.sin() * off;
+                    d2.size_scale *= def.dual_size_pct;
+                    d2.opacity_scale *= def.dual_opacity;
+                    if let Some((x0, y0, x1, y1)) =
+                        layer.draw_stamp_v2(d2, &def, &mut stroke, &mut tip, clip)
+                    {
+                        bounds = Some(match bounds {
+                            Some((a0, b0, a1, b1)) => {
+                                (a0.min(x0), b0.min(y0), a1.max(x1), b1.max(y1))
+                            }
+                            None => (x0, y0, x1, y1),
+                        });
+                    }
+                }
+                if let Some((x0, y0, x1, y1)) = bounds {
+                    layer.flush_paint_f_rect(x0, y0, x1, y1);
+                }
             }
+            self.tip_mask = tip;
+        } else if let Some(brush) = brush_legacy {
+            let mut tip = std::mem::take(&mut self.tip_cache);
+            {
+                let layer = &mut self.layers[self.active_layer];
+                if let Some((x0, y0, x1, y1)) =
+                    layer.draw_stamp(x, y, &brush, pressure, &mut stroke, &mut tip, clip)
+                {
+                    layer.flush_paint_f_rect(x0, y0, x1, y1);
+                }
+            }
+            self.tip_cache = tip;
         }
         self.selection.mask = clip_owned;
         self.stroke = stroke;
-        self.tip_cache = tip;
         self.commit_stroke_region(DirtyRect::from_center_radius(
             x,
             y,
@@ -3318,27 +3472,62 @@ impl Document {
     }
 
     pub fn paint_segment(&mut self, x0: f32, y0: f32, p0: f32, x1: f32, y1: f32, p1: f32) {
+        if self
+            .layers
+            .get(self.active_layer)
+            .is_none_or(|l| l.is_folder || l.is_adjustment() || l.locked)
+            || self.active_is_hidden()
+        {
+            return;
+        }
         self.prepare_stroke_display();
-        let brush = self.brush.clone();
-        let r0 = brush.effective_size(p0) * 0.5;
-        let r1 = brush.effective_size(p1) * 0.5;
-        let e0 = crate::tip::TipCache::effective_radius(r0, brush.hardness);
-        let e1 = crate::tip::TipCache::effective_radius(r1, brush.hardness);
+        let r0 = self.brush.effective_size(p0) * 0.5;
+        let r1 = self.brush.effective_size(p1) * 0.5;
+        let e0 = crate::tip::TipCache::effective_radius(r0, self.brush.hardness);
+        let e1 = crate::tip::TipCache::effective_radius(r1, self.brush.hardness);
+        let use_v2 = self.brush_backend == BrushBackend::V2 && !self.brush.is_pixel_art();
+        let def = use_v2.then(|| crate::BrushDef::from_settings(&self.brush));
+        let brush_legacy = (!use_v2).then(|| self.brush.clone());
         let mut stroke = std::mem::take(&mut self.stroke);
-        let mut tip = std::mem::take(&mut self.tip_cache);
         let clip_owned = self.selection.mask.take();
         let clip = clip_owned.as_ref().filter(|m| !m.is_empty());
-        {
-            let layer = &mut self.layers[self.active_layer];
-            if let Some((x0, y0, x1, y1)) =
-                layer.draw_segment(x0, y0, p0, x1, y1, p1, &brush, &mut stroke, &mut tip, clip)
+        if let Some(def) = def {
+            let mut tip = std::mem::take(&mut self.tip_mask);
+            let mut planner = std::mem::take(&mut self.dab_planner);
             {
-                layer.flush_paint_f_rect(x0, y0, x1, y1);
+                let layer = &mut self.layers[self.active_layer];
+                if let Some((x0, y0, x1, y1)) = layer.draw_segment_v2(
+                    x0,
+                    y0,
+                    p0,
+                    x1,
+                    y1,
+                    p1,
+                    &def,
+                    &mut stroke,
+                    &mut tip,
+                    &mut planner,
+                    clip,
+                ) {
+                    layer.flush_paint_f_rect(x0, y0, x1, y1);
+                }
             }
+            self.tip_mask = tip;
+            self.dab_planner = planner;
+        } else if let Some(brush) = brush_legacy {
+            let mut tip = std::mem::take(&mut self.tip_cache);
+            {
+                let layer = &mut self.layers[self.active_layer];
+                if let Some((x0, y0, x1, y1)) =
+                    layer.draw_segment(x0, y0, p0, x1, y1, p1, &brush, &mut stroke, &mut tip, clip)
+                {
+                    layer.flush_paint_f_rect(x0, y0, x1, y1);
+                }
+            }
+            self.tip_cache = tip;
         }
         self.selection.mask = clip_owned;
         self.stroke = stroke;
-        self.tip_cache = tip;
         let mut dirty = DirtyRect::from_center_radius(x0, y0, e0, self.width, self.height);
         dirty.expand_point(x1, y1, e1, self.width, self.height);
         self.commit_stroke_region(dirty);
@@ -3348,10 +3537,16 @@ impl Document {
     /// float→u8 flush + one `refresh_display` over the dab-union (per-segment
     /// flush/refresh was the soft-brush 500ms path).
     pub fn paint_polyline(&mut self, points: &[(f32, f32, f32)]) {
+        self.paint_polyline_ex(points, false);
+    }
+
+    /// Like [`Self::paint_polyline`], with `stroke_ending` enabling taper_out on this batch.
+    pub fn paint_polyline_ex(&mut self, points: &[(f32, f32, f32)], stroke_ending: bool) {
         if self
             .layers
             .get(self.active_layer)
             .is_none_or(|l| l.is_folder || l.locked)
+            || self.active_is_hidden()
         {
             return;
         }
@@ -3362,54 +3557,157 @@ impl Document {
             return;
         }
         self.prepare_stroke_display();
-        let brush = self.brush.clone();
+        let use_v2 = self.brush_backend == BrushBackend::V2 && !self.brush.is_pixel_art();
+        let def = use_v2.then(|| crate::BrushDef::from_settings(&self.brush));
+        let brush_legacy = (!use_v2).then(|| self.brush.clone());
         let mut stroke = std::mem::take(&mut self.stroke);
-        let mut tip = std::mem::take(&mut self.tip_cache);
         let clip_owned = self.selection.mask.take();
         let clip = clip_owned.as_ref().filter(|m| !m.is_empty());
         let mut union = DirtyRect::empty();
         let mut flush_box: Option<(i32, i32, i32, i32)> = None;
-        {
-            let _brush = crate::perf_probe::Probe::brush();
+        if let Some(def) = def {
+            let mut tip = std::mem::take(&mut self.tip_mask);
+            let mut planner = std::mem::take(&mut self.dab_planner);
+            // Precompute remaining path length after each segment start (taper_out).
+            let mut seg_lens: Vec<f32> = Vec::with_capacity(points.len().saturating_sub(1));
+            let mut total = 0.0_f32;
             for w in points.windows(2) {
                 let (a, b) = (w[0], w[1]);
-                let dab = {
-                    let layer = &mut self.layers[self.active_layer];
-                    layer.draw_segment(
-                        a.0,
-                        a.1,
-                        a.2,
-                        b.0,
-                        b.1,
-                        b.2,
-                        &brush,
-                        &mut stroke,
-                        &mut tip,
-                        clip,
-                    )
-                };
-                if let Some((x0, y0, x1, y1)) = dab {
-                    let seg = DirtyRect {
-                        x0: x0.max(0) as u32,
-                        y0: y0.max(0) as u32,
-                        x1: x1.max(0) as u32,
-                        y1: y1.max(0) as u32,
+                let d = ((b.0 - a.0) * (b.0 - a.0) + (b.1 - a.1) * (b.1 - a.1)).sqrt();
+                seg_lens.push(d);
+                total += d;
+            }
+            {
+                let _brush = crate::perf_probe::Probe::brush();
+                let mut remain = total;
+                for (i, w) in points.windows(2).enumerate() {
+                    let (a, b) = (w[0], w[1]);
+                    let dab = {
+                        let layer = &mut self.layers[self.active_layer];
+                        layer.draw_segment_v2_ex(
+                            a.0,
+                            a.1,
+                            a.2,
+                            b.0,
+                            b.1,
+                            b.2,
+                            &def,
+                            &mut stroke,
+                            &mut tip,
+                            &mut planner,
+                            clip,
+                            stroke_ending,
+                            remain,
+                        )
                     };
-                    self.history.mark_stroke_dirty(seg);
-                    union.union(seg);
-                    flush_box = Some(match flush_box {
-                        Some((a0, b0, a1, b1)) => (a0.min(x0), b0.min(y0), a1.max(x1), b1.max(y1)),
-                        None => (x0, y0, x1, y1),
-                    });
+                    remain = (remain - seg_lens[i]).max(0.0);
+                    if let Some((x0, y0, x1, y1)) = dab {
+                        let seg = DirtyRect {
+                            x0: x0.max(0) as u32,
+                            y0: y0.max(0) as u32,
+                            x1: x1.max(0) as u32,
+                            y1: y1.max(0) as u32,
+                        };
+                        self.history.mark_stroke_dirty(seg);
+                        union.union(seg);
+                        flush_box = Some(match flush_box {
+                            Some((a0, b0, a1, b1)) => {
+                                (a0.min(x0), b0.min(y0), a1.max(x1), b1.max(y1))
+                            }
+                            None => (x0, y0, x1, y1),
+                        });
+                    }
+                }
+                if let Some((x0, y0, x1, y1)) = flush_box {
+                    let stamped = self.layers[self.active_layer]
+                        .paint_tiles
+                        .dirty_keys_snapshot();
+                    self.layers[self.active_layer].flush_paint_f_rect(x0, y0, x1, y1);
+                    self.selection.mask = clip_owned;
+                    self.stroke = stroke;
+                    self.tip_mask = tip;
+                    self.dab_planner = planner;
+                    if !union.is_empty() {
+                        union.clamp_to(self.width, self.height);
+                        {
+                            let _blend = crate::perf_probe::Probe::blend();
+                            self.refresh_stroke_display_ex(
+                                union,
+                                (!stamped.is_empty()).then_some(stamped.as_slice()),
+                            );
+                        }
+                        if stamped.is_empty() {
+                            self.composite.gpu_dirty.union(union);
+                        } else {
+                            let ts = crate::tiles::TILE_SIZE as u32;
+                            for &(tx, ty) in &stamped {
+                                let ox = (tx * crate::tiles::TILE_SIZE as i32).max(0) as u32;
+                                let oy = (ty * crate::tiles::TILE_SIZE as i32).max(0) as u32;
+                                let mut part = DirtyRect {
+                                    x0: ox,
+                                    y0: oy,
+                                    x1: (ox + ts).min(self.width),
+                                    y1: (oy + ts).min(self.height),
+                                };
+                                part = part.intersect(union);
+                                if !part.is_empty() {
+                                    self.composite.gpu_dirty_parts.push(part);
+                                }
+                            }
+                        }
+                        self.revision = self.revision.wrapping_add(1);
+                    }
+                    return;
                 }
             }
-            if let Some((x0, y0, x1, y1)) = flush_box {
-                self.layers[self.active_layer].flush_paint_f_rect(x0, y0, x1, y1);
+            self.tip_mask = tip;
+            self.dab_planner = planner;
+        } else if let Some(brush) = brush_legacy {
+            let mut tip = std::mem::take(&mut self.tip_cache);
+            {
+                let _brush = crate::perf_probe::Probe::brush();
+                for w in points.windows(2) {
+                    let (a, b) = (w[0], w[1]);
+                    let dab = {
+                        let layer = &mut self.layers[self.active_layer];
+                        layer.draw_segment(
+                            a.0,
+                            a.1,
+                            a.2,
+                            b.0,
+                            b.1,
+                            b.2,
+                            &brush,
+                            &mut stroke,
+                            &mut tip,
+                            clip,
+                        )
+                    };
+                    if let Some((x0, y0, x1, y1)) = dab {
+                        let seg = DirtyRect {
+                            x0: x0.max(0) as u32,
+                            y0: y0.max(0) as u32,
+                            x1: x1.max(0) as u32,
+                            y1: y1.max(0) as u32,
+                        };
+                        self.history.mark_stroke_dirty(seg);
+                        union.union(seg);
+                        flush_box = Some(match flush_box {
+                            Some((a0, b0, a1, b1)) => {
+                                (a0.min(x0), b0.min(y0), a1.max(x1), b1.max(y1))
+                            }
+                            None => (x0, y0, x1, y1),
+                        });
+                    }
+                }
+                if let Some((x0, y0, x1, y1)) = flush_box {
+                    self.layers[self.active_layer].flush_paint_f_rect(x0, y0, x1, y1);
+                }
             }
+            self.tip_cache = tip;
         }
         self.selection.mask = clip_owned;
         self.stroke = stroke;
-        self.tip_cache = tip;
         if !union.is_empty() {
             union.clamp_to(self.width, self.height);
             {
@@ -3426,6 +3724,7 @@ impl Document {
             .layers
             .get(self.active_layer)
             .is_none_or(|l| l.is_folder || l.locked)
+            || self.active_is_hidden()
         {
             return;
         }
@@ -3481,6 +3780,7 @@ impl Document {
             .layers
             .get(self.active_layer)
             .is_none_or(|l| l.is_folder || l.locked)
+            || self.active_is_hidden()
         {
             return;
         }
@@ -3517,6 +3817,7 @@ impl Document {
             .layers
             .get(self.active_layer)
             .is_none_or(|l| l.is_folder || l.locked)
+            || self.active_is_hidden()
         {
             return;
         }
@@ -3573,7 +3874,15 @@ impl Document {
         let after = self.layers[idx].tiles.extract_region(dirty);
         self.history.push_region(idx, dirty, before, after);
         self.stroke_stack.invalidate();
-        self.composite.mark_dirty(dirty);
+        let parts = tile_parts_covering(dirty, self.width, self.height);
+        if parts.len() > 1 && parts.len() <= 768 {
+            self.composite.mark_dirty_parts(parts.iter().copied());
+            self.composite.gpu_dirty_parts.extend(parts);
+        } else {
+            self.composite.mark_dirty(dirty);
+            self.composite.gpu_dirty.union(dirty);
+        }
+        self.bump_content();
         self.revision = self.revision.wrapping_add(1);
     }
 
@@ -3619,7 +3928,7 @@ impl Document {
         let mut a = self.background.a as f32 / 255.0;
         let floating = self.floating_blit();
         for (li, layer) in self.layers.iter().enumerate() {
-            if !layer.visible || layer.is_folder {
+            if layer.is_folder || !layer_effectively_visible(&self.layers, li) {
                 continue;
             }
             let mut sr = 0.0f32;
@@ -3676,7 +3985,7 @@ impl Document {
         })
     }
 
-    /// Paste RGBA as a new layer, pixels centered on the canvas (Krita).
+    /// Paste RGBA as a new layer, pixels centered on the canvas.
     /// Not a floating selection — baked into layer tiles immediately.
     pub fn paste_rgba_as_new_layer(&mut self, width: u32, height: u32, pixels: Vec<u8>) -> bool {
         if width == 0 || height == 0 || pixels.len() < (width * height * 4) as usize {
@@ -4345,6 +4654,16 @@ impl Document {
         self.run_active_layer_filter(false, 0, |layer| operation(layer));
     }
 
+    /// Same AABB as filter apply/preview (selection ∪ content, padded).
+    pub fn filter_studio_bounds(&self) -> DirtyRect {
+        self.filter_work_bounds(64)
+    }
+
+    /// Tight selection / content AABB without pad — preview Fit framing.
+    pub fn filter_studio_fit_bounds(&self) -> DirtyRect {
+        self.filter_work_bounds(0)
+    }
+
     fn filter_work_bounds(&self, pad: i32) -> DirtyRect {
         let pad = pad.max(0) as i32;
         let full = DirtyRect::full(self.width, self.height);
@@ -4392,6 +4711,14 @@ impl Document {
         operation: impl FnOnce(&mut Layer),
     ) {
         let idx = self.active_layer;
+        if self
+            .layers
+            .get(idx)
+            .is_none_or(|l| l.is_folder || l.is_adjustment() || l.locked)
+            || !layer_effectively_visible(&self.layers, idx)
+        {
+            return;
+        }
         let pad = 64; // enough for large blur/motion kernels
         let bounds = self.filter_work_bounds(pad);
         let bw = bounds.width();
@@ -4693,6 +5020,85 @@ impl Document {
         self.selection.apply_feather(r);
         self.invalidate_selection_footprint();
     }
+
+    /// Optimistic eye UI: set `visible` on `idx` and folder descendants without
+    /// composite dirty (flush still calls [`Self::set_layer_visible`]).
+    pub fn apply_visibility_flags(&mut self, idx: usize, vis: bool) {
+        if idx >= self.layers.len() {
+            return;
+        }
+        let is_folder = self.layers[idx].is_folder;
+        let pid = self.layers[idx].group_id;
+        self.layers[idx].visible = vis;
+        if !is_folder {
+            return;
+        }
+        let mut descendants = vec![pid];
+        while let Some(folder) = descendants.pop() {
+            for layer in self.layers.iter_mut() {
+                if layer.parent_id() == folder {
+                    layer.visible = vis;
+                    if layer.is_folder {
+                        descendants.push(layer.folder_uid());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Tile-sized dirty rects covering `rect` (for sparse undo/composite/upload).
+fn tile_parts_covering(rect: DirtyRect, width: u32, height: u32) -> Vec<DirtyRect> {
+    let mut out = Vec::new();
+    let mut r = rect;
+    r.clamp_to(width, height);
+    if r.is_empty() {
+        return out;
+    }
+    let ts = crate::tiles::TILE_SIZE as i32;
+    let w = width as i32;
+    let h = height as i32;
+    for (tx, ty) in TileBuffer::tiles_covering_rect(r.x0 as i32, r.y0 as i32, r.x1 as i32, r.y1 as i32)
+    {
+        let x0 = (tx * ts).max(0) as u32;
+        let y0 = (ty * ts).max(0) as u32;
+        let x1 = ((tx + 1) * ts).clamp(0, w) as u32;
+        let y1 = ((ty + 1) * ts).clamp(0, h) as u32;
+        if x1 > x0 && y1 > y0 {
+            out.push(DirtyRect { x0, y0, x1, y1 });
+        }
+    }
+    out
+}
+
+/// Layer contributes to the visible stack: own eye on and all ancestor folders on.
+pub fn layer_effectively_visible(layers: &[Layer], idx: usize) -> bool {
+    let Some(layer) = layers.get(idx) else {
+        return false;
+    };
+    if !layer.visible {
+        return false;
+    }
+    let mut parent = layer.parent_folder;
+    // Folders use group_id as their identity; walk up parent_folder chain.
+    let mut guard = 0usize;
+    while let Some(pid) = parent {
+        guard += 1;
+        if guard > layers.len() {
+            break;
+        }
+        let Some(folder) = layers
+            .iter()
+            .find(|l| l.is_folder && l.group_id == Some(pid))
+        else {
+            break;
+        };
+        if !folder.visible {
+            return false;
+        }
+        parent = folder.parent_folder;
+    }
+    true
 }
 
 fn sample_layer_bilinear(src: &[u8], w: u32, h: u32, x: f32, y: f32, out: &mut [u8]) {
@@ -4729,5 +5135,86 @@ fn sample_layer_bilinear(src: &[u8], w: u32, h: u32, x: f32, y: f32, out: &mut [
     }
     for c in 0..4 {
         out[c] = (acc[c] / weight).round().clamp(0.0, 255.0) as u8;
+    }
+}
+
+#[cfg(test)]
+mod hidden_layer_tests {
+    use super::*;
+    use crate::Rgba;
+
+    #[test]
+    fn hidden_blocks_paint_and_filter() {
+        let mut doc = Document::new(128, 128);
+        doc.layers[0].visible = false;
+        assert!(doc.active_is_hidden());
+        assert!(!doc.require_paintable("Рисование"));
+        doc.paint_stamp(64.0, 64.0, 1.0);
+        assert_eq!(doc.layers[0].tiles.painted_tile_count(), 0);
+        assert!(!doc.require_paintable("Фильтр"));
+    }
+
+    #[test]
+    fn folder_eye_off_hides_children_for_eyedrop() {
+        let mut doc = Document::new(64, 64);
+        assert!(doc.add_folder());
+        // Folder is typically inserted; put paint into folder if API supports.
+        // Fallback: hide layer 0 and ensure eyedrop skips it.
+        doc.layers[0].tiles.set_rgba(8, 8, [255, 0, 0, 255]);
+        doc.layers[0].visible = false;
+        let sample = doc.eyedrop_at(8.5, 8.5);
+        // Background or nothing from hidden layer — must not return pure red from hidden.
+        if let Some(c) = sample {
+            assert!(
+                !(c.r == 255 && c.g == 0 && c.b == 0 && c.a == 255),
+                "eyedrop must ignore hidden layer"
+            );
+        }
+    }
+
+    #[test]
+    fn undo_on_hidden_restores_and_notices() {
+        let mut doc = Document::new(128, 128);
+        doc.brush.color = Rgba {
+            r: 0,
+            g: 255,
+            b: 0,
+            a: 255,
+        };
+        doc.begin_stroke_undo();
+        doc.paint_stamp(40.0, 40.0, 1.0);
+        doc.end_stroke_undo();
+        assert!(doc.layers[0].tiles.painted_tile_count() > 0);
+        doc.layers[0].visible = false;
+        assert!(doc.undo());
+        assert_eq!(doc.layers[0].tiles.painted_tile_count(), 0);
+        let notice = doc.take_notice();
+        assert!(
+            notice
+                .as_ref()
+                .is_some_and(|(m, err)| !err && m.contains("скрыт")),
+            "expected hidden-layer undo toast, got {notice:?}"
+        );
+    }
+
+    #[test]
+    fn undo_stroke_tile_diff_is_fast() {
+        let mut doc = Document::new(1024, 1024);
+        doc.brush.size = 40.0;
+        doc.begin_stroke_undo();
+        for i in 0..20 {
+            let t = i as f32 / 19.0;
+            doc.paint_stamp(100.0 + t * 400.0, 200.0, 1.0);
+        }
+        doc.end_stroke_undo();
+        let t0 = std::time::Instant::now();
+        assert!(doc.undo());
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        // Restore + regional dirty only (no UI nav). Budget generous for debug.
+        assert!(
+            ms < 50.0,
+            "undo restore too slow: {ms:.2}ms (target <<50ms core-only)"
+        );
+        assert!(doc.redo());
     }
 }

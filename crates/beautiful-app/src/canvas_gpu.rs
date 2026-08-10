@@ -1163,12 +1163,17 @@ pub fn sync_softlight_sources(
     )
 }
 
-/// Register GPU resources once at app startup.
+/// Register GPU resources once (safe to call after first frame).
 pub fn init(cc: &eframe::CreationContext<'_>) -> bool {
     let Some(rs) = cc.wgpu_render_state.as_ref() else {
         log::warn!("canvas_gpu: no wgpu_render_state — falling back to egui textures");
         return false;
     };
+    init_with_rs(rs)
+}
+
+/// Same as [`init`], when only a cloned `RenderState` is available (deferred boot).
+pub fn init_with_rs(rs: &eframe::egui_wgpu::RenderState) -> bool {
     let mut renderer = rs.renderer.write();
     if renderer
         .callback_resources

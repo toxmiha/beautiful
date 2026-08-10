@@ -967,11 +967,14 @@ pub fn build_navigator_thumb_from_tiles(tiles: &TileBuffer, max_edge: u32) -> (u
     let tw = ((doc_w as f32) / scale).round().max(1.0) as u32;
     let th = ((doc_h as f32) / scale).round().max(1.0) as u32;
     let mut out = vec![0u8; (tw as usize) * (th as usize) * 4];
+    // Decode cold tiles once if a sample hits them (hidden layers may be parked).
+    let mut cold_cache: std::collections::HashMap<(i32, i32), Vec<u8>> =
+        std::collections::HashMap::new();
     for y in 0..th {
         for x in 0..tw {
             let sx = ((x as f32 + 0.5) / tw as f32 * doc_w as f32) as i32;
             let sy = ((y as f32 + 0.5) / th as f32 * doc_h as f32) as i32;
-            let rgba = tiles.get_rgba(sx, sy);
+            let rgba = tiles.get_rgba_hot_or_cold(sx, sy, &mut cold_cache);
             let di = ((y * tw + x) * 4) as usize;
             out[di..di + 4].copy_from_slice(&rgba);
         }

@@ -267,7 +267,7 @@ pub fn rect_stroke_sharp(
 pub fn ellipse_sdf(px: f32, py: f32, cx: f32, cy: f32, rx: f32, ry: f32) -> f32 {
     let rx = rx.max(1e-3);
     let ry = ry.max(1e-3);
-    // Quilez-style: exact for circles; good enough for mild eccentricity.
+    // Exact for circles; good enough for mild eccentricity.
     let nx = (px - cx) / rx;
     let ny = (py - cy) / ry;
     let r = (nx * nx + ny * ny).sqrt();

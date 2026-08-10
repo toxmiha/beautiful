@@ -1,4 +1,4 @@
-//! Blender-like autosave + crash recovery.
+//! Autosave + crash recovery.
 //!
 //! Layout under `%APPDATA%/Beautiful/autosave/`:
 //! - `session.lock` — present while the app runs; leftover ⇒ previous crash

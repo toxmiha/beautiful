@@ -9,6 +9,7 @@ use crate::dock::{DockLayout, DockSide, PanelKind};
 use crate::file::FileState;
 use crate::file_browser::FileBrowser;
 use crate::file_drop::FileDropManager;
+use crate::filter_studio::FilterStudioState;
 use crate::gallery::{self, GalleryState};
 use crate::mcp_bridge::{McpBridge, McpCommand};
 use crate::palette::ColorState;
@@ -41,11 +42,20 @@ pub struct BeautifulApp {
     color_state: ColorState,
     dock: DockLayout,
     dock_dirty: bool,
+    /// Force SidePanel widths from layout.json once per process.
+    dock_widths_seeded: bool,
+    /// Persist main window size/pos when it changes.
+    window_geom_dirty: bool,
+    /// Frames to skip geometry sync while the viewport settles.
+    window_geom_settle: u8,
+    /// Apply maximized after settle (boot-time maximize breaks acrylic/egui size).
+    pending_maximize: bool,
     tool: WorkspaceTool,
     tool_session: ToolSession,
     tool_pages: ToolPages,
     brush_panel: BrushPanelUi,
     filters: FilterUiState,
+    filter_studio: FilterStudioState,
     resources: ResourceStats,
     resource_tick: f32,
     theme_applied: bool,
@@ -73,14 +83,18 @@ pub struct BeautifulApp {
     perf_ui_open: bool,
     /// Extra frames of continuous repaint (MCP spam_repaint / profiler).
     spam_repaint_left: u32,
-    /// Blender-style autosave + crash recovery.
+    /// Autosave + crash recovery.
     autosave: AutosaveState,
     /// Discord Rich Presence worker.
     discord: crate::discord_rpc::DiscordRpc,
     /// Seconds since last Discord activity push.
     discord_tick: f32,
+    /// GitHub release check — offer download only (never auto-install).
+    update_checker: crate::update_check::UpdateChecker,
     /// Multi-sheet desk rect from CentralPanel (sheets render in a Foreground pass).
     desk_screen_rect: Option<egui::Rect>,
+    /// In-window Loading progress until deferred GPU/addons finish.
+    boot: crate::splash::BootState,
 }
 
 impl BeautifulApp {
@@ -88,27 +102,18 @@ impl BeautifulApp {
         let mut settings = AppSettings::load();
         settings.clamp();
         settings.ensure_dirs();
-        crate::addons::ensure_example_addon(&settings);
+        // Fast path: show the main window ASAP. Heavy GPU pipelines / addons /
+        // autosave run across the first frames under an in-app Loading bar.
         theme::apply_settings_colors(&settings);
         theme::apply(&cc.egui_ctx);
         log_win32_exstyle(cc);
         apply_window_material(cc, &settings);
         log_wgpu_surface(cc);
 
-        let canvas_gpu_ready = crate::canvas_gpu::init(cc);
-        let wgpu_rs = if canvas_gpu_ready {
-            cc.wgpu_render_state.clone()
-        } else {
-            None
-        };
-
-        let mut addons = AddonManager::new();
-        addons.reload(&settings);
-
-        let mut autosave = AutosaveState::default();
-        autosave.boot(&settings);
-
+        let wgpu_rs = cc.wgpu_render_state.clone();
         let discord = crate::discord_rpc::DiscordRpc::start(settings.discord_rpc_enabled);
+        let mut update_checker = crate::update_check::UpdateChecker::new();
+        update_checker.request_check(std::time::Duration::from_secs(0));
 
         let mut document = Document::new(2000, 1500);
         document.set_undo_max_steps(settings.undo_max_steps);
@@ -118,6 +123,8 @@ impl BeautifulApp {
         let color_state = ColorState::from_rgba(document.brush.color);
         let workspace = Workspace::new_with_primary("Untitled", document.width, document.height);
         let open_canvases = OpenCanvasList::new_primary("Untitled");
+
+        crate::action_log::log("boot", "window ready — deferred Loading overlay");
 
         Self {
             document,
@@ -129,11 +136,18 @@ impl BeautifulApp {
             color_state,
             dock: DockLayout::load(),
             dock_dirty: false,
+            dock_widths_seeded: false,
+            window_geom_dirty: false,
+            // Skip boot-time maximize restore: frameless+acrylic+wgpu often keeps the
+            // swapchain at the windowed size, so UI stays top-left inside a huge blur.
+            window_geom_settle: 4,
+            pending_maximize: false,
             tool,
             tool_session,
             tool_pages: ToolPages::load(),
             brush_panel: BrushPanelUi::default(),
             filters: FilterUiState::default(),
+            filter_studio: FilterStudioState::default(),
             resources: ResourceStats::default(),
             resource_tick: 0.0,
             theme_applied: true,
@@ -144,21 +158,65 @@ impl BeautifulApp {
             gallery: GalleryState::default(),
             layer_ui: LayerUiState::default(),
             settings,
-            addons,
+            addons: AddonManager::new(),
             prefs: PrefsUi::default(),
             fps: 60.0,
             frame_ms: 16.0,
-            canvas_gpu_ready,
+            canvas_gpu_ready: false,
             wgpu_rs,
             mcp,
             mcp_quit: false,
             perf_ui_open: false,
             spam_repaint_left: 0,
-            autosave,
+            autosave: AutosaveState::default(),
             discord,
             discord_tick: 0.0,
+            update_checker,
             desk_screen_rect: None,
+            boot: crate::splash::BootState::default(),
         }
+    }
+
+    /// Advance one deferred boot step per call; bar jumps when the step finishes.
+    fn tick_boot(&mut self, ctx: &egui::Context) {
+        use crate::splash::BootStep;
+        if !self.boot.run_step || self.boot.step == BootStep::Done {
+            return;
+        }
+        match self.boot.step {
+            BootStep::Theme => {
+                theme::apply_settings_colors(&self.settings);
+                theme::apply(ctx);
+                crate::action_log::log("boot", "theme");
+            }
+            BootStep::GpuPipelines => {
+                if let Some(rs) = self.wgpu_rs.as_ref() {
+                    self.canvas_gpu_ready = crate::canvas_gpu::init_with_rs(rs);
+                } else {
+                    self.canvas_gpu_ready = false;
+                }
+                crate::action_log::log(
+                    "boot",
+                    &format!("gpu_pipelines ready={}", self.canvas_gpu_ready),
+                );
+            }
+            BootStep::Addons => {
+                crate::addons::ensure_example_addon(&self.settings);
+                self.addons.reload(&self.settings);
+                crate::action_log::log("boot", "addons");
+            }
+            BootStep::Autosave => {
+                self.autosave.boot(&self.settings);
+                crate::action_log::log("boot", "autosave");
+            }
+            BootStep::Warmup => {
+                self.document.warm_tip_cache();
+                beautiful_core::warm_srgb_luts();
+                crate::action_log::log("boot", "warmup");
+            }
+            BootStep::Done => {}
+        }
+        self.boot.advance_after_step();
     }
 
     /// Mirror global tool/brush session into the focused document.
@@ -173,6 +231,8 @@ impl BeautifulApp {
 
     /// Blank sheet inside the current holst (not a new file).
     fn add_blank_sheet(&mut self) {
+        self.tool_session
+            .capture_from_document(&self.document, self.tool);
         if !self.workspace.can_add_sheet() {
             self.file.set_status(
                 format!(
@@ -212,6 +272,8 @@ impl BeautifulApp {
 
     /// New sheet from clipboard image (within current holst).
     fn add_sheet_from_clipboard(&mut self) {
+        self.tool_session
+            .capture_from_document(&self.document, self.tool);
         if !self.workspace.can_add_sheet() {
             self.file.set_status(
                 format!(
@@ -258,6 +320,8 @@ impl BeautifulApp {
 
     /// Open file(s) as sheets inside the current holst.
     fn open_as_new_sheet(&mut self, path: &std::path::Path) {
+        self.tool_session
+            .capture_from_document(&self.document, self.tool);
         if !self.workspace.can_add_sheet() {
             self.file.set_status(
                 format!(
@@ -324,6 +388,17 @@ impl BeautifulApp {
             self.apply_tool_session();
             self.canvas.mark_dirty();
             self.spam_repaint_left = self.spam_repaint_left.max(2);
+            if !self.document.layers.is_empty() {
+                let li = self
+                    .document
+                    .active_layer
+                    .min(self.document.layers.len() - 1);
+                self.layer_ui.focus_layer(li);
+            } else {
+                self.layer_ui.selected.clear();
+                self.layer_ui.anchor = None;
+                self.layer_ui.scroll_to = None;
+            }
         }
     }
 
@@ -340,6 +415,12 @@ impl BeautifulApp {
             self.document.edit_generation(),
             self.file.saved_edit_gen(),
         );
+        let nsfw = if let Some(p) = &self.file.path {
+            self.file.is_path_nsfw(p)
+        } else {
+            self.file.pending_nsfw()
+        };
+        self.open_canvases.set_active_nsfw(nsfw);
         self.workspace.set_focused_title(title);
     }
 
@@ -411,6 +492,18 @@ impl BeautifulApp {
         }
         self.apply_tool_session();
         self.spam_repaint_left = self.spam_repaint_left.max(2);
+        // Layer list highlight is session UI — resync to this document's active layer.
+        if !self.document.layers.is_empty() {
+            let idx = self
+                .document
+                .active_layer
+                .min(self.document.layers.len() - 1);
+            self.layer_ui.focus_layer(idx);
+        } else {
+            self.layer_ui.selected.clear();
+            self.layer_ui.anchor = None;
+            self.layer_ui.scroll_to = None;
+        }
     }
 
     fn focus_canvas_index(&mut self, idx: usize) {
@@ -639,6 +732,8 @@ impl BeautifulApp {
                     && self.screen != AppScreen::Editor;
 
                 if replace_primary {
+                    self.tool_session
+                        .capture_from_document(&self.document, self.tool);
                     self.document = doc;
                     self.document.ensure_active_paintable();
                     self.canvas.on_document_replaced();
@@ -1047,7 +1142,7 @@ impl BeautifulApp {
                     let _s =
                         crate::perf::Scope::new(crate::perf::Category::Stroke, "stroke.paint");
                     self.document.begin_stroke_undo();
-                    self.document.paint_polyline(&points);
+                    self.document.paint_polyline_ex(&points, true);
                     self.document.end_stroke_undo();
                 }
                 let paint_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1270,12 +1365,13 @@ impl eframe::App for BeautifulApp {
     /// Fully clear framebuffer so acrylic / DComp can show through empty chrome.
     /// Opaque A/B (`NO_TRANSPARENT`) uses solid dark clear instead.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        if crate::debug_flags::opaque_window()
+        let solid = crate::debug_flags::opaque_window()
             || matches!(
                 self.settings.material,
                 crate::settings::UiMaterial::Solid
             )
-        {
+            || !crate::os_win::dwm_backdrop_supported();
+        if solid {
             let c = self.settings.app_color;
             [
                 c[0] as f32 / 255.0,
@@ -1292,6 +1388,8 @@ impl eframe::App for BeautifulApp {
     fn on_exit(&mut self) {
         crate::perf_ui::flush_on_exit();
         self.autosave.shutdown_clean(&self.settings);
+        self.dock.save();
+        let _ = self.settings.save();
     }
 
     /// Brush stamps run here (before panel layout). Still frame-bound by eframe:
@@ -1301,6 +1399,7 @@ impl eframe::App for BeautifulApp {
         if self.prefs.open
             || self.filters.dialog_open()
             || self.filters.canvas_size_open
+            || self.filter_studio.is_open()
             || self.file_browser.open
         {
             return;
@@ -1339,8 +1438,40 @@ impl eframe::App for BeautifulApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         crate::perf::begin_frame();
         self.settings.apply_ui_scale(ctx);
+        // eframe can reset visuals after CreationContext — re-apply every frame so
+        // dark chrome / button fills stick without opening Preferences.
+        theme::apply_settings_colors(&self.settings);
+        theme::apply(ctx);
+        self.theme_applied = true;
+
+        // —— Cold start: main window already visible; Loading bar while we finish ——
+        // Progress advances only when a boot step completes (not a timer).
+        if !self.boot.is_ready() {
+            if self.boot.settle_frames > 0 {
+                self.boot.settle_frames -= 1;
+            } else {
+                self.tick_boot(ctx);
+            }
+            crate::splash::show_overlay(ctx, &self.boot);
+            ctx.request_repaint();
+            let _ = frame;
+            crate::perf::end_frame();
+            return;
+        }
+
         self.drain_mcp(ctx);
         self.flush_visibility_coalesce();
+        // Deferred cold-park: never on the eye-click path (was ~500ms zstd).
+        if !self.canvas.is_drawing()
+            && self.layer_ui.pending_visibility.is_empty()
+            && !ctx.input(|i| i.pointer.any_down())
+        {
+            let n = self.document.park_hidden_layers_idle(24);
+            if n > 0 {
+                // Keep draining over subsequent idle frames.
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        }
         if self.mcp_quit {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -1361,11 +1492,21 @@ impl eframe::App for BeautifulApp {
         }
         crate::perf_ui::show(ctx, &mut self.perf_ui_open);
 
-        if !self.theme_applied {
-            theme::apply(ctx);
-            self.theme_applied = true;
-        }
         self.pen.apply_settings(&self.settings);
+        if self.window_geom_settle > 0 {
+            self.window_geom_settle -= 1;
+            ctx.request_repaint();
+            if self.window_geom_settle == 0 && self.pending_maximize {
+                self.pending_maximize = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+                // Give the maximize resize one more settle before saving geometry.
+                self.window_geom_settle = 4;
+                ctx.request_repaint();
+            }
+        } else {
+            sync_window_geometry(ctx, &mut self.settings, &mut self.window_geom_dirty);
+        }
+        handle_frameless_resize_borders(ctx);
 
         // Frame timing (egui stable_dt) → smoothed FPS readout.
         let dt = ctx.input(|i| i.stable_dt).clamp(1e-4, 0.5);
@@ -1484,6 +1625,56 @@ impl eframe::App for BeautifulApp {
         }
         theme::paint_app_gradient(ctx);
 
+        self.update_checker.poll();
+        if let Some(offer) = self.update_checker.pending().cloned() {
+            let mut open = false;
+            let mut dismiss = false;
+            egui::TopBottomPanel::top("update_offer_banner")
+                .exact_height(52.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgb(32, 40, 48))
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .stroke(egui::Stroke::new(1.0_f32, theme::ACCENT)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Доступна новая версия {} (у вас {})",
+                                    if offer.name.is_empty() {
+                                        offer.tag.as_str()
+                                    } else {
+                                        offer.name.as_str()
+                                    },
+                                    env!("CARGO_PKG_VERSION")
+                                ))
+                                .strong()
+                                .color(theme::text()),
+                            );
+                            ui.label(theme::label_dim(
+                                "Скачать вручную со страницы релиза — приложение само не ставит обновления.",
+                            ));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::btn(ui, theme::label("Позже")).clicked() {
+                                dismiss = true;
+                            }
+                            if theme::btn(ui, theme::label("Открыть скачивание")).clicked() {
+                                open = true;
+                            }
+                        });
+                    });
+                });
+            if open {
+                self.update_checker.open_download();
+            }
+            if dismiss {
+                self.update_checker.dismiss();
+            }
+        }
+
         let mut go_gallery = false;
         self.discord_tick += ctx.input(|i| i.unstable_dt);
         if self.discord_tick >= 5.0 {
@@ -1495,7 +1686,7 @@ impl eframe::App for BeautifulApp {
         }
 
         if self.screen == AppScreen::Gallery {
-            // Crash recovery banner (Blender-style) — home screen, not canvas.
+            // Crash recovery banner — home screen, not canvas.
             if !self.autosave.pending_recover.is_empty() {
                 let mut open_recover: Option<std::path::PathBuf> = None;
                 let mut dismiss_all = false;
@@ -1513,7 +1704,7 @@ impl eframe::App for BeautifulApp {
                                 ui.label(
                                     egui::RichText::new("Recover files")
                                         .strong()
-                                        .color(theme::TEXT),
+                                        .color(theme::text()),
                                 );
                                 ui.label(theme::label_dim(
                                     "Previous session did not quit cleanly. Open a snapshot or dismiss.",
@@ -1563,6 +1754,7 @@ impl eframe::App for BeautifulApp {
                 &mut request_open_canvas,
                 &mut request_new_canvas,
                 &mut request_open_paths,
+                &mut self.filter_studio,
             );
             if request_open_canvas {
                 self.open_canvas_from_dialog();
@@ -1622,7 +1814,7 @@ impl eframe::App for BeautifulApp {
         self.file.add_time_spent(dt);
         self.sync_active_canvas_meta();
 
-        let fb_modal = false; // Explorer is a separate OS window — don't freeze the app.
+        let fb_modal = false; // File browser is a separate OS window — don't freeze the app.
 
         // Apply undo/redo/tool keys BEFORE docks + canvas so navigator/thumbs see
         // the restored document in the same frame (was after docks → stale nav).
@@ -1664,6 +1856,13 @@ impl eframe::App for BeautifulApp {
                 &mut request_open_canvas,
                 &mut request_new_canvas,
                 &mut request_open_paths,
+                &mut self.filter_studio,
+            );
+            crate::filter_studio::show(
+                ctx,
+                &mut self.document,
+                &mut self.canvas,
+                &mut self.filter_studio,
             );
             ui::show_addon_panels(ctx, &mut self.addons, &mut self.document, &mut self.file);
             if request_open_canvas && !self.file_browser.open {
@@ -1986,18 +2185,21 @@ impl eframe::App for BeautifulApp {
                 self.open_save_as_browser();
             }
         }
-        // Modal blocker removed: explorer runs in its own OS window.
+        // Modal blocker removed: file browser runs in its own OS window.
         self.consume_file_browser(ctx);
 
         if let Some(idx) = self.canvas.pending_layer_pick.take() {
-            self.layer_ui.selected = vec![idx];
-            self.layer_ui.anchor = Some(idx);
+            self.layer_ui.focus_layer(idx);
         }
 
         if self.dock_dirty {
             self.dock.save();
             self.tool_pages.save();
             self.dock_dirty = false;
+        }
+        if self.window_geom_dirty {
+            let _ = self.settings.save();
+            self.window_geom_dirty = false;
         }
         self.tool_session
             .capture_from_document(&self.document, self.tool);
@@ -2041,16 +2243,15 @@ impl BeautifulApp {
             &mut self.settings,
             &mut self.addons,
             self.discord.ui_status(),
+            Some(self.pen.last_raw_force()),
+            Some(self.pen.last_pressure()),
         );
         if prefs_apply.undo {
             self.document
                 .set_undo_max_steps(self.settings.undo_max_steps);
         }
-        if self.prefs.open || prefs_apply.appearance {
-            theme::apply_settings_colors(&self.settings);
-            theme::apply(ctx);
-        }
         if prefs_apply.appearance {
+            // Colors already re-applied each frame; still refresh DWM material live.
             apply_window_material_runtime(frame, &self.settings);
         }
         if prefs_apply.addons_reload {
@@ -2073,29 +2274,43 @@ impl BeautifulApp {
         use crate::settings::DiscordTitleMode;
 
         let tool_name = self.tool.discord_label();
-        let canvas_title = self.open_canvases.active().title.clone();
-        let (details, state, preview_jpeg) = match self.screen {
+        let tab = self.open_canvases.active();
+        let path_nsfw = tab
+            .path
+            .as_ref()
+            .map(|p| self.file.is_path_nsfw(p))
+            .unwrap_or(false);
+        let nsfw = tab.nsfw || path_nsfw || self.file.pending_nsfw();
+        let canvas_title = tab.title.clone();
+        let (details, state, preview_jpeg, show_preview) = match self.screen {
             AppScreen::Gallery => (
-                match self.settings.discord_title_mode {
-                    DiscordTitleMode::AppName => "Beautiful".to_owned(),
-                    DiscordTitleMode::CanvasName => "Gallery".to_owned(),
-                },
-                "Browsing canvases".to_owned(),
+                "Beautiful".to_owned(),
+                "Browsing gallery".to_owned(),
                 None,
+                false,
             ),
             AppScreen::Editor => {
-                let details = match self.settings.discord_title_mode {
-                    DiscordTitleMode::AppName => "Beautiful".to_owned(),
-                    DiscordTitleMode::CanvasName => {
-                        if canvas_title.trim().is_empty() {
-                            "Untitled".to_owned()
-                        } else {
-                            canvas_title
+                let details = if nsfw {
+                    "Beautiful".to_owned()
+                } else {
+                    match self.settings.discord_title_mode {
+                        DiscordTitleMode::AppName => "Beautiful".to_owned(),
+                        DiscordTitleMode::CanvasName => {
+                            if canvas_title.trim().is_empty() {
+                                "Untitled".to_owned()
+                            } else {
+                                canvas_title
+                            }
                         }
                     }
                 };
-                let state = format!("Tool · {tool_name}");
-                let preview_jpeg = if self.settings.discord_show_canvas_preview {
+                let layers = self.document.layers.len();
+                let state = format!(
+                    "{tool_name} · {}×{} · {layers} layers",
+                    self.document.width, self.document.height
+                );
+                let want_preview = self.settings.discord_show_canvas_preview && !nsfw;
+                let preview_jpeg = if want_preview {
                     let (w, h, pixels) = beautiful_core::build_navigator_thumb_from_layers(
                         self.document.background,
                         &self.document.layers,
@@ -2108,13 +2323,13 @@ impl BeautifulApp {
                 } else {
                     None
                 };
-                (details, state, preview_jpeg)
+                (details, state, preview_jpeg, want_preview)
             }
         };
         self.discord.set_activity(ActivityUpdate {
             details,
             state,
-            show_preview: self.settings.discord_show_canvas_preview,
+            show_preview,
             preview_jpeg,
         });
     }
@@ -2154,7 +2369,7 @@ impl BeautifulApp {
                 egui::Frame::new()
                     .fill(egui::Color32::from_rgb(28, 28, 32))
                     .inner_margin(egui::Margin::symmetric(6, 4))
-                    .stroke(egui::Stroke::new(1.0_f32, theme::STROKE)),
+                    .stroke(egui::Stroke::new(1.0_f32, theme::stroke())),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -2379,8 +2594,8 @@ impl BeautifulApp {
             .interactable(false)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
-                    .fill(theme::BG_MENU)
-                    .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                    .fill(theme::bg_menu())
+                    .stroke(egui::Stroke::new(1.0_f32, theme::stroke()))
                     .corner_radius(8.0)
                     .inner_margin(10.0)
                     .shadow(egui::Shadow {
@@ -2486,10 +2701,10 @@ impl BeautifulApp {
         // Resize: sheet index + desk-space delta applied to min/max (dmin_x, dmin_y, dmax_x, dmax_y).
         let mut resize_sheet: Option<(usize, [f32; 4])> = None;
         let can_close = self.workspace.len() > 1;
-        let frame_border = theme::STROKE;
-        let body_fill = theme::BG_PANEL;
-        let title_active = theme::BG_PANEL_2;
-        let title_idle = theme::BG_PANEL_2; // same as active — no fake "dimmed" inactive look
+        let frame_border = theme::stroke();
+        let body_fill = theme::bg_panel_solid();
+        let title_active = theme::bg_panel_2_solid();
+        let title_idle = theme::bg_panel_2_solid(); // same as active — no fake "dimmed" inactive look
         let title_hover = egui::Color32::from_rgb(48, 48, 54);
         const EDGE: f32 = 8.0_f32;
         const MIN_W: f32 = 200.0;
@@ -2977,7 +3192,27 @@ impl BeautifulApp {
     fn render_docks(&mut self, ctx: &egui::Context) {
         let content = ctx.content_rect();
         self.dock.begin_frame(content);
-        let freeze = false; // Explorer is a separate OS window.
+        let freeze = false; // File browser is a separate OS window.
+
+        if !self.dock_widths_seeded {
+            self.dock_widths_seeded = true;
+            for (ci, col) in self.dock.left_columns.iter().enumerate() {
+                seed_side_panel_width(
+                    ctx,
+                    egui::Id::new(("dock_left_col", ci)),
+                    col.width.clamp(200.0, 420.0),
+                    true,
+                );
+            }
+            for (ci, col) in self.dock.right_columns.iter().enumerate() {
+                seed_side_panel_width(
+                    ctx,
+                    egui::Id::new(("dock_right_col", ci)),
+                    col.width.clamp(200.0, 420.0),
+                    false,
+                );
+            }
+        }
 
         let left_cols = self.dock.left_columns.clone();
         let right_cols = self.dock.right_columns.clone();
@@ -2992,7 +3227,7 @@ impl BeautifulApp {
                 .default_width(w)
                 .width_range(200.0..=420.0)
                 .frame(theme::panel_frame())
-                .show_animated(ctx, !col.panels.is_empty(), |ui| {
+                .show(ctx, |ui| {
                     if freeze {
                         ui.disable();
                     }
@@ -3035,7 +3270,7 @@ impl BeautifulApp {
                 .default_width(w)
                 .width_range(200.0..=420.0)
                 .frame(theme::panel_frame())
-                .show_animated(ctx, !col.panels.is_empty(), |ui| {
+                .show(ctx, |ui| {
                     if freeze {
                         ui.disable();
                     }
@@ -3078,7 +3313,7 @@ impl BeautifulApp {
             let mut open = true;
             let frame = egui::Frame::new()
                 .fill(theme::menu_fill())
-                .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                .stroke(egui::Stroke::new(1.0_f32, theme::stroke()))
                 .corner_radius(8.0)
                 .inner_margin(egui::Margin::same(8));
             egui::Window::new(kind.title())
@@ -3148,7 +3383,7 @@ impl BeautifulApp {
             }
         }
 
-        // Blender-style: resolve drop only AFTER column/slot hit-rects are registered.
+        // Resolve drop only AFTER column/slot hit-rects are registered.
         if !freeze && self.dock.drag.is_some() {
             if let Some(pos) = ctx.pointer_interact_pos() {
                 if let Some(d) = self.dock.drag.as_mut() {
@@ -3458,7 +3693,7 @@ fn log_win32_exstyle(cc: &eframe::CreationContext<'_>) {
 #[cfg(not(target_os = "windows"))]
 fn log_win32_exstyle(_cc: &eframe::CreationContext<'_>) {}
 
-/// Win11 backdrop materials (Acrylic / Mica / Aero-styled / clear).
+/// Win11 backdrop materials (Acrylic / Mica / glass / clear).
 fn apply_window_material(cc: &eframe::CreationContext<'_>, settings: &AppSettings) {
     #[cfg(target_os = "windows")]
     {
@@ -3515,7 +3750,7 @@ fn apply_material_to_handle(
                 a,
             ))
         }
-        UiMaterial::Aero => {
+        UiMaterial::LegacyGlass => {
             let a = (50.0 + strength * 110.0) as u8;
             Some((
                 c[0].saturating_add(20).min(255),
@@ -3532,12 +3767,19 @@ fn apply_material_to_handle(
 
     let result = match settings.material {
         UiMaterial::Solid => Ok(()),
+        _ if !crate::os_win::dwm_backdrop_supported() => {
+            crate::action_log::log(
+                "ui",
+                "DWM backdrop skipped (needs Windows 11 build 22000+); using Solid",
+            );
+            Ok(())
+        }
         UiMaterial::Mica => window_vibrancy::apply_mica(&window, dark).or_else(|e| {
             crate::action_log::log("ui", &format!("mica unavailable ({e}), acrylic fallback"));
             window_vibrancy::apply_acrylic(&window, tint)
         }),
-        // Win11: legacy Aero blur often breaks with DxgiFromVisual — acrylic + cool tint.
-        UiMaterial::Aero | UiMaterial::Acrylic | UiMaterial::Glass | UiMaterial::Smoke => {
+        // Win11: legacy glass blur often breaks with DxgiFromVisual — acrylic + cool tint.
+        UiMaterial::LegacyGlass | UiMaterial::Acrylic | UiMaterial::Glass | UiMaterial::Smoke => {
             window_vibrancy::apply_acrylic(&window, tint).or_else(|e| {
                 crate::action_log::log("ui", &format!("acrylic failed ({e}), blur fallback"));
                 window_vibrancy::apply_blur(&window, tint)
@@ -3554,5 +3796,160 @@ fn apply_material_to_handle(
             ),
         ),
         Err(e) => crate::action_log::log("ui", &format!("material apply failed: {e}")),
+    }
+}
+
+fn seed_side_panel_width(ctx: &egui::Context, id: egui::Id, width: f32, left: bool) {
+    let content = ctx.content_rect();
+    let height = content.height().max(1.0);
+    let width = width.clamp(200.0, 420.0).min(content.width().max(200.0));
+    let rect = if left {
+        egui::Rect::from_min_size(content.left_top(), egui::vec2(width, height))
+    } else {
+        egui::Rect::from_min_max(
+            egui::pos2(content.right() - width, content.top()),
+            content.right_bottom(),
+        )
+    };
+    ctx.data_mut(|d| {
+        d.insert_persisted(id, egui::containers::panel::PanelState { rect });
+    });
+}
+
+fn sync_window_geometry(
+    ctx: &egui::Context,
+    settings: &mut AppSettings,
+    dirty: &mut bool,
+) {
+    let (maximized, inner, outer) = ctx.input(|i| {
+        let vp = i.viewport();
+        (
+            vp.maximized.unwrap_or(false),
+            vp.inner_rect.map(|r| r.size()),
+            vp.outer_rect.map(|r| r.min),
+        )
+    });
+
+    if settings.window_maximized != maximized {
+        settings.window_maximized = maximized;
+        *dirty = true;
+    }
+
+    // Keep last restored size/pos while maximized so next launch can restore the windowed rect.
+    if !maximized {
+        if let Some(size) = inner {
+            let next = [size.x.round(), size.y.round()];
+            if settings.window_inner_size != Some(next)
+                && next[0] >= 960.0
+                && next[1] >= 640.0
+            {
+                settings.window_inner_size = Some(next);
+                *dirty = true;
+            }
+        }
+        if let Some(pos) = outer {
+            let next = [pos.x.round(), pos.y.round()];
+            if settings.window_outer_pos != Some(next) {
+                settings.window_outer_pos = Some(next);
+                *dirty = true;
+            }
+        }
+    }
+}
+
+/// Invisible edge grips so undecorated windows stay resizable on Windows.
+fn handle_frameless_resize_borders(ctx: &egui::Context) {
+    let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+    if maximized {
+        return;
+    }
+    let rect = ctx.content_rect();
+    const GRIP: f32 = 5.0;
+    let edges: [(&str, egui::Rect, egui::ResizeDirection, egui::CursorIcon); 8] = [
+        (
+            "resize_n",
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left() + GRIP, rect.top()),
+                egui::pos2(rect.right() - GRIP, rect.top() + GRIP),
+            ),
+            egui::ResizeDirection::North,
+            egui::CursorIcon::ResizeNorth,
+        ),
+        (
+            "resize_s",
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left() + GRIP, rect.bottom() - GRIP),
+                egui::pos2(rect.right() - GRIP, rect.bottom()),
+            ),
+            egui::ResizeDirection::South,
+            egui::CursorIcon::ResizeSouth,
+        ),
+        (
+            "resize_w",
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.top() + GRIP),
+                egui::pos2(rect.left() + GRIP, rect.bottom() - GRIP),
+            ),
+            egui::ResizeDirection::West,
+            egui::CursorIcon::ResizeWest,
+        ),
+        (
+            "resize_e",
+            egui::Rect::from_min_max(
+                egui::pos2(rect.right() - GRIP, rect.top() + GRIP),
+                egui::pos2(rect.right(), rect.bottom() - GRIP),
+            ),
+            egui::ResizeDirection::East,
+            egui::CursorIcon::ResizeEast,
+        ),
+        (
+            "resize_nw",
+            egui::Rect::from_min_size(rect.left_top(), egui::vec2(GRIP, GRIP)),
+            egui::ResizeDirection::NorthWest,
+            egui::CursorIcon::ResizeNorthWest,
+        ),
+        (
+            "resize_ne",
+            egui::Rect::from_min_size(
+                egui::pos2(rect.right() - GRIP, rect.top()),
+                egui::vec2(GRIP, GRIP),
+            ),
+            egui::ResizeDirection::NorthEast,
+            egui::CursorIcon::ResizeNorthEast,
+        ),
+        (
+            "resize_sw",
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left(), rect.bottom() - GRIP),
+                egui::vec2(GRIP, GRIP),
+            ),
+            egui::ResizeDirection::SouthWest,
+            egui::CursorIcon::ResizeSouthWest,
+        ),
+        (
+            "resize_se",
+            egui::Rect::from_min_size(
+                egui::pos2(rect.right() - GRIP, rect.bottom() - GRIP),
+                egui::vec2(GRIP, GRIP),
+            ),
+            egui::ResizeDirection::SouthEast,
+            egui::CursorIcon::ResizeSouthEast,
+        ),
+    ];
+
+    let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("frameless_resize"));
+    let ui = egui::Ui::new(
+        ctx.clone(),
+        egui::Id::new("frameless_resize_ui"),
+        egui::UiBuilder::new().layer_id(layer).max_rect(rect),
+    );
+    for (id, hit, dir, cursor) in edges {
+        let resp = ui.interact(hit, egui::Id::new(id), egui::Sense::drag());
+        if resp.hovered() {
+            ctx.set_cursor_icon(cursor);
+        }
+        if resp.drag_started_by(egui::PointerButton::Primary) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+        }
     }
 }

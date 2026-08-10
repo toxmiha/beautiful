@@ -1,5 +1,7 @@
 mod brush;
+mod brush_v2;
 mod color;
+mod curve;
 mod composite;
 mod display_lod;
 mod display_sync;
@@ -33,14 +35,26 @@ mod txmh;
 mod visibility_cache;
 mod warp;
 
-pub use brush::{BrushKind, BrushSettings, BrushShape, BrushTexture, HairDirection, StrokeState};
+pub use brush::{
+    BrushBackend, BrushKind, BrushSettings, BrushShape, BrushTexture, HairDirection, PaintMode,
+    StrokeState, BRUSH_SIZE_MAX, BRUSH_SIZE_MIN,
+};
+pub use brush_v2::{
+    BrushDef, BrushGraphNode, BrushGraphNodeData, BrushGraphWire, BrushNodeGraph, BrushOutField,
+    CompileError,
+};
 pub use color::{
     linear_to_srgb, load_premul_linear, make_src_premul, source_over_premul, srgb_to_linear,
-    store_premul_linear, DrawingColorSlot, Rgba,
+    store_premul_linear, warm_srgb_luts, DrawingColorSlot, Rgba,
 };
+pub use curve::{CurveLut, CurvePoint, TransferCurve};
 pub use composite::{
-    composite_region_packed_into, CompositeCache, DirtyRect, FloatingBlit, SyncResult,
-    COMPOSITE_BUDGET_PX,
+    composite_region_packed_into, composite_region_packed_into_skip, CompositeCache, DirtyRect,
+    FloatingBlit, SyncResult, COMPOSITE_BUDGET_PX,
+};
+pub use filters::{
+    AdjustmentKind, ChromaMode, DitherMethod, FisheyeModel, GlitchMethod, NoiseMethod,
+    PixelizeMethod, ReplaceAffect, RippleMode, VignetteShape,
 };
 pub use projection::{budget as projection_budget, Projection, ProjectionBackend};
 pub use display_lod::{
@@ -56,7 +70,7 @@ pub use display_sync::{
     DisplayFramePlan, MipAction,
 };
 pub use doc_op::{DocOp, DocOpJournal, DocOpKind};
-pub use document::{Document, LayerDropPlace, StageRect};
+pub use document::{layer_effectively_visible, Document, LayerDropPlace, StageRect};
 pub use fill::{FillEngine, FillOptions, FillSampleSource};
 pub use gradient::{
     gradient_t, lerp_stops_dithered, snap_gradient_end, GradientEnds, GradientInterp,
@@ -68,7 +82,6 @@ pub use io::{
     load_raster_image, save_document, IoError,
 };
 pub use jobs::CancelToken;
-pub use filters::AdjustmentKind;
 pub use layer::{
     ancestor_folder_mask_cov, ancestor_folder_opacity, blend_over, blend_rgb, effective_blend_mode,
     BlendMode, Layer,

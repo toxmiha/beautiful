@@ -4,7 +4,7 @@ use eframe::egui;
 
 use crate::theme;
 
-/// Blender-style color button: swatch opens a popup with HSV wheel + RGB.
+/// Color button: swatch opens a popup with HSV wheel + RGB.
 pub fn color_button_rgb(ui: &mut egui::Ui, rgb: &mut [u8; 3]) -> bool {
     let mut c = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
     let changed = color_button_srgba(ui, &mut c, false);
@@ -21,7 +21,7 @@ pub fn color_button_srgba(ui: &mut egui::Ui, color: &mut egui::Color32, alpha: b
     ui.painter().rect_stroke(
         rect,
         3.0,
-        egui::Stroke::new(1.0_f32, theme::STROKE),
+        egui::Stroke::new(1.0_f32, theme::stroke()),
         egui::StrokeKind::Inside,
     );
 

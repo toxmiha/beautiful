@@ -1,4 +1,4 @@
-//! One pasteboard workspace (Figma / Illustrator style) with multiple document sheets.
+//! One pasteboard workspace with multiple document sheets.
 //!
 //! Focused sheet body lives on `BeautifulApp`; inactive sheets are stored here and
 //! swapped in via [`Workspace::focus_index`].
@@ -620,7 +620,7 @@ impl Workspace {
         let modifiers = ui.input(|i| i.modifiers);
         let pointer = ui.input(|i| i.pointer.hover_pos());
         // Desk zoom: Alt+wheel always, or wheel on empty pasteboard (not over a sheet).
-        // Same notch math as canvas (ZOOM_STEP 1.18, one step per ~120 raw delta).
+        // Same notch math as canvas (ZOOM_STEP, one step per WHEEL_NOTCH_POINTS).
         let want_desk_zoom = modifiers.alt
             || (!pointer_over_sheet
                 && response.hovered()
@@ -637,17 +637,18 @@ impl Workspace {
                 }
                 self.wheel_accum += raw_y;
             }
-            if self.wheel_accum.abs() >= 120.0 {
+            let notch = crate::canvas::WHEEL_NOTCH_POINTS;
+            if self.wheel_accum.abs() >= notch {
                 let factor = if self.wheel_accum > 0.0 {
-                    self.wheel_accum -= 120.0;
-                    if self.wheel_accum > 120.0 {
-                        self.wheel_accum = 119.0;
+                    self.wheel_accum -= notch;
+                    if self.wheel_accum > notch {
+                        self.wheel_accum = notch - 1.0;
                     }
                     ZOOM_STEP
                 } else {
-                    self.wheel_accum += 120.0;
-                    if self.wheel_accum < -120.0 {
-                        self.wheel_accum = -119.0;
+                    self.wheel_accum += notch;
+                    if self.wheel_accum < -notch {
+                        self.wheel_accum = -(notch - 1.0);
                     }
                     1.0 / ZOOM_STEP
                 };

@@ -1,4 +1,9 @@
 //! Color utilities: sRGB ↔ linear, premultiplied alpha, Porter-Duff helpers.
+//!
+//! Hot path (`srgb_u8_to_linear` / `linear_to_srgb_u8` used by paint flush/load)
+//! uses LUTs — same transfer as the analytic IEC curve, ±1 LSB at worst.
+
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -109,14 +114,50 @@ pub fn linear_to_srgb(c: f32) -> f32 {
     }
 }
 
+/// 256-entry decode: identical to `srgb_to_linear(i/255)` for every `u8`.
+static SRGB_U8_TO_LINEAR: LazyLock<[f32; 256]> = LazyLock::new(|| {
+    let mut t = [0.0f32; 256];
+    for (i, slot) in t.iter_mut().enumerate() {
+        *slot = srgb_to_linear(i as f32 * (1.0 / 255.0));
+    }
+    t
+});
+
+/// Encode LUT: linear [0,1] → sRGB u8. 64K bins → typically 0, rarely ±1 vs `powf`.
+const LINEAR_TO_SRGB_U8_N: usize = 65536;
+
+static LINEAR_TO_SRGB_U8: LazyLock<[u8; LINEAR_TO_SRGB_U8_N]> = LazyLock::new(|| {
+    let mut t = [0u8; LINEAR_TO_SRGB_U8_N];
+    let denom = (LINEAR_TO_SRGB_U8_N - 1) as f32;
+    for (i, slot) in t.iter_mut().enumerate() {
+        *slot = (linear_to_srgb(i as f32 / denom) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    }
+    t
+});
+
 #[inline]
 pub fn srgb_u8_to_linear(c: u8) -> f32 {
-    srgb_to_linear(c as f32 * (1.0 / 255.0))
+    SRGB_U8_TO_LINEAR[c as usize]
 }
 
 #[inline]
 pub fn linear_to_srgb_u8(c: f32) -> u8 {
-    (linear_to_srgb(c) * 255.0).round().clamp(0.0, 255.0) as u8
+    if !(c > 0.0) {
+        return 0;
+    }
+    if c >= 1.0 {
+        return 255;
+    }
+    let idx = (c * (LINEAR_TO_SRGB_U8_N - 1) as f32) as usize;
+    LINEAR_TO_SRGB_U8[idx.min(LINEAR_TO_SRGB_U8_N - 1)]
+}
+
+/// Touch LUTs so the first paint stroke does not pay init on the hot path.
+pub fn warm_srgb_luts() {
+    let _ = SRGB_U8_TO_LINEAR[0];
+    let _ = LINEAR_TO_SRGB_U8[0];
 }
 
 /// Load straight sRGB8 pixel → premultiplied linear.
@@ -207,5 +248,48 @@ mod tests {
         let lin = srgb_u8_to_linear(128);
         let back = linear_to_srgb_u8(lin);
         assert!((back as i32 - 128).abs() <= 1);
+    }
+
+    #[test]
+    fn u8_decode_matches_analytic() {
+        for i in 0u8..=255 {
+            let lut = srgb_u8_to_linear(i);
+            let exact = srgb_to_linear(i as f32 / 255.0);
+            assert!(
+                (lut - exact).abs() <= 1e-6,
+                "decode mismatch i={i}: lut={lut} exact={exact}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_lut_within_one_lsb_of_analytic() {
+        warm_srgb_luts();
+        let mut max_err = 0i32;
+        // Dense samples across [0,1], plus all exact u8 linear values.
+        for i in 0..4096 {
+            let c = i as f32 / 4095.0;
+            let lut = linear_to_srgb_u8(c) as i32;
+            let exact = (linear_to_srgb(c) * 255.0).round().clamp(0.0, 255.0) as i32;
+            max_err = max_err.max((lut - exact).abs());
+        }
+        for i in 0u8..=255 {
+            let c = srgb_to_linear(i as f32 / 255.0);
+            let lut = linear_to_srgb_u8(c) as i32;
+            let exact = (linear_to_srgb(c) * 255.0).round().clamp(0.0, 255.0) as i32;
+            max_err = max_err.max((lut - exact).abs());
+        }
+        assert!(max_err <= 1, "encode LUT max |err|={max_err} (allow ±1 LSB)");
+    }
+
+    #[test]
+    fn roundtrip_all_u8() {
+        for i in 0u8..=255 {
+            let back = linear_to_srgb_u8(srgb_u8_to_linear(i));
+            assert!(
+                (back as i32 - i as i32).abs() <= 1,
+                "roundtrip i={i} → {back}"
+            );
+        }
     }
 }

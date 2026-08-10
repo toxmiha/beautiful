@@ -736,14 +736,14 @@ pub fn icon_button(ui: &mut Ui, icon: ToolIcon, selected: bool, tip: &str) -> Re
         } else if response.hovered() {
             theme::BG_HOVER
         } else {
-            theme::BG_PANEL_2
+            theme::bg_panel_2_solid()
         };
         let border = if selected {
             theme::ACCENT
         } else {
-            theme::STROKE
+            theme::stroke()
         };
-        let fg = if selected { theme::ACCENT } else { theme::TEXT };
+        let fg = if selected { theme::ACCENT } else { theme::text() };
         ui.painter().rect_filled(rect, 6.0, bg);
         ui.painter().rect_stroke(
             rect,
@@ -763,7 +763,7 @@ pub fn small_icon_button(ui: &mut Ui, icon: ToolIcon, tip: &str) -> Response {
         let fg = if response.hovered() {
             theme::ACCENT
         } else {
-            theme::TEXT
+            theme::text()
         };
         paint(ui.painter(), rect.shrink(2.0), icon, fg);
     }
@@ -774,7 +774,7 @@ pub fn small_icon_button(ui: &mut Ui, icon: ToolIcon, tip: &str) -> Response {
 pub fn menu_icon_btn(ui: &mut Ui, icon: ToolIcon, label: &str) -> Response {
     ui.horizontal(|ui| {
         let (irect, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-        paint(ui.painter(), irect, icon, theme::TEXT);
+        paint(ui.painter(), irect, icon, theme::text());
         theme::btn(ui, theme::label(label))
     })
     .inner

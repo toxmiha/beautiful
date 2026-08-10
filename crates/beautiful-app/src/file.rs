@@ -490,6 +490,19 @@ impl FileState {
         }
     }
 
+    pub fn is_path_nsfw(&self, path: &Path) -> bool {
+        self.library
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .map(|e| e.nsfw)
+            .unwrap_or(false)
+    }
+
+    pub fn pending_nsfw(&self) -> bool {
+        self.pending_meta.as_ref().map(|m| m.nsfw).unwrap_or(false)
+    }
+
     pub fn toggle_entry_tag(&mut self, path: &Path, tag: &str) {
         let tag = tag.trim();
         if tag.is_empty() {
@@ -511,7 +524,9 @@ impl FileState {
         }
         #[cfg(target_os = "windows")]
         {
-            let _ = std::process::Command::new("explorer")
+            let mut c = std::process::Command::new("explorer");
+            crate::os_win::hide_console(&mut c);
+            let _ = c
                 .arg(format!("/select,{}", path.to_string_lossy()))
                 .spawn();
         }
@@ -618,7 +633,7 @@ impl FileState {
                 if is_err {
                     theme::ACCENT
                 } else {
-                    theme::STROKE
+                    theme::stroke()
                 },
             ))
             .corner_radius(10.0)
@@ -637,7 +652,7 @@ impl FileState {
                 ui.set_max_width(420.0);
                 ui.label(
                     egui::RichText::new(msg)
-                        .color(if is_err { theme::ACCENT } else { theme::TEXT })
+                        .color(if is_err { theme::ACCENT } else { theme::text() })
                         .size(15.0),
                 );
             });
@@ -1021,7 +1036,7 @@ impl FileState {
         let center = ctx.content_rect().center();
         let frame = egui::Frame::window(&ctx.style())
             .fill(theme::menu_fill())
-            .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+            .stroke(egui::Stroke::new(1.0_f32, theme::stroke()))
             .corner_radius(10.0)
             .inner_margin(egui::Margin::same(14))
             .shadow(egui::Shadow {
@@ -1053,7 +1068,7 @@ impl FileState {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.save_root_prompt_path)
                             .desired_width(320.0)
-                            .text_color(theme::TEXT),
+                            .text_color(theme::text()),
                     );
                     if theme::menu_btn(ui, theme::label("Обзор…")).clicked() {
                         let mut dlg = rfd::FileDialog::new();
@@ -1230,7 +1245,7 @@ impl FileState {
             let center = ctx.content_rect().center();
             let frame = egui::Frame::window(&ctx.style())
                 .fill(theme::menu_fill())
-                .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                .stroke(egui::Stroke::new(1.0_f32, theme::stroke()))
                 .corner_radius(10.0)
                 .inner_margin(egui::Margin::same(14));
             egui::Window::new("Loading")
@@ -1268,7 +1283,7 @@ impl FileState {
             let center = ctx.content_rect().center();
             let frame = egui::Frame::window(&ctx.style())
                 .fill(theme::menu_fill())
-                .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                .stroke(egui::Stroke::new(1.0_f32, theme::stroke()))
                 .corner_radius(10.0)
                 .inner_margin(egui::Margin::same(14));
             egui::Window::new("Saving")
@@ -1299,7 +1314,7 @@ impl FileState {
             let center = ctx.content_rect().center();
             let frame = egui::Frame::window(&ctx.style())
                 .fill(theme::menu_fill())
-                .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                .stroke(egui::Stroke::new(1.0_f32, theme::stroke()))
                 .corner_radius(10.0)
                 .inner_margin(egui::Margin::same(14))
                 .shadow(egui::Shadow {

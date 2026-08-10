@@ -156,6 +156,7 @@ pub struct MemoryInventory {
     pub ws_bytes: Option<u64>,
     pub private_bytes: Option<u64>,
     pub layers_bytes: u64,
+    pub cold_bytes: u64,
     pub composite_bytes: u64,
     pub undo_bytes: u64,
     pub undo_steps: usize,
@@ -182,7 +183,7 @@ pub struct PerfSnapshot {
     pub events: Vec<ActionEvent>,
     pub memory: MemoryInventory,
     pub memory_baseline: Option<MemoryInventory>,
-    /// Process CPU % of the whole machine (Task Manager style, 0..=100).
+    /// Process CPU % of the whole machine (0..=100).
     pub cpu_percent: f32,
     /// Peak CPU % since last Reset.
     pub cpu_peak_percent: f32,
@@ -236,7 +237,7 @@ struct PerfState {
     bench_events0: usize,
     /// Frame meta filled by app before end_frame.
     pending_meta: FrameMeta,
-    /// Process CPU % (Task Manager style vs all cores, 0..=100).
+    /// Process CPU % (vs all cores, 0..=100).
     cpu_percent: f32,
     cpu_peak_percent: f32,
     cpu_prev_proc_100ns: Option<u64>,
@@ -535,10 +536,12 @@ pub fn sample_memory(document: &Document) {
 
 pub fn inventory_from_document(document: &Document) -> MemoryInventory {
     let mut layers_bytes = 0u64;
+    let mut cold_bytes = 0u64;
     let mut top: Vec<LayerMem> = Vec::new();
     for (idx, layer) in document.layers.iter().enumerate() {
         let bytes = layer.approx_tile_bytes();
         layers_bytes = layers_bytes.saturating_add(bytes);
+        cold_bytes = cold_bytes.saturating_add(layer.tiles.cold_bytes());
         top.push(LayerMem {
             idx,
             name: layer.name.clone(),
@@ -570,6 +573,7 @@ pub fn inventory_from_document(document: &Document) -> MemoryInventory {
         ws_bytes,
         private_bytes,
         layers_bytes,
+        cold_bytes,
         composite_bytes,
         undo_bytes,
         undo_steps: document.history.undo_len(),
@@ -974,6 +978,7 @@ fn memory_json(m: &MemoryInventory) -> Value {
         "ws_mb": m.ws_bytes.map(|b| b as f64 / (1024.0 * 1024.0)),
         "private_mb": m.private_bytes.map(|b| b as f64 / (1024.0 * 1024.0)),
         "layers_mb": m.layers_bytes as f64 / (1024.0 * 1024.0),
+        "cold_mb": m.cold_bytes as f64 / (1024.0 * 1024.0),
         "composite_mb": m.composite_bytes as f64 / (1024.0 * 1024.0),
         "undo_mb": m.undo_bytes as f64 / (1024.0 * 1024.0),
         "undo_steps": m.undo_steps,
@@ -1100,7 +1105,7 @@ fn process_cpu_times_100ns() -> Option<u64> {
     None
 }
 
-/// Update process CPU % like Task Manager (share of all logical CPUs, 0..=100).
+/// Update process CPU % (share of all logical CPUs, 0..=100).
 fn tick_process_cpu(s: &mut PerfState) {
     // ~4 Hz — enough for HUD, cheap.
     if let Some(prev_wall) = s.cpu_prev_wall {

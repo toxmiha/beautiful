@@ -3,7 +3,7 @@
 //! Empty / never-written tiles are absent from the map (read as transparent).
 //! Undo shares `Arc`s until a write forces `Arc::make_mut`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::composite::DirtyRect;
@@ -21,6 +21,8 @@ pub struct TileBuffer {
     pub width: u32,
     pub height: u32,
     tiles: HashMap<TileKey, TileArc>,
+    /// Eye-off cold store: zstd-compressed tiles (only when Arc unique).
+    cold: HashMap<TileKey, Arc<Vec<u8>>>,
 }
 
 impl TileBuffer {
@@ -29,35 +31,38 @@ impl TileBuffer {
             width,
             height,
             tiles: HashMap::new(),
+            cold: HashMap::new(),
         }
     }
 
     pub fn clear(&mut self) {
         self.tiles.clear();
+        self.cold.clear();
     }
 
     pub fn resize_empty(&mut self, width: u32, height: u32) {
         self.width = width;
         self.height = height;
         self.tiles.clear();
+        self.cold.clear();
     }
 
     pub fn painted_tile_count(&self) -> usize {
-        self.tiles.len()
+        self.tiles.len() + self.cold.len()
     }
 
     pub fn keys(&self) -> impl Iterator<Item = TileKey> + '_ {
-        self.tiles.keys().copied()
+        self.tiles.keys().copied().chain(self.cold.keys().copied())
     }
 
     /// Axis-aligned bounds covering all painted tiles (document space), if any.
     pub fn content_bounds(&self) -> Option<DirtyRect> {
-        if self.tiles.is_empty() {
+        if self.tiles.is_empty() && self.cold.is_empty() {
             return None;
         }
         let ts = TILE_SIZE;
         let mut rect = DirtyRect::empty();
-        for &(tx, ty) in self.tiles.keys() {
+        for &(tx, ty) in self.tiles.keys().chain(self.cold.keys()) {
             let x0 = (tx * ts as i32).max(0) as u32;
             let y0 = (ty * ts as i32).max(0) as u32;
             let x1 = ((tx + 1) * ts as i32).clamp(0, self.width as i32) as u32;
@@ -79,7 +84,7 @@ impl TileBuffer {
     pub fn content_bounds_intersecting(&self, roi: DirtyRect) -> Option<DirtyRect> {
         let mut roi = roi;
         roi.clamp_to(self.width, self.height);
-        if self.tiles.is_empty() || roi.is_empty() {
+        if (self.tiles.is_empty() && self.cold.is_empty()) || roi.is_empty() {
             return None;
         }
         let ts = TILE_SIZE as i32;
@@ -90,7 +95,7 @@ impl TileBuffer {
             roi.x1 as i32,
             roi.y1 as i32,
         ) {
-            if !self.tiles.contains_key(&(tx, ty)) {
+            if !self.tiles.contains_key(&(tx, ty)) && !self.cold.contains_key(&(tx, ty)) {
                 continue;
             }
             let x0 = (tx * ts).max(0) as u32;
@@ -110,15 +115,23 @@ impl TileBuffer {
     }
 
     pub fn approx_bytes(&self) -> u64 {
-        (self.tiles.len() as u64).saturating_mul(TILE_BYTES as u64)
+        let hot = (self.tiles.len() as u64).saturating_mul(TILE_BYTES as u64);
+        let cold: u64 = self.cold.values().map(|z| z.len() as u64).sum();
+        hot.saturating_add(cold)
     }
 
-    /// Cheap structural clone: shares all tile Arcs (COW).
+    /// Approximate compressed cold bytes only (memory HUD).
+    pub fn cold_bytes(&self) -> u64 {
+        self.cold.values().map(|z| z.len() as u64).sum()
+    }
+
+    /// Cheap structural clone: shares all tile Arcs (COW). Cold stays compressed Arc.
     pub fn clone_shared(&self) -> Self {
         Self {
             width: self.width,
             height: self.height,
             tiles: self.tiles.clone(),
+            cold: self.cold.clone(),
         }
     }
 
@@ -127,10 +140,85 @@ impl TileBuffer {
         self.width = other.width;
         self.height = other.height;
         self.tiles = other.tiles.clone();
+        self.cold = other.cold.clone();
+    }
+
+    /// Insert or remove one tile (history tile-diff undo/redo).
+    pub fn set_tile_opt(&mut self, key: TileKey, tile: Option<TileArc>) {
+        self.cold.remove(&key);
+        match tile {
+            Some(t) => {
+                self.tiles.insert(key, t);
+            }
+            None => {
+                self.tiles.remove(&key);
+            }
+        }
+    }
+
+    /// Park unique hot tiles into zstd cold store (eye-off). Skips Arcs shared with undo.
+    pub fn park_unique_tiles(&mut self) {
+        let _ = self.park_unique_tiles_budget(usize::MAX);
+    }
+
+    /// Park at most `max_tiles` unique hot tiles (idle budget). Returns how many parked.
+    pub fn park_unique_tiles_budget(&mut self, max_tiles: usize) -> usize {
+        if max_tiles == 0 {
+            return 0;
+        }
+        let keys: Vec<TileKey> = self.tiles.keys().copied().collect();
+        let mut parked = 0usize;
+        for key in keys {
+            if parked >= max_tiles {
+                break;
+            }
+            let Some(arc) = self.tiles.get(&key) else {
+                continue;
+            };
+            if Arc::strong_count(arc) != 1 {
+                continue;
+            }
+            let Some(arc) = self.tiles.remove(&key) else {
+                continue;
+            };
+            match zstd::encode_all(arc.as_slice(), 1) {
+                Ok(compressed) => {
+                    self.cold.insert(key, Arc::new(compressed));
+                    parked += 1;
+                }
+                Err(_) => {
+                    self.tiles.insert(key, arc);
+                }
+            }
+        }
+        parked
+    }
+
+    /// Thaw all cold tiles to hot RGBA (eye-on / edit / save).
+    pub fn ensure_hot(&mut self) {
+        if self.cold.is_empty() {
+            return;
+        }
+        let cold = std::mem::take(&mut self.cold);
+        for (key, z) in cold {
+            match zstd::decode_all(z.as_slice()) {
+                Ok(raw) if raw.len() == TILE_BYTES => {
+                    self.tiles.insert(key, Arc::new(raw));
+                }
+                _ => {
+                    // Keep compressed if decode fails (should not happen).
+                    self.cold.insert(key, z);
+                }
+            }
+        }
+    }
+
+    pub fn has_cold(&self) -> bool {
+        !self.cold.is_empty()
     }
 
     pub fn tile_keys(&self) -> impl Iterator<Item = TileKey> + '_ {
-        self.tiles.keys().copied()
+        self.tiles.keys().copied().chain(self.cold.keys().copied())
     }
 
     pub fn tile_coord(px: i32, py: i32) -> TileKey {
@@ -211,6 +299,50 @@ impl TileBuffer {
         [tile[i], tile[i + 1], tile[i + 2], tile[i + 3]]
     }
 
+    /// Sample hot tiles, or decode a cold tile into `cold_cache` once (thumbs).
+    pub fn get_rgba_hot_or_cold(
+        &self,
+        x: i32,
+        y: i32,
+        cold_cache: &mut HashMap<TileKey, Vec<u8>>,
+    ) -> [u8; 4] {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return [0; 4];
+        }
+        let key = Self::tile_coord(x, y);
+        let (ox, oy) = Self::tile_origin(key.0, key.1);
+        let lx = (x - ox) as usize;
+        let ly = (y - oy) as usize;
+        let i = (ly * TILE_SIZE as usize + lx) * 4;
+        if let Some(tile) = self.tiles.get(&key) {
+            if i + 4 <= tile.len() {
+                return [tile[i], tile[i + 1], tile[i + 2], tile[i + 3]];
+            }
+            return [0; 4];
+        }
+        if let Some(cached) = cold_cache.get(&key) {
+            if i + 4 <= cached.len() {
+                return [cached[i], cached[i + 1], cached[i + 2], cached[i + 3]];
+            }
+            return [0; 4];
+        }
+        let Some(z) = self.cold.get(&key) else {
+            return [0; 4];
+        };
+        match zstd::decode_all(z.as_slice()) {
+            Ok(raw) if raw.len() == TILE_BYTES => {
+                let px = if i + 4 <= raw.len() {
+                    [raw[i], raw[i + 1], raw[i + 2], raw[i + 3]]
+                } else {
+                    [0; 4]
+                };
+                cold_cache.insert(key, raw);
+                px
+            }
+            _ => [0; 4],
+        }
+    }
+
     pub fn set_rgba(&mut self, x: i32, y: i32, rgba: [u8; 4]) {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
             return;
@@ -235,6 +367,21 @@ impl TileBuffer {
 
     pub fn get_tile(&self, tx: i32, ty: i32) -> Option<&TileArc> {
         self.tiles.get(&(tx, ty))
+    }
+
+    /// True if any painted (hot or cold) tile overlaps `rect`.
+    pub fn intersects_rect(&self, rect: DirtyRect) -> bool {
+        let mut r = rect;
+        r.clamp_to(self.width, self.height);
+        if r.is_empty() {
+            return false;
+        }
+        for key in Self::tiles_covering_rect(r.x0 as i32, r.y0 as i32, r.x1 as i32, r.y1 as i32) {
+            if self.tiles.contains_key(&key) || self.cold.contains_key(&key) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Insert/replace a shared tile Arc (undo restore of one tile).
@@ -455,12 +602,15 @@ pub struct PaintTileMap {
     tiles: HashMap<TileKey, Arc<Vec<f32>>>,
     /// Document-space AABB already converted from u8 for each warm tile.
     warmed: HashMap<TileKey, (i32, i32, i32, i32)>,
+    /// Tiles stamped since last flush (float→u8 only these — same pixels, less CPU).
+    dirty: HashSet<TileKey>,
 }
 
 impl PaintTileMap {
     pub fn clear(&mut self) {
         self.tiles.clear();
         self.warmed.clear();
+        self.dirty.clear();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -469,6 +619,24 @@ impl PaintTileMap {
 
     pub fn approx_bytes(&self) -> u64 {
         (self.tiles.len() as u64).saturating_mul((TILE_PIXELS * 4 * 4) as u64)
+    }
+
+    #[inline]
+    pub fn mark_dirty(&mut self, key: TileKey) {
+        self.dirty.insert(key);
+    }
+
+    #[inline]
+    pub fn mark_dirty_keys(&mut self, keys: &[TileKey]) {
+        for &k in keys {
+            self.dirty.insert(k);
+        }
+    }
+
+    /// Keys stamped since last flush (does not clear).
+    #[inline]
+    pub fn dirty_keys_snapshot(&self) -> Vec<TileKey> {
+        self.dirty.iter().copied().collect()
     }
 
     /// Full-tile warm (legacy helpers / tests).
@@ -686,26 +854,39 @@ impl PaintTileMap {
             }
         }
         self.warmed.clear();
+        self.dirty.clear();
     }
 
     /// Write paint tiles intersecting `rect` back to u8 **without** dropping float
     /// scratch. Keeping warm tiles across segments avoids re-converting the same
     /// 64×64 blocks on every dab of a large/soft stroke. Call [`Self::clear`]
     /// when the stroke ends to free RAM.
+    ///
+    /// Only tiles marked dirty (stamped since last flush) are converted — bit-identical
+    /// to flushing the AABB, skips tiles whose float buffer did not change this frame.
     pub fn flush_rect_to(&mut self, dest: &mut TileBuffer, x0: i32, y0: i32, x1: i32, y1: i32) {
+        if self.dirty.is_empty() {
+            return;
+        }
+        let ts = TILE_SIZE as i32;
         let keys: Vec<TileKey> = if x1 > x0 && y1 > y0 {
-            TileBuffer::tiles_covering_rect(x0, y0, x1, y1)
-                .filter(|k| self.tiles.contains_key(k))
+            self.dirty
+                .iter()
+                .copied()
+                .filter(|&(tx, ty)| {
+                    let (ox, oy) = TileBuffer::tile_origin(tx, ty);
+                    ox < x1 && oy < y1 && ox + ts > x0 && oy + ts > y0
+                })
                 .collect()
         } else {
-            self.tiles.keys().copied().collect()
+            self.dirty.iter().copied().collect()
         };
         for key in keys {
             let Some(pf) = self.tiles.get(&key) else {
+                self.dirty.remove(&key);
                 continue;
             };
             let (ox, oy) = TileBuffer::tile_origin(key.0, key.1);
-            let ts = TILE_SIZE as i32;
             let (wx0, wy0, wx1, wy1) =
                 self.warmed
                     .get(&key)
@@ -718,6 +899,7 @@ impl PaintTileMap {
             if fx0 < fx1 && fy0 < fy1 {
                 Self::write_paint_tile_region(key, pf, dest, fx0, fy0, fx1, fy1);
             }
+            self.dirty.remove(&key);
         }
     }
 
@@ -862,5 +1044,35 @@ mod tests {
         let tb = TileBuffer::new(4096, 4096);
         assert_eq!(tb.painted_tile_count(), 0);
         assert_eq!(tb.approx_bytes(), 0);
+    }
+
+    #[test]
+    fn park_unique_and_thaw_roundtrip() {
+        let mut tb = TileBuffer::new(128, 128);
+        tb.set_rgba(10, 10, [10, 20, 30, 255]);
+        tb.set_rgba(70, 70, [40, 50, 60, 255]);
+        assert_eq!(tb.painted_tile_count(), 2);
+        assert!(!tb.has_cold());
+        let before = tb.get_rgba(10, 10);
+        tb.park_unique_tiles();
+        assert!(tb.has_cold());
+        assert!(tb.cold_bytes() > 0);
+        // Hot map empty while cold holds data.
+        assert!(tb.get_tile(0, 0).is_none());
+        tb.ensure_hot();
+        assert!(!tb.has_cold());
+        assert_eq!(tb.get_rgba(10, 10), before);
+        assert_eq!(tb.get_rgba(70, 70), [40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn park_skips_shared_arc() {
+        let mut a = TileBuffer::new(64, 64);
+        a.set_rgba(1, 1, [1, 2, 3, 255]);
+        let _undo = a.clone_shared();
+        a.park_unique_tiles();
+        // Shared with undo snapshot → stay hot.
+        assert!(!a.has_cold());
+        assert!(a.get_tile(0, 0).is_some());
     }
 }

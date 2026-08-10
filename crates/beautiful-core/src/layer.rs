@@ -316,7 +316,7 @@ pub enum BlendMode {
     HardLight,
     Difference,
     Exclusion,
-    /// Linear Dodge (Add) — Krita.
+    /// Linear Dodge (Add).
     LinearDodge,
     LinearBurn,
     VividLight,
@@ -801,6 +801,10 @@ fn soft_light_g(d: f32) -> f32 {
 /// Source-over composite of `src` onto `dst` with blend mode (both RGBA8).
 #[inline]
 pub fn blend_over(dst: &mut [u8], src: &[u8], src_a: f32, mode: BlendMode) {
+    if mode == BlendMode::Normal {
+        blend_over_normal(dst, src, src_a);
+        return;
+    }
     let dst_a = dst[3] as f32 / 255.0;
     let out_a = src_a + dst_a * (1.0 - src_a);
     if out_a <= 0.0 {
@@ -825,9 +829,7 @@ pub fn blend_over(dst: &mut [u8], src: &[u8], src_a: f32, mode: BlendMode) {
     let dr = dst[0] as f32 / 255.0;
     let dg = dst[1] as f32 / 255.0;
     let db = dst[2] as f32 / 255.0;
-    let bm = if mode == BlendMode::Normal {
-        [sr, sg, sb]
-    } else if mode == BlendMode::SoftLight {
+    let bm = if mode == BlendMode::SoftLight {
         [
             soft_light_lut()[src[0] as usize][dst[0] as usize] as f32 / 255.0,
             soft_light_lut()[src[1] as usize][dst[1] as usize] as f32 / 255.0,
@@ -847,6 +849,41 @@ pub fn blend_over(dst: &mut [u8], src: &[u8], src_a: f32, mode: BlendMode) {
         let v = (bm[c] * src_a + d * dst_a * (1.0 - src_a)) / out_a;
         dst[c] = (v * 255.0).round().clamp(0.0, 255.0) as u8;
     }
+    dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+}
+
+/// Normal (source-over) only — same math as [`blend_over`] for `BlendMode::Normal`.
+/// Hot path for StrokeStack sandwich / active layer paint.
+#[inline(always)]
+pub fn blend_over_normal(dst: &mut [u8], src: &[u8], src_a: f32) {
+    if src_a <= 0.001 {
+        return;
+    }
+    // sa==1 → result is src (matches general formula). Do not use 0.999 threshold:
+    // that would ignore remaining dst and change pixels.
+    if src_a >= 1.0 {
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = 255;
+        return;
+    }
+    let dst_a = dst[3] as f32 * (1.0 / 255.0);
+    let out_a = src_a + dst_a * (1.0 - src_a);
+    if out_a <= 0.0 {
+        return;
+    }
+    let inv = 1.0 / out_a;
+    let keep = dst_a * (1.0 - src_a);
+    let sr = src[0] as f32 * (1.0 / 255.0);
+    let sg = src[1] as f32 * (1.0 / 255.0);
+    let sb = src[2] as f32 * (1.0 / 255.0);
+    let dr = dst[0] as f32 * (1.0 / 255.0);
+    let dg = dst[1] as f32 * (1.0 / 255.0);
+    let db = dst[2] as f32 * (1.0 / 255.0);
+    dst[0] = ((sr * src_a + dr * keep) * inv * 255.0).round().clamp(0.0, 255.0) as u8;
+    dst[1] = ((sg * src_a + dg * keep) * inv * 255.0).round().clamp(0.0, 255.0) as u8;
+    dst[2] = ((sb * src_a + db * keep) * inv * 255.0).round().clamp(0.0, 255.0) as u8;
     dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 

@@ -93,7 +93,7 @@ impl Default for GradientOptions {
     }
 }
 
-/// Bayer 8×8 ordered dither matrix (0..63), same family Krita uses for preview.
+/// Bayer 8×8 ordered dither matrix (0..63) for preview.
 const BAYER8: [[u8; 8]; 8] = [
     [0, 32, 8, 40, 2, 34, 10, 42],
     [48, 16, 56, 24, 50, 18, 58, 26],

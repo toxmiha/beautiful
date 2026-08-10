@@ -6,37 +6,36 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::keymap::Keymap;
+use beautiful_core::TransferCurve;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MousePressureMode {
-    Off,
+    /// Always report full pressure (1.0) — typical mouse default.
+    #[serde(alias = "off")]
+    Full,
+    /// Constant mapped pressure while the button is held.
     Fixed,
-    Speed,
+    /// Emulate pressure from cursor speed (natural: slow = harder).
+    #[serde(alias = "speed")]
+    Velocity,
+    /// Soft start; pressure rises with distance travelled in the stroke.
+    Ramp,
 }
 
 impl Default for MousePressureMode {
     fn default() -> Self {
-        Self::Off
+        Self::Full
     }
 }
 
-/// Response curve applied after raw stylus force (before sensitivity).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PenPressureCurve {
-    Soft,
-    #[default]
-    Linear,
-    Hard,
-}
-
-impl PenPressureCurve {
+impl MousePressureMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Soft => "Soft",
-            Self::Linear => "Linear",
-            Self::Hard => "Hard",
+            Self::Full => "Full",
+            Self::Fixed => "Fixed",
+            Self::Velocity => "Velocity",
+            Self::Ramp => "Ramp",
         }
     }
 }
@@ -83,8 +82,10 @@ pub enum UiMaterial {
     Mica,
     /// Glassmorphism — strong translucency + bright edge.
     Glass,
-    /// Legacy Aero-style blur + glossy edge.
-    Aero,
+    /// Legacy glass blur + glossy edge.
+    /// Serde alias keeps older settings.json values working.
+    #[serde(alias = "aero")]
+    LegacyGlass,
     /// Smoke — dimming translucent overlay chrome.
     Smoke,
 }
@@ -96,7 +97,7 @@ impl UiMaterial {
             Self::Acrylic => "Acrylic",
             Self::Mica => "Mica",
             Self::Glass => "Glassmorphism",
-            Self::Aero => "Aero",
+            Self::LegacyGlass => "Legacy Glass",
             Self::Smoke => "Smoke",
         }
     }
@@ -138,7 +139,7 @@ pub struct AppSettings {
     pub acrylic_enabled: bool,
     /// 0.0 = subtle, 1.0 = strong DWM tint / blur amount.
     pub acrylic_strength: f32,
-    /// Backdrop material (Acrylic / Mica / Glass / Aero / Smoke / Solid).
+    /// Backdrop material (Acrylic / Mica / Glass / Legacy Glass / Smoke / Solid).
     #[serde(default)]
     pub material: UiMaterial,
     /// When false, dock/chrome panels use opaque fills (no see-through UI).
@@ -155,7 +156,7 @@ pub struct AppSettings {
     /// When false, `ui_scale` replaces OS DPI as pixels_per_point.
     #[serde(default = "default_true")]
     pub ui_scale_follow_windows: bool,
-    /// Solid tint vs Discord-style two-stop gradient.
+    /// Solid tint vs two-stop gradient.
     #[serde(default)]
     pub color_fill: ColorFillMode,
     #[serde(default)]
@@ -181,12 +182,31 @@ pub struct AppSettings {
     pub accent: [u8; 3],
     /// Top-menu tint colors keyed by lowercase name: file, edit, …
     pub menu_colors: HashMap<String, [u8; 3]>,
-    pub pressure_sensitivity: f32,
+    /// Global stylus pressure transfer curve (raw force → mapped pressure).
     #[serde(default)]
-    pub pen_pressure_curve: PenPressureCurve,
+    pub pressure_curve: TransferCurve,
+    /// Preset label: Linear / Soft / Hard / Firm / Custom.
+    #[serde(default = "default_pressure_preset")]
+    pub pressure_curve_preset: String,
     pub mouse_pressure_mode: MousePressureMode,
-    /// Used when mode is Fixed (0..1).
-    pub mouse_pressure_fixed: f32,
+    /// Fixed pressure, and max pressure for Velocity / Ramp (0..1).
+    #[serde(default = "default_mouse_pressure_max", alias = "mouse_pressure_fixed")]
+    pub mouse_pressure_max: f32,
+    /// Floor pressure for Velocity / Ramp (0..1).
+    #[serde(default = "default_mouse_pressure_min")]
+    pub mouse_pressure_min: f32,
+    /// Screen px/s that maps to full velocity effect.
+    #[serde(default = "default_mouse_velocity_ref")]
+    pub mouse_velocity_ref: f32,
+    /// EMA smoothing 0..1 (higher = snappier). Applied as mix toward new sample.
+    #[serde(default = "default_mouse_velocity_smooth")]
+    pub mouse_velocity_smooth: f32,
+    /// If true: fast → harder (old Speed). Default false: slow → harder (natural media).
+    #[serde(default)]
+    pub mouse_velocity_invert: bool,
+    /// Ramp mode: screen pixels of travel to reach max pressure.
+    #[serde(default = "default_mouse_ramp_distance")]
+    pub mouse_ramp_distance: f32,
     pub formats_enabled: FormatFlags,
     pub keymap: Keymap,
     /// Addon id → enabled.
@@ -200,7 +220,7 @@ pub struct AppSettings {
     /// Continuous trackpad-style zoom. Off = discrete notches (stabler pivot).
     #[serde(default)]
     pub zoom_smooth: bool,
-    /// Write recovery snapshots while editing (Blender-style).
+    /// Write recovery snapshots while editing.
     #[serde(default = "default_true")]
     pub autosave_enabled: bool,
     /// Minutes between autosave snapshots.
@@ -212,15 +232,24 @@ pub struct AppSettings {
     /// Discord Rich Presence (requires Discord desktop). Client ID is project-owned.
     #[serde(default = "default_true")]
     pub discord_rpc_enabled: bool,
-    /// Legacy field — ignored (Client ID is baked / one-time appdata).
+    /// Legacy field — ignored (Application ID is baked into the binary).
     #[serde(default)]
     pub discord_client_id: String,
     /// What to show as the main Discord line.
     #[serde(default)]
     pub discord_title_mode: DiscordTitleMode,
     /// Upload a small canvas thumb as the large Discord image (temporary public host).
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub discord_show_canvas_preview: bool,
+    /// Last main-window inner size in points `[w, h]` (custom title-bar chrome).
+    #[serde(default)]
+    pub window_inner_size: Option<[f32; 2]>,
+    /// Last main-window outer position in points `[x, y]`.
+    #[serde(default)]
+    pub window_outer_pos: Option<[f32; 2]>,
+    /// Whether the main window was maximized on last exit.
+    #[serde(default)]
+    pub window_maximized: bool,
 }
 
 /// Main Discord Rich Presence title line.
@@ -251,9 +280,13 @@ impl Default for AppSettings {
             addons_dir: String::new(),
             resources_dir: String::new(),
             undo_max_steps: 50,
-            acrylic_enabled: true,
+            acrylic_enabled: crate::os_win::dwm_backdrop_supported(),
             acrylic_strength: 0.55,
-            material: UiMaterial::Acrylic,
+            material: if crate::os_win::dwm_backdrop_supported() {
+                UiMaterial::Acrylic
+            } else {
+                UiMaterial::Solid
+            },
             ui_transparency: true,
             ui_opacity: default_ui_opacity(),
             ui_scale: default_ui_scale(),
@@ -268,10 +301,15 @@ impl Default for AppSettings {
             gradient_saturation: default_gradient_sat(),
             accent: [255, 140, 66],
             menu_colors: default_menu_colors(),
-            pressure_sensitivity: 1.0,
-            pen_pressure_curve: PenPressureCurve::Linear,
+            pressure_curve: TransferCurve::identity(),
+            pressure_curve_preset: default_pressure_preset(),
             mouse_pressure_mode: MousePressureMode::default(),
-            mouse_pressure_fixed: 0.5,
+            mouse_pressure_max: default_mouse_pressure_max(),
+            mouse_pressure_min: default_mouse_pressure_min(),
+            mouse_velocity_ref: default_mouse_velocity_ref(),
+            mouse_velocity_smooth: default_mouse_velocity_smooth(),
+            mouse_velocity_invert: false,
+            mouse_ramp_distance: default_mouse_ramp_distance(),
             formats_enabled: FormatFlags::default(),
             keymap: Keymap::default(),
             addons_enabled: HashMap::new(),
@@ -284,13 +322,40 @@ impl Default for AppSettings {
             discord_rpc_enabled: true,
             discord_client_id: String::new(),
             discord_title_mode: DiscordTitleMode::AppName,
-            discord_show_canvas_preview: false,
+            discord_show_canvas_preview: true,
+            window_inner_size: None,
+            window_outer_pos: None,
+            window_maximized: false,
         }
     }
 }
 
 fn default_zoom_step_percent() -> f32 {
     18.0
+}
+
+fn default_pressure_preset() -> String {
+    "Linear".to_string()
+}
+
+fn default_mouse_pressure_max() -> f32 {
+    1.0
+}
+
+fn default_mouse_pressure_min() -> f32 {
+    0.15
+}
+
+fn default_mouse_velocity_ref() -> f32 {
+    1200.0
+}
+
+fn default_mouse_velocity_smooth() -> f32 {
+    0.35
+}
+
+fn default_mouse_ramp_distance() -> f32 {
+    180.0
 }
 
 fn default_autosave_mins() -> u32 {
@@ -343,7 +408,6 @@ fn default_menu_colors() -> HashMap<String, [u8; 3]> {
         "filters",
         "view",
         "window",
-        "help",
     ]
     .into_iter()
     .map(|k| (k.to_string(), base))
@@ -366,9 +430,35 @@ impl AppSettings {
         let Ok(bytes) = std::fs::read(&path) else {
             return Self::default();
         };
-        let mut s: Self = serde_json::from_slice(&bytes).unwrap_or_default();
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        let mut s: Self = serde_json::from_value(value.clone()).unwrap_or_default();
+        // Migrate Soft/Linear/Hard enum → TransferCurve when new field absent.
+        if value.get("pressure_curve").is_none() {
+            if let Some(old) = value.get("pen_pressure_curve").and_then(|v| v.as_str()) {
+                let (curve, name) = match old {
+                    "soft" => (TransferCurve::preset_soft(), "Soft"),
+                    "hard" => (TransferCurve::preset_hard(), "Hard"),
+                    _ => (TransferCurve::identity(), "Linear"),
+                };
+                s.pressure_curve = curve;
+                s.pressure_curve_preset = name.to_string();
+            }
+        }
+        s.pressure_curve.sanitize();
+        if s.pressure_curve_preset.is_empty() {
+            s.pressure_curve_preset = s
+                .pressure_curve
+                .matching_preset()
+                .unwrap_or("Custom")
+                .to_string();
+        }
         // Legacy: acrylic_enabled=false with default material → Solid.
         if !s.acrylic_enabled && matches!(s.material, UiMaterial::Acrylic) {
+            s.material = UiMaterial::Solid;
+        }
+        // Win10: DWM materials make clicks/popups fall outside the window.
+        if s.material.uses_dwm_backdrop() && !crate::os_win::dwm_backdrop_supported() {
             s.material = UiMaterial::Solid;
         }
         s.acrylic_enabled = s.material.uses_dwm_backdrop();
@@ -416,6 +506,11 @@ impl AppSettings {
     }
 
     pub fn set_material(&mut self, material: UiMaterial) {
+        let material = if material.uses_dwm_backdrop() && !crate::os_win::dwm_backdrop_supported() {
+            UiMaterial::Solid
+        } else {
+            material
+        };
         self.material = material;
         self.acrylic_enabled = material.uses_dwm_backdrop();
     }
@@ -429,9 +524,10 @@ impl AppSettings {
                 self.gradient_b = [48, 32, 28];
             }
             ThemeBrightness::Light => {
-                self.app_color = [236, 236, 240];
-                self.gradient_a = [248, 248, 252];
-                self.gradient_b = [220, 228, 240];
+                // Soft off-white surface (not pure #FFF) + cool-neutral gradient.
+                self.app_color = [245, 245, 247];
+                self.gradient_a = [252, 252, 254];
+                self.gradient_b = [232, 236, 244];
             }
         }
         self.sync_menu_colors_from_app();
@@ -461,16 +557,25 @@ impl AppSettings {
         self.color_fill = ColorFillMode::Gradient;
     }
 
-    /// Recolor top-menu chips from the global app color (slightly lifted).
+    /// Recolor top-menu chips from the global app color.
     pub fn sync_menu_colors_from_app(&mut self) {
         let base = self.app_color;
-        let lifted = [
-            ((base[0] as u16 + 18).min(255)) as u8,
-            ((base[1] as u16 + 18).min(255)) as u8,
-            ((base[2] as u16 + 18).min(255)) as u8,
-        ];
+        let light = matches!(self.theme_brightness, ThemeBrightness::Light);
+        let lifted = if light {
+            [
+                base[0].saturating_sub(10),
+                base[1].saturating_sub(10),
+                base[2].saturating_sub(10),
+            ]
+        } else {
+            [
+                ((base[0] as u16 + 18).min(255)) as u8,
+                ((base[1] as u16 + 18).min(255)) as u8,
+                ((base[2] as u16 + 18).min(255)) as u8,
+            ]
+        };
         for key in [
-            "file", "edit", "canvas", "selection", "filters", "view", "window", "help",
+            "file", "edit", "canvas", "selection", "filters", "view", "window",
         ] {
             self.menu_colors.insert(key.to_string(), lifted);
         }
@@ -581,8 +686,15 @@ impl AppSettings {
         self.ui_scale = self.ui_scale.clamp(0.75, 2.0);
         self.gradient_angle_deg = self.gradient_angle_deg.rem_euclid(360.0);
         self.gradient_saturation = self.gradient_saturation.clamp(0.0, 2.0);
-        self.pressure_sensitivity = self.pressure_sensitivity.clamp(0.1, 3.0);
-        self.mouse_pressure_fixed = self.mouse_pressure_fixed.clamp(0.05, 1.0);
+        self.pressure_curve.sanitize();
+        self.mouse_pressure_min = self.mouse_pressure_min.clamp(0.0, 1.0);
+        self.mouse_pressure_max = self.mouse_pressure_max.clamp(0.05, 1.0);
+        if self.mouse_pressure_min > self.mouse_pressure_max {
+            std::mem::swap(&mut self.mouse_pressure_min, &mut self.mouse_pressure_max);
+        }
+        self.mouse_velocity_ref = self.mouse_velocity_ref.clamp(50.0, 8000.0);
+        self.mouse_velocity_smooth = self.mouse_velocity_smooth.clamp(0.05, 1.0);
+        self.mouse_ramp_distance = self.mouse_ramp_distance.clamp(20.0, 2000.0);
         self.zoom_step_percent = self.zoom_step_percent.clamp(5.0, 50.0);
         self.autosave_interval_mins = self.autosave_interval_mins.clamp(1, 60);
         self.autosave_keep_versions = self.autosave_keep_versions.clamp(1, 20);

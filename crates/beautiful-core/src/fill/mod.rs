@@ -9,7 +9,7 @@
 //!      opacity, blend mode, preserve-alpha and ignore-transparent.
 //!
 //! Matching always compares against the chosen sample source; writes always land
-//! on the active layer, matching Krita "Sample: Current & Below / All".
+//! on the active layer (sample current / below / all layers).
 
 mod scanline;
 

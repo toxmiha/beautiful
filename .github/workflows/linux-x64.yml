@@ -1,14 +1,19 @@
 # Build Beautiful for Linux x86_64 (Steam Deck / SteamOS compatible).
+# Disabled for routine use — do not run unless explicitly needed.
 name: linux-x64
 
 on:
+  # Manual only; not on push/tags (Windows is the primary ship target).
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
+    inputs:
+      confirm:
+        description: 'Type BUILD to confirm Linux build'
+        required: true
+        default: ''
 
 jobs:
   build:
+    if: github.event.inputs.confirm == 'BUILD'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -23,26 +28,25 @@ jobs:
             mesa-vulkan-drivers libvulkan-dev
 
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-gnu
 
       - name: Build release
-        run: cargo build --release -p beautiful-app --target x86_64-unknown-linux-gnu
+        run: cargo build --release -p beautiful-app
 
       - name: Pack Beautiful-Alpha/linux
         run: |
           mkdir -p dist/Beautiful-Alpha/linux
-          cp target/x86_64-unknown-linux-gnu/release/beautiful dist/Beautiful-Alpha/linux/
+          cp target/release/beautiful dist/Beautiful-Alpha/linux/
           chmod +x dist/Beautiful-Alpha/linux/beautiful
           cat > dist/Beautiful-Alpha/linux/run-beautiful.sh <<'EOF'
           #!/usr/bin/env bash
           DIR="$(cd "$(dirname "$0")" && pwd)"
+          cd "$DIR"
           export WGPU_BACKEND="${WGPU_BACKEND:-vulkan}"
           exec "$DIR/beautiful" "$@"
           EOF
           chmod +x dist/Beautiful-Alpha/linux/run-beautiful.sh
           cat > dist/Beautiful-Alpha/linux/README.txt <<'EOF'
-          Beautiful — Linux / Steam Deck
+          Beautiful — Linux x86_64 / Steam Deck (SteamOS)
           Run: ./run-beautiful.sh (needs Vulkan/Mesa)
           EOF
 
@@ -50,3 +54,4 @@ jobs:
         with:
           name: beautiful-linux-x64
           path: dist/Beautiful-Alpha/linux/
+          if-no-files-found: error

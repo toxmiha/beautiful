@@ -1,4 +1,4 @@
-//! Blender-style Preferences window (categories left, settings right).
+//! Preferences window (categories left, settings right).
 
 use std::path::PathBuf;
 
@@ -6,7 +6,7 @@ use eframe::egui;
 
 use crate::addons::AddonManager;
 use crate::keymap::{capture_binding, Action, Keymap};
-use crate::settings::{AppSettings, MousePressureMode, PenPressureCurve};
+use crate::settings::{AppSettings, MousePressureMode};
 use crate::theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,8 +48,6 @@ pub struct PrefsUi {
     path_buf_docs: String,
     path_buf_addons: String,
     path_buf_resources: String,
-    /// One-time Discord Application ID entry (project setup).
-    discord_setup_id: String,
     /// Filter text for the Interface → UI font combo.
     font_filter: String,
 }
@@ -63,7 +61,6 @@ impl Default for PrefsUi {
             path_buf_docs: String::new(),
             path_buf_addons: String::new(),
             path_buf_resources: String::new(),
-            discord_setup_id: String::new(),
             font_filter: String::new(),
         }
     }
@@ -105,6 +102,8 @@ pub fn show_preferences(
     settings: &mut AppSettings,
     addons: &mut AddonManager,
     rpc_status: crate::discord_rpc::RpcUiStatus,
+    live_raw_pressure: Option<f32>,
+    live_mapped_pressure: Option<f32>,
 ) -> PrefsApply {
     let mut apply = PrefsApply {
         appearance: false,
@@ -122,20 +121,23 @@ pub fn show_preferences(
 
     let mut open = ui_state.open;
     let center = ctx.content_rect().center();
+    let screen = ctx.content_rect().shrink(20.0);
     egui::Window::new("Preferences")
         .open(&mut open)
         .collapsible(false)
-        .resizable(false)
+        .resizable(true)
         .movable(true)
         .order(egui::Order::Foreground)
-        .default_pos(center - egui::vec2(400.0, 280.0))
-        .default_size([800.0, 520.0])
-        .min_size([720.0, 420.0])
-        .max_size([900.0, 640.0])
+        .default_pos(center - egui::vec2(410.0, 270.0))
+        .default_size([820.0, 540.0])
+        .min_size([640.0, 420.0])
+        // Hard cap — without this, ScrollArea/labels ratchet the window every frame.
+        .max_size([960.0, 720.0])
+        .constrain_to(screen)
         .frame(
             egui::Frame::window(&ctx.style())
                 .fill(theme::menu_fill())
-                .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                .stroke(egui::Stroke::new(1.0_f32, theme::stroke()))
                 .corner_radius(12.0)
                 .inner_margin(egui::Margin::same(12))
                 .shadow(egui::Shadow {
@@ -149,9 +151,12 @@ pub fn show_preferences(
             theme::apply_opaque_chrome(ui);
             ui.visuals_mut().window_fill = theme::menu_fill();
             ui.visuals_mut().panel_fill = theme::menu_fill();
-            ui.visuals_mut().override_text_color = Some(theme::TEXT);
+            ui.visuals_mut().override_text_color = Some(theme::text());
+            // Fit to the *current* window rect; never raise min_size to content
+            // (that is the classic egui self-growing window feedback loop).
             let full = ui.available_size();
-            // Blender-style: left vertical category list + right content.
+            ui.set_max_size(full);
+            // Left vertical category list + right content.
             ui.horizontal(|ui| {
                 ui.allocate_ui_with_layout(
                     egui::vec2(168.0, full.y),
@@ -163,6 +168,7 @@ pub fn show_preferences(
                         ui.add_space(4.0);
                         egui::ScrollArea::vertical()
                             .id_salt("prefs_cats")
+                            .max_height((full.y - 28.0).max(80.0))
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.with_layout(
@@ -188,15 +194,28 @@ pub fn show_preferences(
                     },
                 );
                 ui.separator();
+                let body_w = (full.x - 180.0).max(200.0);
                 ui.allocate_ui_with_layout(
-                    egui::vec2((full.x - 180.0).max(400.0), full.y),
+                    egui::vec2(body_w, full.y),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
+                        let scroll_src = if ui_state.category == PrefsCategory::Input {
+                            // Curve editor needs pointer drag; keep wheel + scrollbar only.
+                            egui::containers::scroll_area::ScrollSource {
+                                scroll_bar: true,
+                                drag: false,
+                                mouse_wheel: true,
+                            }
+                        } else {
+                            egui::containers::scroll_area::ScrollSource::ALL
+                        };
                         egui::ScrollArea::vertical()
                             .id_salt("prefs_body")
+                            .max_height(full.y.max(80.0))
                             .auto_shrink([false, false])
+                            .scroll_source(scroll_src)
                             .show(ui, |ui| {
-                                ui.set_min_width(ui.available_width().max(400.0));
+                                ui.set_max_width(body_w);
                                 ui.label(theme::heading(ui_state.category.title()));
                                 ui.add_space(8.0);
                                 match ui_state.category {
@@ -213,7 +232,7 @@ pub fn show_preferences(
                                         interface_panel(ui, ctx, settings, ui_state, &mut apply);
                                     }
                                     PrefsCategory::Input => {
-                                        input_panel(ui, settings);
+                                        input_panel(ui, settings, live_raw_pressure, live_mapped_pressure);
                                     }
                                     PrefsCategory::Formats => {
                                         formats_panel(ui, settings);
@@ -270,7 +289,7 @@ fn path_row(ui: &mut egui::Ui, label: &str, buf: &mut String) -> Option<PathBuf>
         ui.add(
             egui::TextEdit::singleline(buf)
                 .desired_width(420.0)
-                .text_color(theme::TEXT),
+                .text_color(theme::text()),
         );
         if theme::btn(ui, theme::label("Browse…")).clicked() {
             if let Some(p) = rfd::FileDialog::new().pick_folder() {
@@ -350,7 +369,7 @@ fn color_edit(ui: &mut egui::Ui, label: &str, rgb: &mut [u8; 3]) -> bool {
 
 fn system_panel_extra_autosave(
     ui: &mut egui::Ui,
-    ui_state: &mut PrefsUi,
+    _ui_state: &mut PrefsUi,
     settings: &mut AppSettings,
     apply: &mut PrefsApply,
     rpc_status: crate::discord_rpc::RpcUiStatus,
@@ -359,7 +378,7 @@ fn system_panel_extra_autosave(
     crate::ui_kit::section(ui, "Autosave & recovery");
     crate::ui_kit::hint(
         ui,
-        "Like Blender: periodic snapshots. After a crash, recover files appear on the home screen.",
+        "Periodic snapshots while editing. After a crash, recover files appear on the home screen.",
     );
     ui.checkbox(
         &mut settings.autosave_enabled,
@@ -384,7 +403,7 @@ fn system_panel_extra_autosave(
     crate::ui_kit::section(ui, "Discord Rich Presence");
     crate::ui_kit::hint(
         ui,
-        "Как у игр: Application ID зашит в проект. В Discord → Settings → Activity Privacy включи Display current activity. Нужен Discord desktop.",
+        "Как у игр: Discord desktop + Activity Privacy → Display current activity. Application ID уже встроен в Beautiful.",
     );
     if ui
         .checkbox(
@@ -417,63 +436,15 @@ fn system_panel_extra_autosave(
                 theme::label("Превью холста (крупная картинка)"),
             )
             .on_hover_text(
-                "Уменьшенный JPEG уходит на временный хост (litterbox, 72ч), чтобы Discord мог его показать. Логотип — в углу. Без превью — большой логотип.",
+                "JPEG превью временно грузится на хост, чтобы Discord мог показать картинку. NSFW-холсты никогда не показывают превью и имя. В Discord Developer Portal → Rich Presence → Art Assets загрузи квадратный логотип с ключом logo.",
             )
             .changed()
         {
             apply.discord = true;
         }
         ui.label(theme::label_dim(
-            "Всегда: время сессии · выбранный инструмент · логотип",
+            "Всегда: время сессии · инструмент · размер холста · слои. NSFW → скрыты имя и превью.",
         ));
-        if matches!(
-            rpc_status,
-            crate::discord_rpc::RpcUiStatus::MissingClientId
-        ) {
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new(
-                    "Одноразово для проекта: создай Application «Beautiful» на discord.com/developers и вставь Application ID:",
-                )
-                .color(egui::Color32::from_rgb(220, 140, 100))
-                .size(12.0),
-            );
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut ui_state.discord_setup_id)
-                        .desired_width(260.0)
-                        .hint_text("Application ID"),
-                );
-                if ui.button(theme::label("Сохранить ID")).clicked() {
-                    if let Err(e) =
-                        crate::discord_rpc::save_appdata_client_id(&ui_state.discord_setup_id)
-                    {
-                        crate::action_log::log("discord", &format!("save id failed: {e}"));
-                    } else {
-                        apply.discord = true;
-                    }
-                }
-                if ui.button(theme::label("Открыть портал")).clicked() {
-                    #[cfg(windows)]
-                    {
-                        let _ = std::process::Command::new("cmd")
-                            .args([
-                                "/C",
-                                "start",
-                                "",
-                                "https://discord.com/developers/applications",
-                            ])
-                            .spawn();
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        let _ = std::process::Command::new("xdg-open")
-                            .arg("https://discord.com/developers/applications")
-                            .spawn();
-                    }
-                }
-            });
-        }
         if ui
             .button(theme::label("Обновить статус сейчас"))
             .clicked()
@@ -483,11 +454,8 @@ fn system_panel_extra_autosave(
     });
     let status_col = match rpc_status {
         crate::discord_rpc::RpcUiStatus::Connected => egui::Color32::from_rgb(120, 200, 140),
-        crate::discord_rpc::RpcUiStatus::Error
-        | crate::discord_rpc::RpcUiStatus::MissingClientId => {
-            egui::Color32::from_rgb(220, 140, 100)
-        }
-        _ => theme::TEXT_DIM,
+        crate::discord_rpc::RpcUiStatus::Error => egui::Color32::from_rgb(220, 140, 100),
+        _ => theme::text_dim(),
     };
     ui.label(
         egui::RichText::new(format!("Статус: {}", rpc_status.label()))
@@ -507,35 +475,45 @@ fn interface_panel(
     use crate::ui_fonts;
 
     ui.label(theme::heading("Window material"));
-    ui.label(theme::label_dim(
-        "Mica / Acrylic use Win11 DWM. Glass / Aero / Smoke also restyle chrome — live.",
-    ));
+    if crate::os_win::dwm_backdrop_supported() {
+        ui.label(theme::label_dim(
+            "Mica / Acrylic use Win11 DWM. Glass / Legacy Glass / Smoke also restyle chrome — live.",
+        ));
+    } else {
+        ui.label(theme::label_dim(
+            "DWM materials need Windows 11. On Windows 10 only Solid is used (avoids clicks falling outside the window).",
+        ));
+    }
     ui.horizontal_wrapped(|ui| {
         for m in [
             UiMaterial::Solid,
             UiMaterial::Acrylic,
             UiMaterial::Mica,
             UiMaterial::Glass,
-            UiMaterial::Aero,
+            UiMaterial::LegacyGlass,
             UiMaterial::Smoke,
         ] {
+            let dwm_ok = crate::os_win::dwm_backdrop_supported();
+            let enabled = matches!(m, UiMaterial::Solid) || dwm_ok;
             let selected = settings.material == m;
-            if ui
-                .selectable_label(selected, theme::label(m.label()))
-                .on_hover_text(match m {
-                    UiMaterial::Solid => "Opaque panels, no blur",
-                    UiMaterial::Acrylic => "Translucent blur tint",
-                    UiMaterial::Mica => "Wallpaper-tinted opaque backdrop",
-                    UiMaterial::Glass => "Frosted glass + bright edge",
-                    UiMaterial::Aero => "Legacy glass blur + gloss",
-                    UiMaterial::Smoke => "Dim smoke overlay chrome",
-                })
-                .clicked()
-            {
-                settings.set_material(m);
-                apply.appearance = true;
-                ctx.request_repaint();
-            }
+            ui.add_enabled_ui(enabled, |ui| {
+                if ui
+                    .selectable_label(selected, theme::label(m.label()))
+                    .on_hover_text(match m {
+                        UiMaterial::Solid => "Opaque panels, no blur",
+                        UiMaterial::Acrylic => "Translucent blur tint (Win11)",
+                        UiMaterial::Mica => "Wallpaper-tinted opaque backdrop (Win11)",
+                        UiMaterial::Glass => "Frosted glass + bright edge (Win11)",
+                        UiMaterial::LegacyGlass => "Legacy glass blur + gloss (Win11)",
+                        UiMaterial::Smoke => "Dim smoke overlay chrome (Win11)",
+                    })
+                    .clicked()
+                {
+                    settings.set_material(m);
+                    apply.appearance = true;
+                    ctx.request_repaint();
+                }
+            });
         }
     });
     ui.add_space(4.0);
@@ -694,12 +672,12 @@ fn interface_panel(
                         if ui
                             .add(
                                 egui::Button::new(
-                                    egui::RichText::new(label).color(theme::TEXT).size(13.0),
+                                    egui::RichText::new(label).color(theme::text()).size(13.0),
                                 )
                                 .fill(if selected {
-                                    theme::BG_TAB_ACTIVE
+                                    theme::bg_tab_active()
                                 } else {
-                                    theme::BG_MENU_ITEM
+                                    theme::bg_menu_item()
                                 })
                                 .min_size(egui::vec2(ui.available_width(), 22.0)),
                             )
@@ -740,7 +718,7 @@ fn interface_panel(
         }
     });
 
-    // Discord-style gradient strip + end pickers.
+    // Two-stop gradient strip + end pickers.
     {
         let (a, b) = (settings.gradient_a, settings.gradient_b);
         let strip_h = 28.0;
@@ -759,7 +737,7 @@ fn interface_panel(
         ui.painter().rect_stroke(
             rect,
             4.0,
-            egui::Stroke::new(1.0_f32, theme::STROKE),
+            egui::Stroke::new(1.0_f32, theme::stroke()),
             egui::StrokeKind::Outside,
         );
     }
@@ -855,62 +833,116 @@ fn interface_panel(
     }
 }
 
-fn input_panel(ui: &mut egui::Ui, settings: &mut AppSettings) {
+fn input_panel(
+    ui: &mut egui::Ui,
+    settings: &mut AppSettings,
+    live_raw: Option<f32>,
+    live_mapped: Option<f32>,
+) {
     ui.label(theme::heading("Stylus / pen"));
     ui.label(theme::label_dim(
         "XP-Pen, Wacom, Huion: enable Windows Ink in the tablet driver. Pressure arrives as Windows Pointer / Touch events.",
     ));
-    ui.add_space(6.0);
-    ui.label(theme::label_dim("Pen pressure sensitivity"));
-    ui.add(egui::Slider::new(&mut settings.pressure_sensitivity, 0.1..=3.0).trailing_fill(true));
+    ui.add_space(8.0);
+    if crate::curve_ui::pressure_curve_panel(
+        ui,
+        &mut settings.pressure_curve,
+        &mut settings.pressure_curve_preset,
+        live_raw,
+        live_mapped,
+    ) {
+        // Curve change is applied next frame via PenInput::apply_settings.
+    }
+    ui.add_space(12.0);
+    ui.label(theme::heading("Mouse pressure emulation"));
     ui.label(theme::label_dim(
-        "<1 = softer response, >1 = firmer (needs harder press for full size)",
+        "When the driver reports no stylus force (mouse, or Ink off). Emulated values still go through the curve above, then into brush Pressure→size/opacity/flow.",
     ));
-    ui.add_space(6.0);
-    ui.label(theme::label_dim("Pressure curve"));
-    ui.horizontal(|ui| {
-        for curve in [
-            PenPressureCurve::Soft,
-            PenPressureCurve::Linear,
-            PenPressureCurve::Hard,
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        for mode in [
+            MousePressureMode::Full,
+            MousePressureMode::Fixed,
+            MousePressureMode::Velocity,
+            MousePressureMode::Ramp,
         ] {
             ui.selectable_value(
-                &mut settings.pen_pressure_curve,
-                curve,
-                theme::label(curve.label()),
+                &mut settings.mouse_pressure_mode,
+                mode,
+                theme::label(mode.label()),
             );
         }
     });
-    ui.add_space(12.0);
-    ui.label(theme::heading("Mouse (no pen pressure)"));
-    ui.label(theme::label_dim(
-        "Used when the driver does not report force (mouse or Ink off).",
-    ));
-    ui.horizontal(|ui| {
-        ui.selectable_value(
-            &mut settings.mouse_pressure_mode,
-            MousePressureMode::Off,
-            "Full (1.0)",
-        );
-        ui.selectable_value(
-            &mut settings.mouse_pressure_mode,
-            MousePressureMode::Fixed,
-            "Fixed",
-        );
-        ui.selectable_value(
-            &mut settings.mouse_pressure_mode,
-            MousePressureMode::Speed,
-            "Speed",
-        );
-    });
-    if matches!(
-        settings.mouse_pressure_mode,
-        MousePressureMode::Fixed | MousePressureMode::Speed
-    ) {
-        ui.label(theme::label_dim("Fixed / base pressure"));
-        ui.add(
-            egui::Slider::new(&mut settings.mouse_pressure_fixed, 0.05..=1.0).trailing_fill(true),
-        );
+    ui.add_space(4.0);
+    match settings.mouse_pressure_mode {
+        MousePressureMode::Full => {
+            ui.label(theme::label_dim(
+                "Always 100% pressure. Brush Pressure toggles see a constant full press.",
+            ));
+        }
+        MousePressureMode::Fixed => {
+            ui.label(theme::label_dim(
+                "Constant pressure while the mouse button is held.",
+            ));
+            ui.label(theme::label_dim("Pressure"));
+            ui.add(
+                egui::Slider::new(&mut settings.mouse_pressure_max, 0.05..=1.0)
+                    .trailing_fill(true)
+                    .suffix(" ×"),
+            );
+        }
+        MousePressureMode::Velocity => {
+            ui.label(theme::label_dim(
+                "Natural media default: slower → harder, faster → lighter (perfect-freehand / quill). Enable Invert for the opposite.",
+            ));
+            ui.label(theme::label_dim("Min pressure (fast)"));
+            ui.add(
+                egui::Slider::new(&mut settings.mouse_pressure_min, 0.0..=1.0).trailing_fill(true),
+            );
+            ui.label(theme::label_dim("Max pressure (slow)"));
+            ui.add(
+                egui::Slider::new(&mut settings.mouse_pressure_max, 0.05..=1.0).trailing_fill(true),
+            );
+            ui.label(theme::label_dim("Reference speed (px/s at full effect)"));
+            ui.add(
+                egui::Slider::new(&mut settings.mouse_velocity_ref, 100.0..=4000.0)
+                    .trailing_fill(true)
+                    .logarithmic(true),
+            );
+            ui.label(theme::label_dim("Smoothing"));
+            ui.add(
+                egui::Slider::new(&mut settings.mouse_velocity_smooth, 0.05..=1.0)
+                    .trailing_fill(true),
+            );
+            ui.checkbox(
+                &mut settings.mouse_velocity_invert,
+                theme::label("Invert (fast = harder)"),
+            );
+        }
+        MousePressureMode::Ramp => {
+            ui.label(theme::label_dim(
+                "Stroke starts soft and builds toward max as you travel — useful for mouse taper without a tablet.",
+            ));
+            ui.label(theme::label_dim("Start pressure"));
+            ui.add(
+                egui::Slider::new(&mut settings.mouse_pressure_min, 0.0..=1.0).trailing_fill(true),
+            );
+            ui.label(theme::label_dim("End pressure"));
+            ui.add(
+                egui::Slider::new(&mut settings.mouse_pressure_max, 0.05..=1.0).trailing_fill(true),
+            );
+            ui.label(theme::label_dim("Distance to max (screen px)"));
+            ui.add(
+                egui::Slider::new(&mut settings.mouse_ramp_distance, 40.0..=800.0)
+                    .trailing_fill(true),
+            );
+        }
+    }
+    if let (Some(raw), Some(mapped)) = (live_raw, live_mapped) {
+        ui.add_space(4.0);
+        ui.label(theme::label_dim(format!(
+            "Live: raw {raw:.2} → curve {mapped:.2}"
+        )));
     }
 }
 
@@ -988,7 +1020,10 @@ fn addons_panel(
     apply: &mut PrefsApply,
 ) {
     ui.label(theme::label_dim(
-        "Script add-ons can register filters/menus (Rhai). Native plugins coming later.",
+        "Add-ons run sandboxed Rhai scripts (no OS / network / files). They only get the permissions listed below. New installs stay disabled until you enable them.",
+    ));
+    ui.label(theme::label_dim(
+        "Only install add-ons you trust — enabling runs their code inside Beautiful.",
     ));
     ui.horizontal(|ui| {
         if theme::btn(ui, theme::label("Reload")).clicked() {
@@ -1025,12 +1060,15 @@ fn addons_panel(
         ui.group(|ui| {
             ui.horizontal(|ui| {
                 let mut on = addon.enabled;
-                if ui
-                    .checkbox(&mut on, theme::label(&addon.manifest.name))
-                    .changed()
-                {
+                let enable = ui.checkbox(&mut on, theme::label(&addon.manifest.name));
+                if enable.changed() {
                     addons.set_enabled(&addon.manifest.id, on, settings);
                     apply.addons_reload = true;
+                }
+                if enable.hovered() {
+                    enable.on_hover_text(
+                        "Enable = allow this script to run with the permissions below",
+                    );
                 }
                 ui.label(theme::label_dim(format!(
                     "v{} · {}",
@@ -1039,6 +1077,23 @@ fn addons_panel(
             });
             if !addon.manifest.description.is_empty() {
                 ui.label(theme::label_dim(&addon.manifest.description));
+            }
+            let perms = addon
+                .permissions
+                .list_sorted()
+                .into_iter()
+                .map(|p| p.label())
+                .collect::<Vec<_>>()
+                .join(" · ");
+            if perms.is_empty() {
+                ui.label(theme::label_dim("Permissions: (none)"));
+            } else {
+                ui.label(theme::label_dim(format!("Permissions: {perms}")));
+            }
+            if addon.legacy_permissions {
+                ui.label(theme::label_dim(
+                    "Manifest has no permissions list — using built-in legacy defaults.",
+                ));
             }
             if let Some(err) = &addon.error {
                 ui.colored_label(egui::Color32::from_rgb(255, 120, 120), err);

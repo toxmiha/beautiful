@@ -1,11 +1,10 @@
-//! Navigator / Overview (Krita-style).
+//! Navigator / Overview — document thumb + viewport rectangle.
 //!
-//! ## Model (same idea as Krita Overview docker)
+//! ## Model
 //! - Thumb shows the **entire document**, letterboxed into the widget.
 //! - White rectangle = current **viewport** in document space (may overhang the
-//!   thumb like the red Navigator box — never collapsed to an edge).
-//! - **Click / drag on thumb** → pan: center the view on that document point
-//!   (Krita: `canvasController()->pan(...)` from overview → canvas transform).
+//!   thumb — never collapsed to an edge).
+//! - **Click / drag on thumb** → pan: center the view on that document point.
 //! - **Zoom slider / ±** → change zoom around the **viewport center**
 //!   (never rewrite zoom from a passive slider bind — only while dragging).
 //! - Navigator never owns the camera: it only calls explicit `CanvasState`
@@ -30,7 +29,7 @@ pub fn navigator_ui(
     }
     let step = zoom_step.clamp(1.05, 1.5);
 
-    ui.label(egui::RichText::new("Navigator").strong().color(theme::TEXT));
+    ui.label(egui::RichText::new("Navigator").strong().color(theme::text()));
     ui.add_space(4.0);
 
     // Thumb fills THIS Navigator panel, after chrome + zoom/rotate rows.
@@ -86,7 +85,7 @@ pub fn navigator_ui(
     ui.painter().rect_stroke(
         content,
         0.0,
-        egui::Stroke::new(1.0_f32, theme::STROKE),
+        egui::Stroke::new(1.0_f32, theme::stroke()),
         egui::StrokeKind::Outside,
     );
 
@@ -104,7 +103,7 @@ pub fn navigator_ui(
         );
     }
 
-    // Pan: click or drag sets view center (Krita overview behavior).
+    // Pan: click or drag sets view center from the overview thumb.
     let pan_input =
         response.dragged_by(PointerButton::Primary) || response.clicked_by(PointerButton::Primary);
     if pan_input {
@@ -130,7 +129,7 @@ pub fn navigator_ui(
     ui.add_space(8.0);
 
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Zoom").color(theme::TEXT_DIM));
+        ui.label(egui::RichText::new("Zoom").color(theme::text_dim()));
         let mut zoom_pct = canvas.zoom_percent();
         let before = zoom_pct;
         let resp = ui.add(
@@ -161,7 +160,7 @@ pub fn navigator_ui(
     });
 
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Rotate").color(theme::TEXT_DIM));
+        ui.label(egui::RichText::new("Rotate").color(theme::text_dim()));
         let mut rot = canvas.rotation_deg;
         let before = rot;
         let resp = ui.add(

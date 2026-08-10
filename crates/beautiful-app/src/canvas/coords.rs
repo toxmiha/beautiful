@@ -2,6 +2,8 @@ use super::*;
 
 /// ~18% zoom change per wheel notch (discrete steps).
 pub const ZOOM_STEP: f32 = 1.18;
+/// egui `line_scroll_speed` points per mouse-wheel notch (~40), not Win32 WHEEL_DELTA 120.
+pub const WHEEL_NOTCH_POINTS: f32 = 40.0;
 
 pub(crate) fn canvas_texture_options(zoom: f32) -> TextureOptions {
     match texture_filter_bucket(zoom) {

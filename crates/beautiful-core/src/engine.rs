@@ -11,7 +11,7 @@ use crate::color::{
 use crate::selection::SelectionMask;
 use crate::tiles::{TileBuffer, TILE_SIZE};
 use crate::tip::TipCache;
-use crate::{BrushKind, BrushSettings, BrushTexture, Layer, StrokeState};
+use crate::{BrushKind, BrushSettings, BrushShape, BrushTexture, Layer, StrokeState};
 
 /// Minimum spacing as fraction of diameter.
 pub const MIN_SPACING: f32 = 0.025;
@@ -49,6 +49,11 @@ impl Layer {
         }
 
         let hardness = brush.hardness.clamp(0.0, 1.0);
+        // Soft Edge shape: soft skirt even at high Hardness (shape was UI-only before).
+        let hardness = match brush.shape {
+            BrushShape::SoftEdge => (hardness * 0.4).clamp(0.0, 0.85),
+            _ => hardness,
+        };
         let blending = brush.effective_blending(pressure);
         let dilution = brush.effective_dilution(pressure);
         let persistence = brush.persistence.clamp(0.0, 1.0);
@@ -58,15 +63,17 @@ impl Layer {
 
         if !stroke.active {
             stroke.begin(brush.color);
-            self.stroke_baseline = Some(self.tiles.clone_shared());
+            // Opacity/Wash plate freeze; Airbrush build-up never samples baseline.
+            self.stroke_baseline = if opacity_mode {
+                Some(self.tiles.clone_shared())
+            } else {
+                None
+            };
             self.stroke_cov.clear();
         }
-
-        // Sample canvas under stamp center for wet-color pickup (Mixer only).
-        // Normal translucent strokes must keep pure ink — wet pickup over existing
-        // paint was muddying color crossings (pink over blue → dark purple).
+        // Pen/Pencil/Marker/Airbrush keep pure ink so translucent crosses stay Normal.
         let (sample_r, sample_g, sample_b, sample_a) = self.sample_rgba_f(x, y);
-        let wet_mix = brush.kind == BrushKind::Mixer;
+        let wet_mix = matches!(brush.kind, BrushKind::Mixer | BrushKind::Brush);
         if wet_mix && brush.kind != BrushKind::Eraser && blending > 0.001 && sample_a > 0.02 {
             let mix = blending * (1.0 - persistence * 0.85);
             stroke.wet[0] += (sample_r - stroke.wet[0]) * mix;
@@ -146,6 +153,7 @@ impl Layer {
                 let _ = self.stroke_cov.ensure_mut(key);
             }
         }
+        self.paint_tiles.mark_dirty_keys(&keys);
         let parallel =
             keys.len() >= 2 && (x1c - x0c) as u64 * (y1c - y0c) as u64 >= (TILE_SIZE as u64).pow(2);
         if parallel {
@@ -311,7 +319,11 @@ impl Layer {
 
         if !stroke.active {
             stroke.begin(brush.color);
-            self.stroke_baseline = Some(self.tiles.clone_shared());
+            self.stroke_baseline = if brush.kind != BrushKind::Airbrush {
+                Some(self.tiles.clone_shared())
+            } else {
+                None
+            };
             self.stroke_cov.clear();
         }
 
@@ -367,6 +379,7 @@ impl Layer {
                 .ensure_region(key, &self.tiles, x0c, y0c, x1c, y1c);
             let _ = self.stroke_cov.ensure_mut(key);
         }
+        self.paint_tiles.mark_dirty_keys(&keys);
 
         for key in keys {
             let cov = self.stroke_cov.ensure_mut(key);
@@ -512,7 +525,7 @@ impl Layer {
             // Spacing must stay continuous — soft brushes need *more* overlap in the
             // visible core, not less. (Hardness-based 0.72×d gaps caused dotted strokes.)
             let spacing_frac = brush.spacing.clamp(MIN_SPACING, 0.5);
-            // Large tips: thin spacing hard (Krita). Soft gets more relief —
+            // Large tips: thin spacing hard. Soft gets more relief —
             // O(r²) dab cost dominates lag; denser stamps do not look better past ~2× overlap.
             let soft = 1.0 - brush.hardness.clamp(0.0, 1.0);
             let large_relief = if diameter > 48.0 {
@@ -605,6 +618,7 @@ impl Layer {
 
         let keys: Vec<_> = TileBuffer::tiles_covering_rect(x0c, y0c, x1c, y1c).collect();
         let ts = TILE_SIZE as i32;
+        self.paint_tiles.mark_dirty_keys(&keys);
         for key in keys {
             let (tx, ty) = key;
             let (ox, oy) = TileBuffer::tile_origin(tx, ty);
@@ -1354,7 +1368,8 @@ mod spacing_tests {
         let mut layer = Layer::new("t", 128, 128);
         let mut tip = TipCache::default();
         let mut blue = BrushSettings::preset_pen();
-        blue.kind = BrushKind::Brush;
+        // Pen keeps pure ink (Normal over). Brush+Blending uses wet pickup separately.
+        blue.kind = BrushKind::Pen;
         blue.pressure_size = false;
         blue.pressure_density = false;
         blue.pressure_blending = false;
@@ -1362,7 +1377,7 @@ mod spacing_tests {
         blue.size = 48.0;
         blue.hardness = 0.0;
         blue.density = 0.4;
-        blue.blending = 0.35;
+        blue.blending = 0.0;
         blue.dilution = 0.15;
         blue.keep_opacity = true;
         blue.hair = 0.0;

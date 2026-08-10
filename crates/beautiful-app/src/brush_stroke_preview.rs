@@ -1,4 +1,4 @@
-//! Live brush stroke preview (Krita-style S-curve).
+//! Live brush stroke preview (S-curve).
 //!
 //! Renders a real engine stroke with current brush params (size, hardness,
 //! spacing, flow/density, opacity, shape, texture, …) into a small offscreen
@@ -43,11 +43,18 @@ pub fn preview_key(brush: &BrushSettings) -> u64 {
         brush.randomize.to_bits(),
         brush.texture_scale.to_bits(),
         brush.texture_scratch_prs.to_bits(),
+        brush.texture_angle.to_bits(),
+        brush.min_flow.to_bits(),
+        brush.flow.to_bits(),
     ] {
         bits.hash(&mut h);
     }
     brush.pressure_size.hash(&mut h);
     brush.pressure_density.hash(&mut h);
+    brush.pressure_flow.hash(&mut h);
+    brush.speed_size.hash(&mut h);
+    brush.speed_opacity.hash(&mut h);
+    brush.speed_flow.hash(&mut h);
     brush.pressure_blending.hash(&mut h);
     brush.pressure_dilution.hash(&mut h);
     brush.keep_opacity.hash(&mut h);
@@ -55,6 +62,7 @@ pub fn preview_key(brush: &BrushSettings) -> u64 {
     brush.shape_invert_transparency.hash(&mut h);
     brush.texture_invert.hash(&mut h);
     brush.texture_invert_transparency.hash(&mut h);
+    brush.texture_move_with_stroke.hash(&mut h);
     h.finish()
 }
 
@@ -94,7 +102,7 @@ fn render(brush: &BrushSettings) -> ColorImage {
     composite_on_checker(&rgba, w as usize, h as usize)
 }
 
-/// Short cubic S-curve with pressure 0→1 (Krita-style, compact panel width).
+/// Short cubic S-curve with pressure 0→1 (compact panel width).
 fn s_curve_points(w: f32, h: f32, brush_size: f32) -> Vec<(f32, f32, f32)> {
     let margin = (brush_size * 0.55 + 6.0).min(w * 0.18);
     // Compact arc — not a full-width S (old preview felt too long).

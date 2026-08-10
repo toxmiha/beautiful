@@ -46,6 +46,8 @@ pub struct OpenCanvas {
     pub id: CanvasId,
     pub title: String,
     pub path: Option<PathBuf>,
+    /// Library / new-canvas NSFW flag — Discord hides name + preview when set.
+    pub nsfw: bool,
     /// `document.edit_generation()` last known for this tab.
     pub edit_gen: u64,
     /// Generation at last save/open for this tab.
@@ -92,6 +94,7 @@ impl OpenCanvasList {
                 id: CanvasId(1),
                 title: title.into(),
                 path: None,
+                nsfw: false,
                 edit_gen: 0,
                 saved_edit_gen: 0,
                 parked: None,
@@ -158,6 +161,10 @@ impl OpenCanvasList {
         t.saved_edit_gen = saved_edit_gen;
     }
 
+    pub fn set_active_nsfw(&mut self, nsfw: bool) {
+        self.active_mut().nsfw = nsfw;
+    }
+
     /// Park live workspace into the active tab slot.
     pub fn park_active(
         &mut self,
@@ -185,6 +192,17 @@ impl OpenCanvasList {
         edit_gen: u64,
         saved_edit_gen: u64,
     ) -> Result<usize, &'static str> {
+        self.push_active_new_ex(title, path, edit_gen, saved_edit_gen, false)
+    }
+
+    pub fn push_active_new_ex(
+        &mut self,
+        title: String,
+        path: Option<PathBuf>,
+        edit_gen: u64,
+        saved_edit_gen: u64,
+        nsfw: bool,
+    ) -> Result<usize, &'static str> {
         if !self.can_open_more() {
             return Err("Too many open canvases — close a tab first");
         }
@@ -195,6 +213,7 @@ impl OpenCanvasList {
             id,
             title,
             path,
+            nsfw,
             edit_gen,
             saved_edit_gen,
             parked: None,

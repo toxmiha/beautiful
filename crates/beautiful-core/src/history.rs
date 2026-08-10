@@ -6,7 +6,7 @@ use crate::composite::DirtyRect;
 use crate::layer::Layer;
 use crate::mask_tiles::AlphaTileMap;
 use crate::selection::{SelectionMask, SelectionRect};
-use crate::tiles::TileBuffer;
+use crate::tiles::{TileArc, TileBuffer, TileKey};
 
 const DEFAULT_MAX_STEPS: usize = 50;
 
@@ -33,6 +33,15 @@ pub enum HistoryEntry {
         before: TileBuffer,
         after: TileBuffer,
         /// Display dirty for regional recomposite (not full canvas).
+        dirty: DirtyRect,
+        undo_sel: Option<SelectionSnap>,
+        redo_sel: Option<SelectionSnap>,
+    },
+    /// Only tiles that changed inside dirty (stroke path) — cheaper RAM + restore.
+    LayerTileDiff {
+        layer_idx: usize,
+        /// (key, before_tile, after_tile); None = absent / transparent.
+        changes: Vec<(TileKey, Option<TileArc>, Option<TileArc>)>,
         dirty: DirtyRect,
         undo_sel: Option<SelectionSnap>,
         redo_sel: Option<SelectionSnap>,
@@ -72,6 +81,8 @@ pub enum HistoryEntry {
 pub struct HistoryEffect {
     pub dirty: HistoryDirty,
     pub selection: Option<SelectionSnap>,
+    /// Layer whose pixels/mask were restored (for hidden-layer undo toast).
+    pub affected_layer: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -220,14 +231,26 @@ impl History {
         if !tiles_differ_in_dirty(&before_tiles, &after, dirty) {
             return;
         }
-        self.push(HistoryEntry::LayerTiles {
-            layer_idx: self.stroke_layer,
-            before: before_tiles,
-            after,
-            dirty,
-            undo_sel: None,
-            redo_sel: None,
-        });
+        let changes = collect_tile_diff(&before_tiles, &after, dirty);
+        // Prefer tile-diff for strokes (few tiles); keep full map only if pathological.
+        if !changes.is_empty() && changes.len() <= 4096 {
+            self.push(HistoryEntry::LayerTileDiff {
+                layer_idx: self.stroke_layer,
+                changes,
+                dirty,
+                undo_sel: None,
+                redo_sel: None,
+            });
+        } else {
+            self.push(HistoryEntry::LayerTiles {
+                layer_idx: self.stroke_layer,
+                before: before_tiles,
+                after,
+                dirty,
+                undo_sel: None,
+                redo_sel: None,
+            });
+        }
     }
 
     pub fn cancel_stroke(&mut self) {
@@ -438,6 +461,7 @@ impl History {
                 HistoryEffect {
                     dirty: HistoryDirty::Region(*rect),
                     selection: None,
+                    affected_layer: Some(*layer_idx),
                 }
             }
             HistoryEntry::LayerTiles {
@@ -454,6 +478,24 @@ impl History {
                 HistoryEffect {
                     dirty: HistoryDirty::Region(*dirty),
                     selection: undo_sel.clone(),
+                    affected_layer: Some(*layer_idx),
+                }
+            }
+            HistoryEntry::LayerTileDiff {
+                layer_idx,
+                changes,
+                dirty,
+                undo_sel,
+                ..
+            } => {
+                if let Some(layer) = layers.get_mut(*layer_idx) {
+                    apply_tile_diff(&mut layer.tiles, changes, true);
+                    layer.invalidate_paint_f();
+                }
+                HistoryEffect {
+                    dirty: HistoryDirty::Region(*dirty),
+                    selection: undo_sel.clone(),
+                    affected_layer: Some(*layer_idx),
                 }
             }
             HistoryEntry::LayerMask {
@@ -470,6 +512,7 @@ impl History {
                 HistoryEffect {
                     dirty: HistoryDirty::Region(*dirty),
                     selection: None,
+                    affected_layer: Some(*layer_idx),
                 }
             }
             HistoryEntry::Layers {
@@ -482,6 +525,7 @@ impl History {
                 HistoryEffect {
                     dirty: HistoryDirty::Full,
                     selection: None,
+                    affected_layer: None,
                 }
             }
             HistoryEntry::LayerInsert {
@@ -496,11 +540,13 @@ impl History {
                 HistoryEffect {
                     dirty: HistoryDirty::Full,
                     selection: None,
+                    affected_layer: None,
                 }
             }
             HistoryEntry::Selection { before, .. } => HistoryEffect {
                 dirty: HistoryDirty::Full,
                 selection: Some(before.clone()),
+                affected_layer: None,
             },
         };
         self.redo.push(entry);
@@ -526,6 +572,7 @@ impl History {
                 HistoryEffect {
                     dirty: HistoryDirty::Region(*rect),
                     selection: None,
+                    affected_layer: Some(*layer_idx),
                 }
             }
             HistoryEntry::LayerTiles {
@@ -542,6 +589,24 @@ impl History {
                 HistoryEffect {
                     dirty: HistoryDirty::Region(*dirty),
                     selection: redo_sel.clone(),
+                    affected_layer: Some(*layer_idx),
+                }
+            }
+            HistoryEntry::LayerTileDiff {
+                layer_idx,
+                changes,
+                dirty,
+                redo_sel,
+                ..
+            } => {
+                if let Some(layer) = layers.get_mut(*layer_idx) {
+                    apply_tile_diff(&mut layer.tiles, changes, false);
+                    layer.invalidate_paint_f();
+                }
+                HistoryEffect {
+                    dirty: HistoryDirty::Region(*dirty),
+                    selection: redo_sel.clone(),
+                    affected_layer: Some(*layer_idx),
                 }
             }
             HistoryEntry::LayerMask {
@@ -558,6 +623,7 @@ impl History {
                 HistoryEffect {
                     dirty: HistoryDirty::Region(*dirty),
                     selection: None,
+                    affected_layer: Some(*layer_idx),
                 }
             }
             HistoryEntry::Layers {
@@ -570,6 +636,7 @@ impl History {
                 HistoryEffect {
                     dirty: HistoryDirty::Full,
                     selection: None,
+                    affected_layer: None,
                 }
             }
             HistoryEntry::LayerInsert {
@@ -584,11 +651,13 @@ impl History {
                 HistoryEffect {
                     dirty: HistoryDirty::Full,
                     selection: None,
+                    affected_layer: None,
                 }
             }
             HistoryEntry::Selection { after, .. } => HistoryEffect {
                 dirty: HistoryDirty::Full,
                 selection: Some(after.clone()),
+                affected_layer: None,
             },
         };
         self.undo.push(entry);
@@ -617,6 +686,23 @@ fn entry_approx_bytes(e: &HistoryEntry) -> u64 {
             ..
         } => {
             let mut n = before.approx_bytes().saturating_add(after.approx_bytes());
+            if let Some(s) = undo_sel {
+                n = n.saturating_add(snap_approx_bytes(s));
+            }
+            if let Some(s) = redo_sel {
+                n = n.saturating_add(snap_approx_bytes(s));
+            }
+            n
+        }
+        HistoryEntry::LayerTileDiff {
+            changes,
+            undo_sel,
+            redo_sel,
+            ..
+        } => {
+            let mut n = (changes.len() as u64)
+                .saturating_mul(crate::tiles::TILE_BYTES as u64)
+                .saturating_mul(2);
             if let Some(s) = undo_sel {
                 n = n.saturating_add(snap_approx_bytes(s));
             }
@@ -677,4 +763,37 @@ fn tiles_differ_in_dirty(a: &TileBuffer, b: &TileBuffer, dirty: DirtyRect) -> bo
         }
     }
     false
+}
+
+fn collect_tile_diff(
+    before: &TileBuffer,
+    after: &TileBuffer,
+    dirty: DirtyRect,
+) -> Vec<(TileKey, Option<TileArc>, Option<TileArc>)> {
+    let mut out = Vec::new();
+    let x0 = dirty.x0 as i32;
+    let y0 = dirty.y0 as i32;
+    let x1 = dirty.x1 as i32;
+    let y1 = dirty.y1 as i32;
+    for key in TileBuffer::tiles_covering_rect(x0, y0, x1, y1) {
+        let ba = before.get_tile(key.0, key.1).cloned();
+        let aa = after.get_tile(key.0, key.1).cloned();
+        match (&ba, &aa) {
+            (None, None) => {}
+            (Some(b), Some(a)) if Arc::ptr_eq(b, a) => {}
+            _ => out.push((key, ba, aa)),
+        }
+    }
+    out
+}
+
+fn apply_tile_diff(
+    tiles: &mut TileBuffer,
+    changes: &[(TileKey, Option<TileArc>, Option<TileArc>)],
+    undo: bool,
+) {
+    for (key, before, after) in changes {
+        let tile = if undo { before } else { after };
+        tiles.set_tile_opt(*key, tile.clone());
+    }
 }

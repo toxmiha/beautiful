@@ -1,9 +1,17 @@
-//! Blender-like add-on manager (manifest + Rhai scripts + deep UI host API).
+//! Add-on manager (manifest + sandboxed Rhai + capability host API).
+//!
+//! Security model (narrow script API + explicit permission gates):
+//! - Scripts only talk to the host through registered functions → [`HostCommand`].
+//! - Manifest `permissions` gate which host APIs exist (undeclared = denied).
+//! - No filesystem / network / process APIs are ever exposed to scripts.
+//! - Rhai engines have operation / depth / string limits (DoS).
+//! - Zip/folder install enforces size + path constraints; new installs start disabled.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
 use rhai::{Dynamic, Engine, Scope, AST};
@@ -11,19 +19,128 @@ use serde::{Deserialize, Serialize};
 
 use crate::settings::AppSettings;
 
+/// Hard caps for untrusted script / package content.
+const MAX_SCRIPT_BYTES: u64 = 512 * 1024;
+const MAX_ZIP_ENTRIES: usize = 500;
+const MAX_ZIP_UNCOMPRESSED: u64 = 8 * 1024 * 1024;
+const MAX_ZIP_FILE: u64 = 2 * 1024 * 1024;
+const MAX_FOLDER_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_RHAI_OPS: u64 = 250_000;
+const MAX_RHAI_CALL_LEVELS: usize = 32;
+const MAX_RHAI_STRING: usize = 64 * 1024;
+const MAX_RHAI_ARRAY: usize = 10_000;
+const MAX_RHAI_MAP: usize = 10_000;
+const MAX_RHAI_EXPR_DEPTH: usize = 64;
+const MAX_ALERT_CHARS: usize = 512;
+
+/// Permissions a script may request. Anything else is rejected at load/install.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddonPermission {
+    /// invert_active_layer, new_layer
+    DocumentEdit,
+    /// set_brush_size / opacity / fg color
+    BrushWrite,
+    /// ui_* builders + register_panel
+    UiPanel,
+    /// log, alert, set_status, touch_display
+    UiNotify,
+    /// register_filter, register_menu
+    MenuRegister,
+}
+
+impl AddonPermission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DocumentEdit => "document_edit",
+            Self::BrushWrite => "brush_write",
+            Self::UiPanel => "ui_panel",
+            Self::UiNotify => "ui_notify",
+            Self::MenuRegister => "menu_register",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DocumentEdit => "Edit document (layers)",
+            Self::BrushWrite => "Change brush / FG color",
+            Self::UiPanel => "Show UI panels",
+            Self::UiNotify => "Status / alerts / log",
+            Self::MenuRegister => "Register menus / filters",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "document_edit" => Ok(Self::DocumentEdit),
+            "brush_write" => Ok(Self::BrushWrite),
+            "ui_panel" => Ok(Self::UiPanel),
+            "ui_notify" => Ok(Self::UiNotify),
+            "menu_register" => Ok(Self::MenuRegister),
+            // Explicit forever-denied names → clear error (not silent ignore).
+            "network" | "http" | "filesystem" | "fs" | "process" | "shell" | "native"
+            | "eval" | "os" | "clipboard_read" | "full_access" => Err(format!(
+                "permission '{s}' is not available (scripts cannot access OS/network/files)"
+            )),
+            other => Err(format!("unknown permission '{other}'")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PermissionSet {
+    inner: HashSet<AddonPermission>,
+}
+
+impl PermissionSet {
+    pub fn from_manifest_list(raw: &[String]) -> Result<Self, String> {
+        let mut inner = HashSet::new();
+        for s in raw {
+            inner.insert(AddonPermission::parse(s)?);
+        }
+        Ok(Self { inner })
+    }
+
+    /// Legacy manifests without `permissions`: grant today's safe host surface only.
+    pub fn legacy_default() -> Self {
+        Self {
+            inner: HashSet::from([
+                AddonPermission::DocumentEdit,
+                AddonPermission::BrushWrite,
+                AddonPermission::UiPanel,
+                AddonPermission::UiNotify,
+                AddonPermission::MenuRegister,
+            ]),
+        }
+    }
+
+    pub fn allows(&self, p: AddonPermission) -> bool {
+        self.inner.contains(&p)
+    }
+
+    pub fn list_sorted(&self) -> Vec<AddonPermission> {
+        let mut v: Vec<_> = self.inner.iter().copied().collect();
+        v.sort_by_key(|p| p.as_str());
+        v
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AddonManifest {
     pub id: String,
     pub name: String,
     #[serde(default)]
     pub version: String,
-    /// "script" | "native" (native = coming soon)
+    /// "script" only for now. "native" is rejected.
     #[serde(default = "default_type")]
     pub r#type: String,
     #[serde(default = "default_entry")]
     pub entry: String,
     #[serde(default)]
     pub description: String,
+    /// Capability list. Empty / omitted → [`PermissionSet::legacy_default`] with a load warning.
+    #[serde(default)]
+    pub permissions: Vec<String>,
 }
 
 fn default_type() -> String {
@@ -39,6 +156,9 @@ pub struct InstalledAddon {
     pub path: PathBuf,
     pub enabled: bool,
     pub error: Option<String>,
+    pub permissions: PermissionSet,
+    /// True when manifest omitted permissions (compat path).
+    pub legacy_permissions: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -91,11 +211,16 @@ pub enum AddonUiNode {
 #[derive(Default, Clone)]
 struct UiScratch {
     nodes: Vec<AddonUiNode>,
-    /// Values returned to scripts for interactive widgets (previous frame).
     clicks: HashMap<String, bool>,
     bools: HashMap<String, bool>,
     floats: HashMap<String, f64>,
     colors: HashMap<String, [u8; 3]>,
+}
+
+struct LoadedEngine {
+    engine: Engine,
+    ast: AST,
+    permissions: PermissionSet,
 }
 
 pub struct AddonManager {
@@ -103,7 +228,7 @@ pub struct AddonManager {
     pub filters: Vec<RegisteredFilter>,
     pub menus: Vec<RegisteredMenu>,
     pub panels: Vec<RegisteredPanel>,
-    engines: HashMap<String, (Engine, AST)>,
+    engines: HashMap<String, LoadedEngine>,
     ui_state: HashMap<String, UiScratch>,
     pub status: Option<String>,
 }
@@ -143,30 +268,44 @@ impl AddonManager {
             if !path.is_dir() {
                 continue;
             }
+            // Skip install scratch dirs.
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("_tmp_install_"))
+            {
+                continue;
+            }
             let manifest_path = path.join("manifest.json");
             let Ok(bytes) = fs::read(&manifest_path) else {
                 continue;
             };
+            if bytes.len() as u64 > MAX_ZIP_FILE {
+                continue;
+            }
             let Ok(manifest) = serde_json::from_slice::<AddonManifest>(&bytes) else {
                 continue;
             };
-            let enabled = settings
-                .addons_enabled
-                .get(&manifest.id)
-                .copied()
-                .unwrap_or(true);
+            let (permissions, legacy_permissions, validate_err) = match validate_manifest(&manifest)
+            {
+                Ok((p, legacy)) => (p, legacy, None),
+                Err(e) => (PermissionSet::default(), false, Some(e)),
+            };
+            let enabled = default_enabled_for(&manifest.id, settings);
             let mut addon = InstalledAddon {
                 manifest,
                 path: path.clone(),
                 enabled,
-                error: None,
+                error: validate_err,
+                permissions,
+                legacy_permissions,
             };
-            if addon.enabled && addon.manifest.r#type == "script" {
+            if addon.error.is_none() && addon.enabled && addon.manifest.r#type == "script" {
                 if let Err(e) = self.load_script_addon(&addon) {
                     addon.error = Some(e);
                 }
-            } else if addon.enabled && addon.manifest.r#type == "native" {
-                addon.error = Some("Native add-ons coming soon".into());
+            } else if addon.error.is_none() && addon.enabled && addon.manifest.r#type == "native" {
+                addon.error = Some("Native add-ons are disabled for security".into());
             }
             self.addons.push(addon);
         }
@@ -174,38 +313,48 @@ impl AddonManager {
     }
 
     fn load_script_addon(&mut self, addon: &InstalledAddon) -> Result<(), String> {
-        let entry = addon.path.join(&addon.manifest.entry);
+        let entry = resolve_under_root(&addon.path, &addon.manifest.entry)?;
+        let meta = fs::metadata(&entry).map_err(|e| format!("read {}: {e}", entry.display()))?;
+        if meta.len() > MAX_SCRIPT_BYTES {
+            return Err(format!(
+                "script too large ({} > {MAX_SCRIPT_BYTES} bytes)",
+                meta.len()
+            ));
+        }
         let src =
             fs::read_to_string(&entry).map_err(|e| format!("read {}: {e}", entry.display()))?;
+
         let scratch = Rc::new(RefCell::new(RegistrationScratch::default()));
-        let mut engine = Engine::new();
-        {
+        let mut engine = hardened_engine();
+        let perms = addon.permissions.clone();
+
+        if perms.allows(AddonPermission::MenuRegister) {
             let s = scratch.clone();
             engine.register_fn("register_filter", move |label: &str, fn_name: &str| {
                 s.borrow_mut()
                     .filters
-                    .push((label.to_string(), fn_name.to_string()));
+                    .push((clamp_str(label, 128), clamp_str(fn_name, 64)));
             });
-        }
-        {
             let s = scratch.clone();
             engine.register_fn("register_menu", move |path: &str, fn_name: &str| {
                 s.borrow_mut()
                     .menus
-                    .push((path.to_string(), fn_name.to_string()));
+                    .push((clamp_str(path, 128), clamp_str(fn_name, 64)));
             });
         }
-        {
+        if perms.allows(AddonPermission::UiPanel) {
             let s = scratch.clone();
             engine.register_fn("register_panel", move |title: &str, draw_fn: &str| {
                 s.borrow_mut()
                     .panels
-                    .push((title.to_string(), draw_fn.to_string()));
+                    .push((clamp_str(title, 128), clamp_str(draw_fn, 64)));
             });
         }
-        engine.register_fn("log", |msg: &str| {
-            log::info!("[addon] {msg}");
-        });
+        if perms.allows(AddonPermission::UiNotify) {
+            engine.register_fn("log", |msg: &str| {
+                log::info!("[addon] {}", clamp_str(msg, MAX_ALERT_CHARS));
+            });
+        }
 
         let ast = engine.compile(&src).map_err(|e| format!("compile: {e}"))?;
         let mut scope = Scope::new();
@@ -237,63 +386,67 @@ impl AddonManager {
             });
         }
         drop(reg);
-        self.engines
-            .insert(addon.manifest.id.clone(), (engine, ast));
+
+        self.engines.insert(
+            addon.manifest.id.clone(),
+            LoadedEngine {
+                engine,
+                ast,
+                permissions: perms,
+            },
+        );
         Ok(())
     }
 
-    fn register_runtime_api(engine: &mut Engine, cmds: Rc<RefCell<Vec<HostCommand>>>, ui: Rc<RefCell<UiScratch>>) {
-        {
+    fn register_runtime_api(
+        engine: &mut Engine,
+        perms: &PermissionSet,
+        cmds: Rc<RefCell<Vec<HostCommand>>>,
+        ui: Rc<RefCell<UiScratch>>,
+    ) {
+        if perms.allows(AddonPermission::DocumentEdit) {
             let c = cmds.clone();
             engine.register_fn("invert_active_layer", move || {
                 c.borrow_mut().push(HostCommand::InvertActiveLayer);
             });
+            let c = cmds.clone();
+            engine.register_fn("new_layer", move |name: &str| {
+                c.borrow_mut()
+                    .push(HostCommand::NewLayer(clamp_str(name, 128)));
+            });
         }
-        {
+        if perms.allows(AddonPermission::UiNotify) {
             let c = cmds.clone();
             engine.register_fn("alert", move |msg: &str| {
-                c.borrow_mut().push(HostCommand::Alert(msg.to_string()));
+                c.borrow_mut()
+                    .push(HostCommand::Alert(clamp_str(msg, MAX_ALERT_CHARS)));
             });
-        }
-        {
             let c = cmds.clone();
             engine.register_fn("log", move |msg: &str| {
-                c.borrow_mut().push(HostCommand::Log(msg.to_string()));
+                c.borrow_mut()
+                    .push(HostCommand::Log(clamp_str(msg, MAX_ALERT_CHARS)));
             });
-        }
-        {
             let c = cmds.clone();
             engine.register_fn("set_status", move |msg: &str| {
-                c.borrow_mut().push(HostCommand::SetStatus(msg.to_string()));
+                c.borrow_mut()
+                    .push(HostCommand::SetStatus(clamp_str(msg, MAX_ALERT_CHARS)));
             });
-        }
-        {
             let c = cmds.clone();
             engine.register_fn("touch_display", move || {
                 c.borrow_mut().push(HostCommand::TouchDisplay);
             });
         }
-        {
-            let c = cmds.clone();
-            engine.register_fn("new_layer", move |name: &str| {
-                c.borrow_mut()
-                    .push(HostCommand::NewLayer(name.to_string()));
-            });
-        }
-        {
+        if perms.allows(AddonPermission::BrushWrite) {
             let c = cmds.clone();
             engine.register_fn("set_brush_size", move |size: f64| {
-                c.borrow_mut().push(HostCommand::SetBrushSize(size as f32));
+                let size = (size as f32).clamp(0.1, 5000.0);
+                c.borrow_mut().push(HostCommand::SetBrushSize(size));
             });
-        }
-        {
             let c = cmds.clone();
             engine.register_fn("set_brush_opacity", move |o: f64| {
-                c.borrow_mut()
-                    .push(HostCommand::SetBrushOpacity(o as f32));
+                let o = (o as f32).clamp(0.0, 1.0);
+                c.borrow_mut().push(HostCommand::SetBrushOpacity(o));
             });
-        }
-        {
             let c = cmds.clone();
             engine.register_fn("set_fg_color", move |r: i64, g: i64, b: i64| {
                 c.borrow_mut().push(HostCommand::SetFgColor([
@@ -304,64 +457,56 @@ impl AddonManager {
             });
         }
 
-        // --- Deep UI builders (collect nodes; interactive values from last frame) ---
-        {
+        if perms.allows(AddonPermission::UiPanel) {
             let u = ui.clone();
             engine.register_fn("ui_label", move |text: &str| {
                 u.borrow_mut()
                     .nodes
-                    .push(AddonUiNode::Label(text.to_string()));
+                    .push(AddonUiNode::Label(clamp_str(text, 512)));
             });
-        }
-        {
             let u = ui.clone();
             engine.register_fn("ui_heading", move |text: &str| {
                 u.borrow_mut()
                     .nodes
-                    .push(AddonUiNode::Heading(text.to_string()));
+                    .push(AddonUiNode::Heading(clamp_str(text, 256)));
             });
-        }
-        {
             let u = ui.clone();
             engine.register_fn("ui_separator", move || {
                 u.borrow_mut().nodes.push(AddonUiNode::Separator);
             });
-        }
-        {
             let u = ui.clone();
             engine.register_fn("ui_button", move |id: &str, label: &str| -> bool {
-                let clicked = u.borrow().clicks.get(id).copied().unwrap_or(false);
+                let id = clamp_str(id, 64);
+                let clicked = u.borrow().clicks.get(&id).copied().unwrap_or(false);
                 u.borrow_mut().nodes.push(AddonUiNode::Button {
-                    id: id.to_string(),
-                    label: label.to_string(),
+                    id,
+                    label: clamp_str(label, 128),
                 });
                 clicked
             });
-        }
-        {
             let u = ui.clone();
             engine.register_fn(
                 "ui_checkbox",
                 move |id: &str, label: &str, value: bool| -> bool {
-                    let v = u.borrow().bools.get(id).copied().unwrap_or(value);
+                    let id = clamp_str(id, 64);
+                    let v = u.borrow().bools.get(&id).copied().unwrap_or(value);
                     u.borrow_mut().nodes.push(AddonUiNode::Checkbox {
-                        id: id.to_string(),
-                        label: label.to_string(),
+                        id,
+                        label: clamp_str(label, 128),
                         value: v,
                     });
                     v
                 },
             );
-        }
-        {
             let u = ui.clone();
             engine.register_fn(
                 "ui_slider",
                 move |id: &str, label: &str, value: f64, min: f64, max: f64| -> f64 {
-                    let v = u.borrow().floats.get(id).copied().unwrap_or(value);
+                    let id = clamp_str(id, 64);
+                    let v = u.borrow().floats.get(&id).copied().unwrap_or(value);
                     u.borrow_mut().nodes.push(AddonUiNode::Slider {
-                        id: id.to_string(),
-                        label: label.to_string(),
+                        id,
+                        label: clamp_str(label, 128),
                         value: v,
                         min,
                         max,
@@ -369,21 +514,20 @@ impl AddonManager {
                     v
                 },
             );
-        }
-        {
             let u = ui.clone();
             engine.register_fn(
                 "ui_color",
                 move |id: &str, label: &str, r: i64, g: i64, b: i64| -> Dynamic {
+                    let id = clamp_str(id, 64);
                     let def = [
                         r.clamp(0, 255) as u8,
                         g.clamp(0, 255) as u8,
                         b.clamp(0, 255) as u8,
                     ];
-                    let rgb = u.borrow().colors.get(id).copied().unwrap_or(def);
+                    let rgb = u.borrow().colors.get(&id).copied().unwrap_or(def);
                     u.borrow_mut().nodes.push(AddonUiNode::Color {
-                        id: id.to_string(),
-                        label: label.to_string(),
+                        id,
+                        label: clamp_str(label, 128),
                         rgb,
                     });
                     let mut map = rhai::Map::new();
@@ -402,19 +546,22 @@ impl AddonManager {
         addon_id: &str,
         fn_name: &str,
     ) -> Result<Vec<HostCommand>, String> {
+        validate_fn_name(fn_name)?;
         let cmds = Rc::new(RefCell::new(Vec::<HostCommand>::new()));
         let ui = Rc::new(RefCell::new(UiScratch::default()));
-        let (engine, ast) = self
+        let loaded = self
             .engines
             .get_mut(addon_id)
             .ok_or_else(|| format!("addon '{addon_id}' not loaded"))?;
-        Self::register_runtime_api(engine, cmds.clone(), ui);
+        let perms = loaded.permissions.clone();
+        Self::register_runtime_api(&mut loaded.engine, &perms, cmds.clone(), ui);
         let mut scope = Scope::new();
-        let _: Dynamic = engine
-            .call_fn(&mut scope, ast, fn_name, ())
+        let _: Dynamic = loaded
+            .engine
+            .call_fn(&mut scope, &loaded.ast, fn_name, ())
             .map_err(|e| format!("call {fn_name}: {e}"))?;
         let out = cmds.borrow().clone();
-        Ok(out)
+        Ok(filter_commands(out, &perms))
     }
 
     /// Build UI nodes for a panel; returns (nodes, host commands from draw).
@@ -423,6 +570,7 @@ impl AddonManager {
         addon_id: &str,
         draw_fn: &str,
     ) -> Result<(Vec<AddonUiNode>, Vec<HostCommand>), String> {
+        validate_fn_name(draw_fn)?;
         let prev = self.ui_state.remove(addon_id).unwrap_or_default();
         let cmds = Rc::new(RefCell::new(Vec::<HostCommand>::new()));
         let ui = Rc::new(RefCell::new(UiScratch {
@@ -432,26 +580,29 @@ impl AddonManager {
             floats: prev.floats,
             colors: prev.colors,
         }));
-        let (engine, ast) = self
+        let loaded = self
             .engines
             .get_mut(addon_id)
             .ok_or_else(|| format!("addon '{addon_id}' not loaded"))?;
-        Self::register_runtime_api(engine, cmds.clone(), ui.clone());
+        let perms = loaded.permissions.clone();
+        if !perms.allows(AddonPermission::UiPanel) {
+            return Err("addon lacks ui_panel permission".into());
+        }
+        Self::register_runtime_api(&mut loaded.engine, &perms, cmds.clone(), ui.clone());
         let mut scope = Scope::new();
-        let _: Dynamic = engine
-            .call_fn(&mut scope, ast, draw_fn, ())
+        let _: Dynamic = loaded
+            .engine
+            .call_fn(&mut scope, &loaded.ast, draw_fn, ())
             .map_err(|e| format!("call {draw_fn}: {e}"))?;
         let nodes = ui.borrow().nodes.clone();
-        // Keep interactive maps for next frame; clear ephemeral clicks after read.
         let mut next = ui.borrow().clone();
         next.nodes.clear();
         next.clicks.clear();
         self.ui_state.insert(addon_id.to_string(), next);
         let out_cmds = cmds.borrow().clone();
-        Ok((nodes, out_cmds))
+        Ok((nodes, filter_commands(out_cmds, &perms)))
     }
 
-    /// Feed widget interactions back for the next draw_panel call.
     pub fn feed_ui_click(&mut self, addon_id: &str, id: &str) {
         self.ui_state
             .entry(addon_id.to_string())
@@ -496,17 +647,27 @@ impl AddonManager {
         src: &Path,
         settings: &mut AppSettings,
     ) -> Result<(), String> {
-        let manifest_path = src.join("manifest.json");
-        let bytes = fs::read(&manifest_path).map_err(|e| e.to_string())?;
-        let manifest: AddonManifest = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let manifest = read_manifest_file(&src.join("manifest.json"))?;
+        let (perms, _) = validate_manifest(&manifest)?;
+        enforce_folder_budget(src)?;
         let dest = settings.resolved_addons_dir().join(&manifest.id);
         if dest.exists() {
             fs::remove_dir_all(&dest).map_err(|e| e.to_string())?;
         }
         copy_dir_all(src, &dest).map_err(|e| e.to_string())?;
-        settings.addons_enabled.insert(manifest.id.clone(), true);
+        // New third-party installs stay off until the user enables them (consent).
+        settings.addons_enabled.insert(manifest.id.clone(), false);
         self.reload(settings);
-        self.status = Some(format!("Installed '{}'", manifest.name));
+        let perm_list = perms
+            .list_sorted()
+            .into_iter()
+            .map(|p| p.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.status = Some(format!(
+            "Installed '{}' (disabled). Enable to run. Permissions: {perm_list}",
+            manifest.name
+        ));
         Ok(())
     }
 
@@ -517,14 +678,45 @@ impl AddonManager {
     ) -> Result<(), String> {
         let file = fs::File::open(zip_path).map_err(|e| e.to_string())?;
         let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+        if archive.len() > MAX_ZIP_ENTRIES {
+            return Err(format!(
+                "zip has too many entries ({} > {MAX_ZIP_ENTRIES})",
+                archive.len()
+            ));
+        }
+
         let tmp = settings
             .resolved_addons_dir()
             .join(format!("_tmp_install_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+
+        let mut uncompressed_total = 0u64;
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-            let out = tmp.join(file.mangled_name());
+            let name = file
+                .enclosed_name()
+                .ok_or_else(|| format!("zip entry has unsafe path: {}", file.name()))?;
+            // enclosed_name already rejects abs / .. ; still keep under tmp.
+            let out = tmp.join(name);
+            ensure_within(&tmp, &out)?;
+
+            let declared = file.size();
+            if declared > MAX_ZIP_FILE {
+                let _ = fs::remove_dir_all(&tmp);
+                return Err(format!(
+                    "zip member too large ({} > {MAX_ZIP_FILE} bytes)",
+                    declared
+                ));
+            }
+            uncompressed_total = uncompressed_total.saturating_add(declared);
+            if uncompressed_total > MAX_ZIP_UNCOMPRESSED {
+                let _ = fs::remove_dir_all(&tmp);
+                return Err(format!(
+                    "zip uncompressed size exceeds {MAX_ZIP_UNCOMPRESSED} bytes"
+                ));
+            }
+
             if file.is_dir() {
                 fs::create_dir_all(&out).map_err(|e| e.to_string())?;
             } else {
@@ -532,10 +724,16 @@ impl AddonManager {
                     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
                 }
                 let mut outfile = fs::File::create(&out).map_err(|e| e.to_string())?;
-                std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
+                let mut limited = file.by_ref().take(MAX_ZIP_FILE + 1);
+                let written =
+                    std::io::copy(&mut limited, &mut outfile).map_err(|e| e.to_string())?;
+                if written > MAX_ZIP_FILE {
+                    let _ = fs::remove_dir_all(&tmp);
+                    return Err("zip member exceeded size limit while extracting".into());
+                }
             }
         }
-        // Find manifest in tmp (root or one level down).
+
         let src = if tmp.join("manifest.json").exists() {
             tmp.clone()
         } else {
@@ -545,8 +743,8 @@ impl AddonManager {
                 .flatten()
                 .flatten()
                 .map(|e| e.path())
-                .find(|p| p.join("manifest.json").exists())
-                .unwrap_or(tmp.clone())
+                .find(|p| p.is_dir() && p.join("manifest.json").exists())
+                .ok_or_else(|| "zip missing manifest.json".to_string())?
         };
         let result = self.install_from_folder(&src, settings);
         let _ = fs::remove_dir_all(&tmp);
@@ -578,12 +776,219 @@ pub enum HostCommand {
     SetFgColor([u8; 3]),
 }
 
+fn hardened_engine() -> Engine {
+    let mut engine = Engine::new();
+    engine.set_max_operations(MAX_RHAI_OPS);
+    engine.set_max_call_levels(MAX_RHAI_CALL_LEVELS);
+    engine.set_max_string_size(MAX_RHAI_STRING);
+    engine.set_max_array_size(MAX_RHAI_ARRAY);
+    engine.set_max_map_size(MAX_RHAI_MAP);
+    engine.set_max_expr_depths(MAX_RHAI_EXPR_DEPTH, MAX_RHAI_EXPR_DEPTH);
+    // No file/module loading from disk.
+    engine.disable_symbol("import");
+    engine.disable_symbol("eval");
+    engine
+}
+
+fn filter_commands(cmds: Vec<HostCommand>, perms: &PermissionSet) -> Vec<HostCommand> {
+    cmds.into_iter()
+        .filter(|c| match c {
+            HostCommand::InvertActiveLayer | HostCommand::NewLayer(_) => {
+                perms.allows(AddonPermission::DocumentEdit)
+            }
+            HostCommand::SetBrushSize(_)
+            | HostCommand::SetBrushOpacity(_)
+            | HostCommand::SetFgColor(_) => perms.allows(AddonPermission::BrushWrite),
+            HostCommand::Log(_)
+            | HostCommand::Alert(_)
+            | HostCommand::SetStatus(_)
+            | HostCommand::TouchDisplay => perms.allows(AddonPermission::UiNotify),
+        })
+        .collect()
+}
+
+fn validate_manifest(manifest: &AddonManifest) -> Result<(PermissionSet, bool), String> {
+    validate_addon_id(&manifest.id)?;
+    if manifest.name.trim().is_empty() {
+        return Err("manifest name is empty".into());
+    }
+    if manifest.name.len() > 128 {
+        return Err("manifest name too long".into());
+    }
+    match manifest.r#type.as_str() {
+        "script" => {}
+        "native" => return Err("native add-ons are not allowed".into()),
+        other => return Err(format!("unsupported add-on type '{other}'")),
+    }
+    validate_rel_path(&manifest.entry)?;
+    if !manifest.entry.ends_with(".rhai") {
+        return Err("entry must be a .rhai script".into());
+    }
+
+    let legacy = manifest.permissions.is_empty();
+    let perms = if legacy {
+        PermissionSet::legacy_default()
+    } else {
+        PermissionSet::from_manifest_list(&manifest.permissions)?
+    };
+    Ok((perms, legacy))
+}
+
+fn validate_addon_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > 64 {
+        return Err("invalid add-on id length".into());
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(
+            "add-on id must be ASCII alphanumeric / '_' / '-' (no path separators)".into(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_rel_path(entry: &str) -> Result<(), String> {
+    if entry.is_empty() || entry.len() > 200 {
+        return Err("invalid entry path".into());
+    }
+    if entry.contains('\0') {
+        return Err("entry path contains NUL".into());
+    }
+    let p = Path::new(entry);
+    if p.is_absolute() {
+        return Err("entry path must be relative".into());
+    }
+    for c in p.components() {
+        match c {
+            Component::Normal(s) => {
+                let s = s.to_string_lossy();
+                if s == ".." || s.contains(':') {
+                    return Err("entry path escapes add-on root".into());
+                }
+            }
+            Component::CurDir => {}
+            _ => return Err("entry path escapes add-on root".into()),
+        }
+    }
+    Ok(())
+}
+
+fn validate_fn_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 64 {
+        return Err("invalid function name".into());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err("function name must be ASCII identifier".into());
+    }
+    Ok(())
+}
+
+fn resolve_under_root(root: &Path, entry: &str) -> Result<PathBuf, String> {
+    validate_rel_path(entry)?;
+    let full = root.join(entry);
+    ensure_within(root, &full)?;
+    if !full.is_file() {
+        return Err(format!("entry not found: {}", full.display()));
+    }
+    Ok(full)
+}
+
+fn ensure_within(base: &Path, candidate: &Path) -> Result<(), String> {
+    // Component-wise: candidate must equal base + only Normal/CurDir parts.
+    let mut base_comps: Vec<_> = base.components().collect();
+    // Normalize trailing CurDir on base.
+    while matches!(base_comps.last(), Some(Component::CurDir)) {
+        base_comps.pop();
+    }
+    let cand: Vec<_> = candidate.components().collect();
+    if cand.len() < base_comps.len() {
+        return Err("path escapes add-on directory".into());
+    }
+    if cand[..base_comps.len()] != base_comps[..] {
+        return Err("path escapes add-on directory".into());
+    }
+    for c in &cand[base_comps.len()..] {
+        match c {
+            Component::Normal(_) | Component::CurDir => {}
+            _ => return Err("path escapes add-on directory".into()),
+        }
+    }
+    Ok(())
+}
+
+fn read_manifest_file(path: &Path) -> Result<AddonManifest, String> {
+    let bytes = fs::read(path).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_ZIP_FILE {
+        return Err("manifest.json too large".into());
+    }
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+}
+
+fn enforce_folder_budget(src: &Path) -> Result<(), String> {
+    let mut total = 0u64;
+    let mut files = 0usize;
+    fn walk(dir: &Path, total: &mut u64, files: &mut usize) -> Result<(), String> {
+        for ent in fs::read_dir(dir).map_err(|e| e.to_string())? {
+            let ent = ent.map_err(|e| e.to_string())?;
+            let path = ent.path();
+            let ty = ent.file_type().map_err(|e| e.to_string())?;
+            if ty.is_dir() {
+                walk(&path, total, files)?;
+            } else if ty.is_file() {
+                *files += 1;
+                if *files > MAX_ZIP_ENTRIES {
+                    return Err("folder has too many files".into());
+                }
+                let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                if len > MAX_ZIP_FILE {
+                    return Err(format!("file too large: {}", path.display()));
+                }
+                *total = total.saturating_add(len);
+                if *total > MAX_FOLDER_BYTES {
+                    return Err(format!(
+                        "folder exceeds {MAX_FOLDER_BYTES} bytes uncompressed budget"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+    walk(src, &mut total, &mut files)?;
+    Ok(())
+}
+
+fn default_enabled_for(id: &str, settings: &AppSettings) -> bool {
+    if let Some(v) = settings.addons_enabled.get(id) {
+        return *v;
+    }
+    // First-party sample only; everything else requires explicit enable.
+    id == "example_invert"
+}
+
+fn clamp_str(s: &str, max: usize) -> String {
+    let mut t = s.chars().take(max).collect::<String>();
+    if s.chars().count() > max {
+        t.push('…');
+    }
+    t
+}
+
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
+        let name = entry.file_name();
+        // Never copy install scratch leftovers.
+        if name.to_string_lossy().starts_with("_tmp_install_") {
+            continue;
+        }
         let ty = entry.file_type()?;
-        let to = dst.join(entry.file_name());
+        let to = dst.join(&name);
         if ty.is_dir() {
             copy_dir_all(&entry.path(), &to)?;
         } else {
@@ -594,34 +999,49 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 fn open_path(path: &Path) {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("explorer").arg(path).spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(path).spawn();
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
-    }
+    crate::os_win::open_path(path);
 }
 
-/// Write a tiny example add-on if the addons folder is empty (first run).
+/// Write a tiny example add-on if missing (first run). First-party → enabled by default.
 pub fn ensure_example_addon(settings: &AppSettings) {
     let dir = settings.resolved_addons_dir().join("example_invert");
     if dir.exists() {
+        // Refresh permissions field on older sample installs (best-effort).
+        let man_path = dir.join("manifest.json");
+        if let Ok(bytes) = fs::read(&man_path) {
+            if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if v.get("permissions").is_none() {
+                    v["permissions"] = serde_json::json!([
+                        "document_edit",
+                        "brush_write",
+                        "ui_panel",
+                        "ui_notify",
+                        "menu_register"
+                    ]);
+                    let _ = fs::write(
+                        &man_path,
+                        serde_json::to_vec_pretty(&v).unwrap_or_default(),
+                    );
+                }
+            }
+        }
         return;
     }
     let _ = fs::create_dir_all(&dir);
     let manifest = r#"{
   "id": "example_invert",
   "name": "Example Invert",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "script",
   "entry": "main.rhai",
-  "description": "Sample Blender-like script add-on with UI panel"
+  "description": "Sample sandboxed script add-on (document + brush + UI)",
+  "permissions": [
+    "document_edit",
+    "brush_write",
+    "ui_panel",
+    "ui_notify",
+    "menu_register"
+  ]
 }"#;
     let script = r#"
 register_filter("Example: Invert Active Layer", "do_invert");
@@ -636,12 +1056,12 @@ fn do_invert() {
 
 fn draw_panel() {
     ui_heading("Example Addon");
-    ui_label("Deep UI API: buttons, sliders, colors.");
+    ui_label("Sandboxed UI API: buttons, sliders, colors.");
     ui_separator();
     if ui_button("invert", "Invert active layer") {
         do_invert();
     }
-    let size = ui_slider("brush", "Brush size", 20.0, 1.0, 200.0);
+    let size = ui_slider("brush", "Brush size", 20.0, 1.0, 600.0);
     if ui_button("apply_size", "Apply brush size") {
         set_brush_size(size);
     }
@@ -653,4 +1073,37 @@ fn draw_panel() {
 "#;
     let _ = fs::write(dir.join("manifest.json"), manifest);
     let _ = fs::write(dir.join("main.rhai"), script);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_path_escape_entry() {
+        assert!(validate_rel_path("../evil.rhai").is_err());
+        assert!(validate_rel_path("C:\\evil.rhai").is_err());
+        assert!(validate_rel_path("ok/sub.rhai").is_ok());
+    }
+
+    #[test]
+    fn rejects_dangerous_permissions() {
+        assert!(AddonPermission::parse("network").is_err());
+        assert!(AddonPermission::parse("filesystem").is_err());
+        assert!(PermissionSet::from_manifest_list(&["document_edit".into()]).is_ok());
+    }
+
+    #[test]
+    fn addon_id_safe() {
+        assert!(validate_addon_id("my_addon-1").is_ok());
+        assert!(validate_addon_id("../x").is_err());
+        assert!(validate_addon_id("a/b").is_err());
+    }
+
+    #[test]
+    fn ensure_within_blocks_dotdot() {
+        let base = Path::new("C:/addons/tmp");
+        assert!(ensure_within(base, Path::new("C:/addons/tmp/a.rhai")).is_ok());
+        assert!(ensure_within(base, Path::new("C:/addons/other/a.rhai")).is_err());
+    }
 }

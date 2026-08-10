@@ -97,19 +97,10 @@ impl MotionCalibrator {
         }
         self.anchor = Some(p);
         self.raw_since = Vec2::ZERO;
-        // Soft-correct float tip toward absolute (don't hard-snap — that re-lattices).
-        // Stronger snap (0.65) cuts visible brush lag vs a lazy 0.35 blend.
-        if let Some(f) = self.float_screen {
-            let err = p - f;
-            if err.length_sq() > 4.0 {
-                // Large error (lost tracking) — resync.
-                self.float_screen = Some(p);
-            } else {
-                self.float_screen = Some(f + err * 0.65);
-            }
-        } else {
-            self.float_screen = Some(p);
-        }
+        // Hard-snap float tip to absolute pointer. Soft blend (0.35→0.65) left the
+        // painted tip visibly behind the OS cursor — felt like early v1 lag.
+        // Sub-pixel continuity still comes from relative `MouseMoved` estimates.
+        self.float_screen = Some(p);
     }
 
     fn estimate_after_raw(&mut self, delta: Vec2) -> Option<Pos2> {
@@ -398,6 +389,16 @@ pub fn paint_samples_mode(
     trajectory: &mut TrajectoryBuilder,
     mode: PaintMode,
 ) -> bool {
+    paint_samples_mode_ex(document, samples, trajectory, mode, false)
+}
+
+pub fn paint_samples_mode_ex(
+    document: &mut Document,
+    samples: &[(f32, f32, f32)],
+    trajectory: &mut TrajectoryBuilder,
+    mode: PaintMode,
+    stroke_ending: bool,
+) -> bool {
     if crate::debug_flags::no_brush_engine() {
         return false;
     }
@@ -456,7 +457,7 @@ pub fn paint_samples_mode(
                 document.smudge_polyline(&chain);
                 true
             } else {
-                document.paint_polyline(&chain);
+                document.paint_polyline_ex(&chain, stroke_ending);
                 true
             }
         }

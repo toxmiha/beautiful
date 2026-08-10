@@ -208,7 +208,11 @@ impl ToolSession {
     /// Pull live document edits (UI sliders) into the session.
     pub fn capture_from_document(&mut self, doc: &beautiful_core::Document, tool: WorkspaceTool) {
         self.tool = tool;
-        let changed = brush_differs(&self.brush, &doc.brush)
+        // Full brush compare (serde) — field-wise list drifted and skipped knobs,
+        // so session never marked dirty / applied stale settings across canvases.
+        let brush_changed =
+            serde_json::to_vec(&self.brush).ok() != serde_json::to_vec(&doc.brush).ok();
+        let changed = brush_changed
             || self.fill_tolerance != doc.fill_tolerance
             || self.feather_radius != doc.feather_radius
             || self.color_bg != doc.color_bg
@@ -262,25 +266,4 @@ impl ToolSession {
             doc.warm_tip_cache();
         }
     }
-}
-
-fn brush_differs(a: &BrushSettings, b: &BrushSettings) -> bool {
-    a.size.to_bits() != b.size.to_bits()
-        || a.density.to_bits() != b.density.to_bits()
-        || a.hardness.to_bits() != b.hardness.to_bits()
-        || a.kind != b.kind
-        || a.shape != b.shape
-        || a.color != b.color
-        || a.min_size_pct.to_bits() != b.min_size_pct.to_bits()
-        || a.min_density.to_bits() != b.min_density.to_bits()
-        || a.blending.to_bits() != b.blending.to_bits()
-        || a.dilution.to_bits() != b.dilution.to_bits()
-        || a.persistence.to_bits() != b.persistence.to_bits()
-        || a.spacing.to_bits() != b.spacing.to_bits()
-        || a.texture != b.texture
-        || a.pressure_size != b.pressure_size
-        || a.pressure_density != b.pressure_density
-        || a.keep_opacity != b.keep_opacity
-        || a.hair.to_bits() != b.hair.to_bits()
-        || a.shape_sharpen.to_bits() != b.shape_sharpen.to_bits()
 }

@@ -69,7 +69,7 @@ $linuxNote
 
 Сборка без zip — папка dist\Beautiful-Alpha.
 
-Версия: alpha 0.1.0
+Версия: alpha 0.4.8
 "@ | Set-Content -Encoding UTF8 (Join-Path $Alpha "README.txt")
 
 # Prefer folder over zip for distribution

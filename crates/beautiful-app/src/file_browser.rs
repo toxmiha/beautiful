@@ -1,4 +1,4 @@
-//! In-app open dialog — Blender-style sidebar + type filter, grid, preview.
+//! In-app open dialog — sidebar + type filter, grid, preview.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use crate::gallery;
 use crate::settings::FormatFlags;
 use crate::theme;
 
-/// Blender-like multi-toggle file type filter.
+/// Multi-toggle file type filter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 struct TypeFilters {
@@ -147,7 +147,7 @@ struct SidePlace {
     path: PathBuf,
 }
 
-/// Sidebar blocks (Blender Outliner-style) — order is user-reorderable.
+/// Sidebar blocks — order is user-reorderable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum SideSection {
     Bookmarks,
@@ -251,7 +251,7 @@ pub struct FileBrowser {
     type_filters: TypeFilters,
     enabled_formats: FormatFlags,
     search: String,
-    /// Editable address bar (Windows Explorer style).
+    /// Editable address bar (folder path).
     path_edit: String,
     path_edit_focused: bool,
     error: Option<String>,
@@ -972,7 +972,7 @@ impl FileBrowser {
 
     fn kick_thumbs(&mut self, ctx: &egui::Context) {
         self.poll_thumbs(ctx);
-        // Parallel decode — Explorer-like snappy grid (several workers).
+        // Parallel decode — snappy thumbnail grid (several workers).
         const MAX_PARALLEL: usize = 8;
         const THUMB_SIDE: u32 = 96;
         while self.thumb_inflight < MAX_PARALLEL {
@@ -1318,7 +1318,7 @@ impl FileBrowser {
         let recess = theme::acrylic_solid_fill();
         let card_fill = theme::acrylic_solid_card();
 
-        // Separate OS window (like Explorer), not an in-app modal.
+        // Separate OS window, not an in-app modal.
         ctx.show_viewport_immediate(
             egui::ViewportId::from_hash_of("beautiful_file_browser"),
             egui::ViewportBuilder::default()
@@ -1372,7 +1372,7 @@ impl FileBrowser {
                             refresh = true;
                         }
                         ui.add_space(4.0);
-                        // Blender-style filter funnel
+                        // Filter funnel
                         let filter_active = !self.type_filters.folders
                             || !self.type_filters.txmh
                             || !self.type_filters.psd
@@ -1384,7 +1384,7 @@ impl FileBrowser {
                                     .color(if filter_active {
                                         egui::Color32::WHITE
                                     } else {
-                                        theme::TEXT
+                                        theme::text()
                                     })
                                     .size(12.0),
                             )
@@ -1432,12 +1432,12 @@ impl FileBrowser {
                             self.type_filters = f;
                         });
                         ui.add_space(6.0);
-                        // Address bar — editable path + recent/history dropdown (Explorer-style).
+                        // Address bar — editable path + recent/history dropdown.
                         let path_w = (ui.available_width() - 200.0).max(140.0);
                         let path_id = egui::Id::new("fb_path_edit");
                         egui::Frame::new()
                             .fill(theme::menu_item_fill())
-                            .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                            .stroke(egui::Stroke::new(1.0_f32, theme::stroke()))
                             .corner_radius(4.0)
                             .inner_margin(egui::Margin::symmetric(6, 2))
                             .show(ui, |ui| {
@@ -1455,7 +1455,7 @@ impl FileBrowser {
                                         egui::TextEdit::singleline(&mut self.path_edit)
                                             .id(path_id)
                                             .desired_width((path_w - 72.0).max(80.0))
-                                            .text_color(theme::TEXT)
+                                            .text_color(theme::text())
                                             .frame(false),
                                     );
                                     if edit.gained_focus() || edit.has_focus() {
@@ -1467,7 +1467,7 @@ impl FileBrowser {
                                         && (edit.has_focus()
                                             || edit.lost_focus()
                                             || self.path_edit_focused);
-                                    // Paste of a full folder/file path → navigate (Explorer-like).
+                                    // Paste of a full folder/file path → navigate.
                                     let pasted = edit.changed()
                                         && ui.input(|i| {
                                             i.events.iter().any(|e| {
@@ -1491,7 +1491,7 @@ impl FileBrowser {
                                         .add(
                                             egui::Button::new(
                                                 egui::RichText::new("→")
-                                                    .color(theme::TEXT)
+                                                    .color(theme::text())
                                                     .size(14.0),
                                             )
                                             .frame(false)
@@ -1567,7 +1567,7 @@ impl FileBrowser {
                                                     ui.set_min_width(path_w.min(520.0));
                                                     ui.label(
                                                         egui::RichText::new("Недавние папки")
-                                                            .color(theme::TEXT)
+                                                            .color(theme::text())
                                                             .size(12.0),
                                                     );
                                                     ui.separator();
@@ -1581,7 +1581,7 @@ impl FileBrowser {
                                                                 .fill(theme::menu_item_fill())
                                                                 .stroke(egui::Stroke::new(
                                                                     1.0_f32,
-                                                                    theme::STROKE,
+                                                                    theme::stroke(),
                                                                 ))
                                                                 .min_size(egui::vec2(
                                                                     ui.available_width(),
@@ -1604,7 +1604,7 @@ impl FileBrowser {
                             egui::TextEdit::singleline(&mut self.search)
                                 .desired_width(180.0)
                                 .hint_text(format!("Search in: {folder_name}"))
-                                .text_color(theme::TEXT)
+                                .text_color(theme::text())
                                 .background_color(theme::menu_item_fill()),
                         );
                     });
@@ -1626,12 +1626,12 @@ impl FileBrowser {
                     mid.max,
                 );
 
-                // Sidebar — separated Blender-style section cards + reorder
+                // Sidebar — separated section cards + reorder
                 ui.scope_builder(egui::UiBuilder::new().max_rect(side), |ui| {
                     ui.painter().rect_filled(side, 0.0, recess);
                     ui.painter().line_segment(
                         [side.right_top(), side.right_bottom()],
-                        egui::Stroke::new(1.0_f32, theme::STROKE),
+                        egui::Stroke::new(1.0_f32, theme::stroke()),
                     );
                     egui::ScrollArea::vertical()
                         .id_salt("fb_sidebar")
@@ -1651,7 +1651,7 @@ impl FileBrowser {
                                 };
                                 let frame_resp = egui::Frame::new()
                                     .fill(card_fill)
-                                    .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                                    .stroke(egui::Stroke::new(1.0_f32, theme::stroke()))
                                     .corner_radius(8.0)
                                     .inner_margin(egui::Margin::symmetric(4, 4))
                                     .outer_margin(egui::Margin::symmetric(8, 5))
@@ -1834,7 +1834,7 @@ impl FileBrowser {
                             }
                             let cell = 108.0;
                             let gap = 12.0;
-                            // Background RMB (Blender-like Files menu)
+                            // Background RMB (files context menu)
                             let bg = ui.allocate_response(
                                 egui::vec2(ui.available_width().max(1.0), 1.0),
                                 egui::Sense::click(),
@@ -2039,7 +2039,7 @@ impl FileBrowser {
                                         if pinned {
                                             egui::Color32::from_rgb(255, 200, 140)
                                         } else {
-                                            theme::TEXT
+                                            theme::text()
                                         },
                                     );
 
@@ -2137,7 +2137,7 @@ impl FileBrowser {
                     ui.painter().rect_filled(preview, 0.0, recess);
                     ui.painter().line_segment(
                         [preview.left_top(), preview.left_bottom()],
-                        egui::Stroke::new(1.0_f32, theme::STROKE),
+                        egui::Stroke::new(1.0_f32, theme::stroke()),
                     );
                     egui::ScrollArea::vertical()
                         .id_salt("fb_preview")
@@ -2270,7 +2270,7 @@ impl FileBrowser {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.file_name)
                                 .desired_width((full.width() * 0.36).clamp(160.0, 360.0))
-                                .text_color(theme::TEXT),
+                                .text_color(theme::text()),
                         );
                         if self.save_mode {
                             let mut fmt = self.save_format;
@@ -2686,7 +2686,7 @@ fn reorder_side_section(
     true
 }
 
-/// Section header with collapse toggle + Blender-style drag handle (reorder).
+/// Section header with collapse toggle + drag handle (reorder).
 /// Returns `Some((dragged, drop_target))` when a section was dropped onto this header.
 fn side_section_header(
     ui: &mut egui::Ui,
@@ -2734,7 +2734,7 @@ fn side_section_header(
         egui::Color32::from_rgb(210, 210, 218),
     );
 
-    // Drag handle — right side (Blender ⠿)
+    // Drag handle — right side (⠿)
     let handle_w = 22.0;
     let handle_rect = egui::Rect::from_min_max(
         egui::pos2(rect.max.x - handle_w - 2.0, rect.min.y),
@@ -2771,7 +2771,7 @@ fn side_section_header(
                 egui::Align2::CENTER_CENTER,
                 section.title(),
                 egui::FontId::proportional(12.0),
-                theme::TEXT,
+                theme::text(),
             );
         }
     }
@@ -2820,7 +2820,7 @@ fn side_row_resp(
         egui::Align2::LEFT_CENTER,
         format!("{icon}  {text}"),
         egui::FontId::proportional(12.5),
-        theme::TEXT,
+        theme::text(),
     );
     resp
 }

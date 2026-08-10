@@ -1,4 +1,11 @@
-//! Dark painting-app theme with WCAG-friendly text contrast.
+//! Dual dark/light painting-app theme.
+//!
+//! Light palette follows comfortable UI practice (Material 3 / Apple HIG / WCAG AA):
+//! - Surfaces: soft off-white (not pure #FFF glare), elevated white panels
+//! - Body text: near-black on-surface (~#1C1C1E), ≥4.5:1 on white
+//! - Secondary text: mid gray (~#6C6C70), still readable
+//! - Borders: soft neutral outline, not black hairlines
+//! - Accent: warm brand orange; selected rows use a light orange container
 
 use std::sync::{Mutex, RwLock};
 
@@ -9,6 +16,7 @@ use eframe::egui::{
 
 use crate::ui_fonts;
 
+// ——— Dark tokens (legacy const names kept for dark defaults) ———
 pub const ACCENT: Color32 = Color32::from_rgb(255, 140, 66);
 pub const ACCENT_DIM: Color32 = Color32::from_rgb(200, 100, 45);
 pub const BG_DEEP: Color32 = Color32::from_rgb(22, 22, 24);
@@ -35,6 +43,27 @@ pub const MEM_BAR: Color32 = Color32::from_rgb(90, 160, 150);
 pub const DISK_BAR: Color32 = ACCENT;
 /// clip-to-below indicator (pink bar).
 pub const CLIP_BAR: Color32 = Color32::from_rgb(236, 96, 168);
+
+// ——— Light tokens (comfortable / WCAG-oriented) ———
+/// Soft page surface — avoids pure-white glare (Apple #F5F5F7 / M3 surface≈99).
+const L_SURFACE: Color32 = Color32::from_rgb(245, 245, 247);
+const L_SURFACE_2: Color32 = Color32::from_rgb(255, 255, 255);
+const L_SURFACE_3: Color32 = Color32::from_rgb(238, 238, 242);
+const L_HOVER: Color32 = Color32::from_rgb(232, 232, 236);
+const L_TAB: Color32 = Color32::from_rgb(235, 235, 239);
+/// Accent container (selected chip / layer) — light warm wash, not dark brown.
+const L_TAB_ACTIVE: Color32 = Color32::from_rgb(255, 232, 214);
+const L_LAYER_SELECTED: Color32 = Color32::from_rgb(255, 224, 200);
+/// On-surface body text (~tone 10) — high contrast on white.
+const L_TEXT: Color32 = Color32::from_rgb(28, 28, 30);
+/// Secondary / muted (~tone 50) — still ≥4.5:1 on #F5F5F7.
+const L_TEXT_DIM: Color32 = Color32::from_rgb(108, 108, 112);
+const L_TEXT_ON_ACCENT: Color32 = Color32::from_rgb(255, 255, 255);
+/// Outline / divider (~tone 80–85).
+const L_STROKE: Color32 = Color32::from_rgb(209, 209, 214);
+/// Slightly deeper orange reads better on light chrome than neon #FF8C42.
+const L_ACCENT: Color32 = Color32::from_rgb(224, 112, 48);
+const L_ACCENT_DIM: Color32 = Color32::from_rgb(196, 96, 40);
 
 struct ThemeLive {
     accent: Color32,
@@ -102,9 +131,7 @@ static THEME_LIVE: RwLock<ThemeLive> = RwLock::new(ThemeLive {
 static APPLIED_UI_FONT: Mutex<Option<String>> = Mutex::new(None);
 
 fn lift_rgb(c: Color32, delta: i16) -> Color32 {
-    let lift = |v: u8| -> u8 {
-        (v as i16 + delta).clamp(0, 255) as u8
-    };
+    let lift = |v: u8| -> u8 { (v as i16 + delta).clamp(0, 255) as u8 };
     Color32::from_rgb(lift(c.r()), lift(c.g()), lift(c.b()))
 }
 
@@ -192,6 +219,95 @@ pub fn is_light_theme() -> bool {
         .unwrap_or(false)
 }
 
+/// Primary UI text — dark on light theme, light on dark.
+pub fn text() -> Color32 {
+    if is_light_theme() {
+        L_TEXT
+    } else {
+        TEXT
+    }
+}
+
+pub fn text_dim() -> Color32 {
+    if is_light_theme() {
+        L_TEXT_DIM
+    } else {
+        TEXT_DIM
+    }
+}
+
+pub fn text_on_accent() -> Color32 {
+    if is_light_theme() {
+        L_TEXT_ON_ACCENT
+    } else {
+        TEXT_ON_ACCENT
+    }
+}
+
+pub fn stroke() -> Color32 {
+    if is_light_theme() {
+        L_STROKE
+    } else {
+        STROKE
+    }
+}
+
+pub fn bg_menu() -> Color32 {
+    if is_light_theme() {
+        L_SURFACE_2
+    } else {
+        BG_MENU
+    }
+}
+
+pub fn bg_menu_item() -> Color32 {
+    if is_light_theme() {
+        L_SURFACE
+    } else {
+        BG_MENU_ITEM
+    }
+}
+
+pub fn bg_tab() -> Color32 {
+    if is_light_theme() {
+        L_TAB
+    } else {
+        BG_TAB
+    }
+}
+
+pub fn bg_tab_active() -> Color32 {
+    if is_light_theme() {
+        L_TAB_ACTIVE
+    } else {
+        BG_TAB_ACTIVE
+    }
+}
+
+pub fn bg_layer_selected() -> Color32 {
+    if is_light_theme() {
+        L_LAYER_SELECTED
+    } else {
+        BG_LAYER_SELECTED
+    }
+}
+
+pub fn bg_panel_solid() -> Color32 {
+    if is_light_theme() {
+        L_SURFACE_2
+    } else {
+        Color32::from_rgb(22, 22, 25)
+    }
+}
+
+pub fn bg_panel_2_solid() -> Color32 {
+    if is_light_theme() {
+        L_SURFACE_3
+    } else {
+        Color32::from_rgb(30, 30, 34)
+    }
+}
+
 fn sat_boost(c: Color32, sat: f32) -> Color32 {
     let s = sat.clamp(0.0, 2.0);
     if (s - 1.0).abs() < 0.01 {
@@ -228,6 +344,10 @@ pub fn gradient_ends() -> (Color32, Color32, f32) {
 
 /// Opaque menu / popup fill derived from app color.
 pub fn menu_fill() -> Color32 {
+    if is_light_theme() {
+        // Prefer clean white menus for readability over tinted acrylic wash.
+        return bg_menu();
+    }
     let base = if matches!(color_fill_mode(), crate::settings::ColorFillMode::Gradient) {
         let (a, b, _) = gradient_ends();
         Color32::from_rgb(
@@ -238,40 +358,89 @@ pub fn menu_fill() -> Color32 {
     } else {
         app_color()
     };
-    let lift = if is_light_theme() { -8 } else { 8 };
-    lift_rgb(base, lift)
+    lift_rgb(base, 8)
 }
 
 pub fn menu_item_fill() -> Color32 {
-    lift_rgb(menu_fill(), if is_light_theme() { -10 } else { 10 })
+    if is_light_theme() {
+        bg_menu_item()
+    } else {
+        lift_rgb(menu_fill(), 10)
+    }
 }
 
 pub fn hover_fill() -> Color32 {
-    lift_rgb(menu_fill(), if is_light_theme() { -16 } else { 20 })
+    if is_light_theme() {
+        L_HOVER
+    } else {
+        lift_rgb(menu_fill(), 20)
+    }
 }
 
 fn panel_alpha() -> u8 {
     let opacity = ui_opacity().clamp(0.2, 1.0);
     let mat = material();
+    let light = is_light_theme();
     let base = match mat {
         crate::settings::UiMaterial::Solid => 255.0,
-        // Mica is an opaque wallpaper backdrop — panels should stay readable but let tint show.
-        crate::settings::UiMaterial::Mica => 200.0 + acrylic_strength() * 40.0,
-        crate::settings::UiMaterial::Acrylic => 90.0 + acrylic_strength() * 90.0,
-        crate::settings::UiMaterial::Glass => 55.0 + acrylic_strength() * 55.0,
-        crate::settings::UiMaterial::Aero => 75.0 + acrylic_strength() * 80.0,
-        crate::settings::UiMaterial::Smoke => 140.0 + acrylic_strength() * 70.0,
+        // Light theme: keep panels more opaque so text stays WCAG-safe over blur.
+        crate::settings::UiMaterial::Mica => {
+            if light {
+                230.0 + acrylic_strength() * 25.0
+            } else {
+                200.0 + acrylic_strength() * 40.0
+            }
+        }
+        crate::settings::UiMaterial::Acrylic => {
+            if light {
+                210.0 + acrylic_strength() * 35.0
+            } else {
+                90.0 + acrylic_strength() * 90.0
+            }
+        }
+        crate::settings::UiMaterial::Glass => {
+            if light {
+                200.0 + acrylic_strength() * 40.0
+            } else {
+                55.0 + acrylic_strength() * 55.0
+            }
+        }
+        crate::settings::UiMaterial::LegacyGlass => {
+            if light {
+                205.0 + acrylic_strength() * 40.0
+            } else {
+                75.0 + acrylic_strength() * 80.0
+            }
+        }
+        crate::settings::UiMaterial::Smoke => {
+            if light {
+                220.0 + acrylic_strength() * 30.0
+            } else {
+                140.0 + acrylic_strength() * 70.0
+            }
+        }
     };
     if !ui_transparency() || matches!(mat, crate::settings::UiMaterial::Solid) {
         255
     } else {
-        (base * opacity).round().clamp(35.0, 255.0) as u8
+        let min_a = if light { 180.0 } else { 35.0 };
+        (base * opacity).round().clamp(min_a, 255.0) as u8
     }
 }
 
 /// Live panel fill — translucent when material + ui_transparency, else opaque.
 pub fn panel_fill() -> Color32 {
-    let base = app_color();
+    let base = if is_light_theme() {
+        // Blend app tint toward soft surface so custom colors stay gentle.
+        let c = app_color();
+        Color32::from_rgb(
+            ((c.r() as u16 * 2 + L_SURFACE.r() as u16 * 3) / 5) as u8,
+            ((c.g() as u16 * 2 + L_SURFACE.g() as u16 * 3) / 5) as u8,
+            ((c.b() as u16 * 2 + L_SURFACE.b() as u16 * 3) / 5) as u8,
+        )
+    } else {
+        app_color()
+    };
     let a = panel_alpha();
     if a >= 250 {
         base
@@ -281,7 +450,11 @@ pub fn panel_fill() -> Color32 {
 }
 
 pub fn chrome_fill() -> Color32 {
-    let base = app_color();
+    let base = if is_light_theme() {
+        L_SURFACE
+    } else {
+        app_color()
+    };
     let a = panel_alpha().saturating_add(20).min(255);
     if a >= 250 {
         base
@@ -291,28 +464,49 @@ pub fn chrome_fill() -> Color32 {
 }
 
 pub fn canvas_surround_fill() -> Color32 {
-    let base = shade_rgb(app_color(), if is_light_theme() { 0.92 } else { 0.45 });
+    let base = if is_light_theme() {
+        shade_rgb(L_SURFACE, 0.96)
+    } else {
+        shade_rgb(app_color(), 0.45)
+    };
     let a = panel_alpha();
     if a >= 250 {
         base
     } else {
-        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a.saturating_sub(20).max(40))
+        Color32::from_rgba_unmultiplied(
+            base.r(),
+            base.g(),
+            base.b(),
+            a.saturating_sub(20).max(if is_light_theme() { 160 } else { 40 }),
+        )
     }
 }
 
-/// Edge stroke for glass / aero materials.
+/// Edge stroke for glass / legacy-glass materials.
 pub fn material_stroke() -> Stroke {
     match material() {
         crate::settings::UiMaterial::Glass => {
-            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 90))
+            if is_light_theme() {
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 0, 0, 28))
+            } else {
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 90))
+            }
         }
-        crate::settings::UiMaterial::Aero => {
-            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(200, 230, 255, 110))
+        crate::settings::UiMaterial::LegacyGlass => {
+            if is_light_theme() {
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(120, 160, 200, 70))
+            } else {
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(200, 230, 255, 110))
+            }
         }
         crate::settings::UiMaterial::Smoke => {
-            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 0, 0, 80))
+            if is_light_theme() {
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 0, 0, 36))
+            } else {
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0, 0, 0, 80))
+            }
         }
-        _ => Stroke::new(1.0_f32, STROKE),
+        _ => Stroke::new(1.0_f32, stroke()),
     }
 }
 
@@ -324,13 +518,33 @@ pub fn paint_app_gradient(_ctx: &egui::Context) {
 
 pub fn apply_settings_colors(settings: &crate::settings::AppSettings) {
     if let Ok(mut t) = THEME_LIVE.write() {
-        let accent_rgb = settings.accent;
-        t.accent = Color32::from_rgb(accent_rgb[0], accent_rgb[1], accent_rgb[2]);
-        t.accent_dim = Color32::from_rgb(
-            (accent_rgb[0] as f32 * 0.78) as u8,
-            (accent_rgb[1] as f32 * 0.78) as u8,
-            (accent_rgb[2] as f32 * 0.78) as u8,
+        let light = matches!(
+            settings.theme_brightness,
+            crate::settings::ThemeBrightness::Light
         );
+        let accent_rgb = settings.accent;
+        // On light chrome, slightly deepen very bright accents so they clear AA.
+        let (ar, ag, ab) = if light {
+            let deepen = |v: u8| -> u8 { ((v as u16 * 88) / 100).min(255) as u8 };
+            // If user kept default neon orange, snap to comfortable light accent.
+            if accent_rgb == [255, 140, 66] {
+                (L_ACCENT.r(), L_ACCENT.g(), L_ACCENT.b())
+            } else {
+                (deepen(accent_rgb[0]), deepen(accent_rgb[1]), deepen(accent_rgb[2]))
+            }
+        } else {
+            (accent_rgb[0], accent_rgb[1], accent_rgb[2])
+        };
+        t.accent = Color32::from_rgb(ar, ag, ab);
+        t.accent_dim = if light {
+            L_ACCENT_DIM
+        } else {
+            Color32::from_rgb(
+                (ar as f32 * 0.78) as u8,
+                (ag as f32 * 0.78) as u8,
+                (ab as f32 * 0.78) as u8,
+            )
+        };
         t.app_color = Color32::from_rgb(
             settings.app_color[0],
             settings.app_color[1],
@@ -359,23 +573,23 @@ pub fn apply_settings_colors(settings: &crate::settings::AppSettings) {
     }
 }
 
-pub fn label(text: impl Into<String>) -> RichText {
-    RichText::new(text).color(TEXT).size(13.0)
+pub fn label(text_s: impl Into<String>) -> RichText {
+    RichText::new(text_s).color(text()).size(13.0)
 }
 
-pub fn label_dim(text: impl Into<String>) -> RichText {
-    RichText::new(text).color(TEXT_DIM).size(13.0)
+pub fn label_dim(text_s: impl Into<String>) -> RichText {
+    RichText::new(text_s).color(text_dim()).size(13.0)
 }
 
-pub fn heading(text: impl Into<String>) -> RichText {
-    RichText::new(text).color(TEXT).size(14.0).strong()
+pub fn heading(text_s: impl Into<String>) -> RichText {
+    RichText::new(text_s).color(text()).size(14.0).strong()
 }
 
 pub fn btn(ui: &mut Ui, text: impl Into<WidgetText>) -> egui::Response {
     ui.add(
         Button::new(text)
             .fill(menu_item_fill())
-            .stroke(Stroke::new(1.0_f32, STROKE)),
+            .stroke(Stroke::new(1.0_f32, stroke())),
     )
 }
 
@@ -383,17 +597,17 @@ pub fn small_btn(ui: &mut Ui, text: impl Into<WidgetText>) -> egui::Response {
     ui.add(
         Button::new(text)
             .fill(menu_item_fill())
-            .stroke(Stroke::new(1.0_f32, STROKE))
+            .stroke(Stroke::new(1.0_f32, stroke()))
             .min_size(egui::vec2(0.0, 20.0)),
     )
 }
 
-/// Opaque dark button — use in windows/popups over acrylic (translucent fills wash white).
+/// Opaque button — use in windows/popups over acrylic.
 pub fn menu_btn(ui: &mut Ui, text: impl Into<WidgetText>) -> egui::Response {
     ui.add(
         Button::new(text)
             .fill(menu_item_fill())
-            .stroke(Stroke::new(1.0_f32, STROKE))
+            .stroke(Stroke::new(1.0_f32, stroke()))
             .corner_radius(6.0),
     )
 }
@@ -406,20 +620,20 @@ pub fn menu_btn_selected(
     ui.add(
         Button::new(text)
             .fill(if selected {
-                BG_TAB_ACTIVE
+                bg_tab_active()
             } else {
                 menu_item_fill()
             })
             .stroke(Stroke::new(
                 1.0_f32,
-                if selected { accent() } else { STROKE },
+                if selected { accent() } else { stroke() },
             ))
             .corner_radius(6.0),
     )
 }
 
-pub fn dark_combo_label(text: impl Into<String>) -> RichText {
-    RichText::new(text).color(TEXT).size(13.0).strong()
+pub fn dark_combo_label(text_s: impl Into<String>) -> RichText {
+    RichText::new(text_s).color(text()).size(13.0).strong()
 }
 
 /// Opaque chrome for ComboBox / popup menus over acrylic.
@@ -428,11 +642,18 @@ pub fn apply_opaque_chrome(ui: &mut Ui) {
     let item = menu_item_fill();
     let hover = hover_fill();
     let acc = accent();
+    let fg = text();
+    let edge = stroke();
+    let tab_active = bg_tab_active();
     let v = ui.visuals_mut();
-    v.override_text_color = Some(TEXT);
+    v.override_text_color = Some(fg);
     v.window_fill = menu;
     v.panel_fill = menu;
-    v.extreme_bg_color = shade_rgb(menu, 0.85);
+    v.extreme_bg_color = if is_light_theme() {
+        L_SURFACE_3
+    } else {
+        shade_rgb(menu, 0.85)
+    };
     v.faint_bg_color = item;
     for w in [
         &mut v.widgets.inactive,
@@ -440,92 +661,121 @@ pub fn apply_opaque_chrome(ui: &mut Ui) {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.fg_stroke = Stroke::new(1.0_f32, TEXT);
-        w.bg_stroke = Stroke::new(1.0_f32, STROKE);
+        w.fg_stroke = Stroke::new(1.0_f32, fg);
+        w.bg_stroke = Stroke::new(1.0_f32, edge);
         w.corner_radius = CornerRadius::same(6);
     }
     v.widgets.inactive.bg_fill = menu;
     v.widgets.inactive.weak_bg_fill = menu;
-    v.widgets.hovered.bg_fill = BG_TAB_ACTIVE;
-    v.widgets.hovered.weak_bg_fill = BG_TAB_ACTIVE;
+    v.widgets.hovered.bg_fill = if is_light_theme() { hover } else { tab_active };
+    v.widgets.hovered.weak_bg_fill = if is_light_theme() { hover } else { tab_active };
     v.widgets.active.bg_fill = item;
     v.widgets.active.weak_bg_fill = item;
     v.widgets.open.bg_fill = item;
     v.widgets.open.weak_bg_fill = item;
-    let _ = hover;
     v.selection.bg_fill = Color32::from_rgba_unmultiplied(acc.r(), acc.g(), acc.b(), 80);
 }
 
 pub fn apply(ctx: &egui::Context) {
     setup_fonts(ctx);
 
+    let light = is_light_theme();
     let accent = accent();
     let accent_dim = accent_dim();
     let menu = menu_fill();
     let item = menu_item_fill();
+    let fg = text();
+    let fg_dim = text_dim();
+    let edge = stroke();
+    let hover = hover_fill();
+    let tab_active = bg_tab_active();
 
-    let mut visuals = Visuals::dark();
-    visuals.dark_mode = true;
-    // Opaque fills for windows/menus so text stays readable over acrylic.
+    let mut visuals = if light {
+        Visuals::light()
+    } else {
+        Visuals::dark()
+    };
+    visuals.dark_mode = !light;
+    let chip = if light { L_TAB } else { Color32::from_rgb(40, 40, 46) };
+    let chip_hover = if light { L_HOVER } else { Color32::from_rgb(52, 52, 60) };
     visuals.window_fill = menu;
     visuals.panel_fill = menu;
-    visuals.extreme_bg_color = menu;
+    visuals.extreme_bg_color = if light { L_SURFACE } else { menu };
     visuals.faint_bg_color = item;
-    visuals.override_text_color = Some(TEXT);
-    visuals.warn_fg_color = Color32::from_rgb(255, 200, 100);
-    visuals.error_fg_color = Color32::from_rgb(255, 120, 120);
+    visuals.override_text_color = Some(fg);
+    visuals.warn_fg_color = if light {
+        Color32::from_rgb(160, 100, 20)
+    } else {
+        Color32::from_rgb(255, 200, 100)
+    };
+    visuals.error_fg_color = if light {
+        Color32::from_rgb(180, 40, 40)
+    } else {
+        Color32::from_rgb(255, 120, 120)
+    };
     visuals.hyperlink_color = accent;
     visuals.selection.bg_fill =
-        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 90);
+        Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), if light { 60 } else { 90 });
     visuals.selection.stroke = Stroke::new(1.0_f32, accent);
 
-    visuals.widgets.inactive.bg_fill = item;
-    visuals.widgets.inactive.weak_bg_fill = item;
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    visuals.widgets.inactive.bg_stroke = Stroke::NONE;
+    visuals.widgets.inactive.bg_fill = chip;
+    visuals.widgets.inactive.weak_bg_fill = chip;
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, fg);
+    visuals.widgets.inactive.bg_stroke = if light {
+        Stroke::new(1.0_f32, edge)
+    } else {
+        Stroke::NONE
+    };
     visuals.widgets.inactive.corner_radius = CornerRadius::same(6);
 
-    visuals.widgets.hovered.bg_fill = BG_TAB_ACTIVE;
-    visuals.widgets.hovered.weak_bg_fill = BG_TAB_ACTIVE;
+    visuals.widgets.hovered.bg_fill = chip_hover;
+    visuals.widgets.hovered.weak_bg_fill = chip_hover;
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, accent_dim);
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, fg);
     visuals.widgets.hovered.corner_radius = CornerRadius::same(6);
 
-    visuals.widgets.active.bg_fill = Color32::from_rgb(70, 52, 38);
+    visuals.widgets.active.bg_fill = tab_active;
+    visuals.widgets.active.weak_bg_fill = tab_active;
     visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, accent);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, accent);
+    visuals.widgets.active.fg_stroke = Stroke::new(
+        1.0_f32,
+        if light { L_TEXT } else { accent },
+    );
     visuals.widgets.active.corner_radius = CornerRadius::same(6);
 
-    visuals.widgets.open.bg_fill = item;
-    visuals.widgets.open.weak_bg_fill = item;
+    visuals.widgets.open.bg_fill = chip;
+    visuals.widgets.open.weak_bg_fill = chip;
     visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, accent);
-    visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, TEXT);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, fg);
     visuals.widgets.open.corner_radius = CornerRadius::same(6);
 
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, STROKE);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, fg_dim);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, edge);
     visuals.widgets.noninteractive.corner_radius = CornerRadius::same(6);
 
-    // Menu bar / combo text must stay light on dark chrome (avoid white pills).
     visuals.button_frame = true;
 
     visuals.window_corner_radius = CornerRadius::same(12);
     visuals.menu_corner_radius = CornerRadius::same(8);
-    // Frameless chrome — no hard window borders (iOS / Win11 acrylic feel).
-    visuals.window_stroke = Stroke::NONE;
+    visuals.window_stroke = if light {
+        Stroke::new(1.0_f32, edge)
+    } else {
+        Stroke::NONE
+    };
     visuals.window_shadow = egui::Shadow {
         offset: [0, 4],
         blur: 14,
         spread: 0,
-        color: Color32::from_black_alpha(70),
+        color: Color32::from_black_alpha(if light { 28 } else { 70 }),
     };
     visuals.popup_shadow = egui::Shadow {
         offset: [0, 3],
         blur: 10,
         spread: 0,
-        color: Color32::from_black_alpha(55),
+        color: Color32::from_black_alpha(if light { 22 } else { 55 }),
     };
     visuals.slider_trailing_fill = true;
+    let _ = hover;
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
@@ -596,32 +846,36 @@ fn setup_fonts(ctx: &egui::Context) {
 /// Acrylic / mica *look* as a solid RGB fill (alpha=255).
 /// Same tint as translucent [`panel_fill`], without the per-frame blend cost.
 pub fn acrylic_solid_fill() -> Color32 {
-    let base = app_color();
+    let base = if is_light_theme() {
+        L_SURFACE
+    } else {
+        app_color()
+    };
     let lift = match material() {
         crate::settings::UiMaterial::Glass => {
             if is_light_theme() {
-                -6
+                -4
             } else {
                 14
             }
         }
-        crate::settings::UiMaterial::Aero => {
+        crate::settings::UiMaterial::LegacyGlass => {
             if is_light_theme() {
-                -4
+                -2
             } else {
                 18
             }
         }
         crate::settings::UiMaterial::Smoke => {
             if is_light_theme() {
-                -10
+                -6
             } else {
                 6
             }
         }
         _ => {
             if is_light_theme() {
-                -8
+                -4
             } else {
                 10
             }
@@ -631,11 +885,11 @@ pub fn acrylic_solid_fill() -> Color32 {
 }
 
 pub fn acrylic_solid_bar() -> Color32 {
-    lift_rgb(acrylic_solid_fill(), if is_light_theme() { -10 } else { 12 })
+    lift_rgb(acrylic_solid_fill(), if is_light_theme() { -8 } else { 12 })
 }
 
 pub fn acrylic_solid_card() -> Color32 {
-    lift_rgb(acrylic_solid_fill(), if is_light_theme() { -14 } else { 18 })
+    lift_rgb(acrylic_solid_fill(), if is_light_theme() { -6 } else { 18 })
 }
 
 pub fn panel_frame() -> egui::Frame {
@@ -643,7 +897,7 @@ pub fn panel_frame() -> egui::Frame {
         offset: [0, 4],
         blur: 12,
         spread: 0,
-        color: Color32::from_black_alpha(60),
+        color: Color32::from_black_alpha(if is_light_theme() { 24 } else { 60 }),
     };
     egui::Frame::new()
         .fill(panel_fill())
@@ -657,14 +911,18 @@ pub fn panel_frame() -> egui::Frame {
 pub fn chrome_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(chrome_fill())
-        .stroke(Stroke::NONE)
+        .stroke(if is_light_theme() {
+            Stroke::new(1.0_f32, stroke())
+        } else {
+            Stroke::NONE
+        })
         .corner_radius(CornerRadius::same(0))
         .inner_margin(egui::Margin::symmetric(10, 6))
         .shadow(egui::Shadow {
             offset: [0, 2],
             blur: 6,
             spread: 0,
-            color: Color32::from_black_alpha(40),
+            color: Color32::from_black_alpha(if is_light_theme() { 16 } else { 40 }),
         })
 }
 

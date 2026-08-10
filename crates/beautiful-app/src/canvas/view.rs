@@ -158,7 +158,7 @@ impl CanvasView {
                         .filter(|p| viewport.contains(*p));
                     let cursor = state.resolve_zoom_pivot(sample);
                     if zoom_smooth {
-                        let factor = step.powf(raw_y / 120.0);
+                        let factor = step.powf(raw_y / crate::canvas::WHEEL_NOTCH_POINTS);
                         if (factor - 1.0).abs() > 1e-5 {
                             let old_z = state.zoom;
                             state.zoom_toward(factor, cursor, view_center, doc_w, doc_h);
@@ -928,6 +928,24 @@ impl CanvasView {
             let smudge = matches!(tool, WorkspaceTool::Smudge);
             if state.trajectory.flush(document, smudge) {
                 state.mark_dirty();
+            }
+            // Ending stub enables taper_out along the last spacing window.
+            if !smudge
+                && document.brush.taper_out > 1e-5
+                && !matches!(
+                    tool,
+                    WorkspaceTool::SelectionBrush | WorkspaceTool::SelectionEraser
+                )
+            {
+                if let Some(b) = state.trajectory.tip().or(state.last_point) {
+                    let stub_len = (document.brush.taper_out
+                        * document.brush.size
+                        * 2.0)
+                        .max(1.0);
+                    let stub = (b.0 + stub_len, b.1, b.2 * 0.15);
+                    document.paint_polyline_ex(&[b, stub], true);
+                    state.mark_dirty();
+                }
             }
             if let Some(tip) = state.trajectory.tip().or(state.last_point) {
                 state.line_anchor = Some(tip);

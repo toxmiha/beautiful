@@ -2,6 +2,7 @@
 /dist/
 /logs/
 /backup/
+/_backup/
 **/.cursor/
 **/node_modules
 **/*.rs.bk
@@ -9,3 +10,9 @@ Cargo.lock
 *.beautiful
 .DS_Store
 Thumbs.db
+
+# Secrets / local agent tooling — never publish
+.env
+.env.*
+*.pem
+tools/beautiful-mcp/

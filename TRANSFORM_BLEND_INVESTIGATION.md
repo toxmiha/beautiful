@@ -129,16 +129,16 @@ Fast path (Normal above only): frozen underlay + GPU float pose + cached transpa
 
 | Источник | Статус | Суть |
 |---|---|---|
-| **Krita** MR !602 in-stack transform preview | Confirmed | Два режима: **in-stack** (корректные blend/masks, дороже) vs **overlay** над стеком (быстрее, blend стека неверный). Pref: можно выключить in-stack → overlay. |
-| **Krita** transform mask + Instant Preview | Confirmed | Асинхронная/LOD-подобная регенерация projection; forced instant preview для тяжёлых tool. |
-| **GIMP** | Confirmed (ранее) | composited preview часто optional/off |
+| Open paint peer — in-stack transform preview | Confirmed | Два режима: **in-stack** (корректные blend/masks, дороже) vs **overlay** над стеком (быстрее, blend стека неверный). Pref: можно выключить in-stack → overlay. |
+| Open paint peer — transform mask + Instant Preview | Confirmed | Асинхронная/LOD-подобная регенерация projection; forced instant preview для тяжёлых tool. |
+| Open paint peer (optional composited preview) | Confirmed (ранее) | composited preview часто optional/off |
 | **Skia / WebRender** | Confirmed | `mix-blend-mode` требует изоляции + корректный backdrop |
 | **closed peers (hypothesis only)** | Hypothesis | закрытые GPU stack; не использовать как «доказанный алгоритм» |
 
 **Сравнение с Beautiful (без выбора решения):**
 
-- Beautiful уже близок к Krita dual-path: Normal above ≈ overlay; non-Normal ≈ попытка «локального in-stack» через CPU bake `blend_above_into` + punch.
-- Krita платит за корректность in-stack scheduler/projection; Beautiful платит синхронным CPU ROI на UI thread throttled ~20 Hz.
+- Beautiful уже близок к dual-path: Normal above ≈ overlay; non-Normal ≈ попытка «локального in-stack» через CPU bake `blend_above_into` + punch.
+- Open peers платят за корректность in-stack scheduler/projection; Beautiful платит синхронным CPU ROI на UI thread throttled ~20 Hz.
 - Идея «локально применить» из OSS: не новый compositor, а (а) измерить, (б) сузить работу до ∩ bounds / переиспользовать immutable above tiles / не дублировать resample. Любая из этих идей — **кандидат после Bench**, не план реализации сейчас.
 
 ---

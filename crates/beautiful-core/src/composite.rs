@@ -1059,10 +1059,12 @@ pub fn composite_region_packed_into_skip(
     let y1 = rect.y1 as usize;
     let row_w = (x1 - x0) * 4;
     let stride = out_w * 4;
-    let doc_w = doc_width as usize;
     let origin_y = origin_y as usize;
     let origin_x = origin_x as usize;
     let area = (x1 - x0).saturating_mul(y1.saturating_sub(y0));
+
+    // Hoist layer participation once per region (was O(rows×L) content_bounds walks).
+    let layer_plan = build_layer_row_plan(layers, rect, floating, skip_layer);
 
     if area >= 64 * 64 {
         use rayon::prelude::*;
@@ -1074,18 +1076,17 @@ pub fn composite_region_packed_into_skip(
                     return;
                 }
                 let mut scratch = vec![0u8; row_w];
-                composite_row_into_skip(
+                composite_row_into_planned(
                     row,
                     x0,
                     x1,
                     y,
-                    doc_w,
                     origin_x,
                     background,
                     layers,
+                    &layer_plan,
                     &mut scratch,
                     floating,
-                    skip_layer,
                 );
             });
         return;
@@ -1095,18 +1096,17 @@ pub fn composite_region_packed_into_skip(
     for y in y0..y1 {
         let local_y = y.saturating_sub(origin_y);
         let row = &mut out[local_y * stride..(local_y + 1) * stride];
-        composite_row_into_skip(
+        composite_row_into_planned(
             row,
             x0,
             x1,
             y,
-            doc_w,
             origin_x,
             background,
             layers,
+            &layer_plan,
             &mut scratch,
             floating,
-            skip_layer,
         );
     }
 }
@@ -1252,6 +1252,96 @@ fn composite_row_into_skip(
     floating: Option<FloatingBlit<'_>>,
     skip_layer: Option<usize>,
 ) {
+    let rect = DirtyRect {
+        x0: x0 as u32,
+        y0: y as u32,
+        x1: x1 as u32,
+        y1: (y as u32).saturating_add(1),
+    };
+    let plan = build_layer_row_plan(layers, rect, floating, skip_layer);
+    composite_row_into_planned(
+        row,
+        x0,
+        x1,
+        y,
+        dst_doc_x0,
+        background,
+        layers,
+        &plan,
+        scratch,
+        floating,
+    );
+}
+
+#[derive(Clone, Copy)]
+struct LayerRowSlot {
+    li: usize,
+    clip_below: bool,
+    /// Precomputed content AABB; `None` means always try (clip/floating).
+    bounds: Option<DirtyRect>,
+}
+
+fn build_layer_row_plan(
+    layers: &[Layer],
+    rect: DirtyRect,
+    floating: Option<FloatingBlit<'_>>,
+    skip_layer: Option<usize>,
+) -> Vec<LayerRowSlot> {
+    let mut plan = Vec::with_capacity(layers.len());
+    for (li, layer) in layers.iter().enumerate() {
+        if skip_layer == Some(li) {
+            continue;
+        }
+        if !layer.visible || crate::omit_above::is_omitted(li) {
+            continue;
+        }
+        if layer.is_folder || layer.is_adjustment() {
+            continue;
+        }
+        let layer_opacity =
+            (layer.opacity.clamp(0.0, 1.0) * ancestor_folder_opacity(layers, li)).clamp(0.0, 1.0);
+        if layer_opacity <= 0.0 {
+            continue;
+        }
+        let clip_below = layer.clip_to_below && li > 0;
+        let has_floating_here = floating.is_some_and(|f| f.layer_idx == li);
+        let bounds = if clip_below || has_floating_here {
+            None
+        } else {
+            // Prefer tile-key hit (sparse) over full AABB when layer is large/sparse.
+            let n = layer.tiles.painted_tile_count();
+            if n == 0 {
+                continue;
+            }
+            if n > 64 && !layer.tiles.intersects_rect(rect) {
+                continue;
+            }
+            match layer.content_bounds() {
+                Some(b) if b.intersects(rect) => Some(b),
+                _ => continue,
+            }
+        };
+        plan.push(LayerRowSlot {
+            li,
+            clip_below,
+            bounds,
+        });
+    }
+    plan
+}
+
+fn composite_row_into_planned(
+    row: &mut [u8],
+    x0: usize,
+    x1: usize,
+    y: usize,
+    dst_doc_x0: usize,
+    background: Rgba,
+    layers: &[Layer],
+    plan: &[LayerRowSlot],
+    scratch: &mut [u8],
+    floating: Option<FloatingBlit<'_>>,
+) {
     for x in x0..x1 {
         let i = (x - dst_doc_x0) * 4;
         row[i] = background.r;
@@ -1265,48 +1355,31 @@ fn composite_row_into_skip(
         return;
     }
 
-    for (li, layer) in layers.iter().enumerate() {
-        if skip_layer == Some(li) {
-            continue;
+    let dirty_row = DirtyRect {
+        x0: x0 as u32,
+        y0: y as u32,
+        x1: x1 as u32,
+        y1: (y as u32).saturating_add(1),
+    };
+
+    for slot in plan {
+        let li = slot.li;
+        let layer = &layers[li];
+        if let Some(bounds) = slot.bounds {
+            if !bounds.intersects(dirty_row) {
+                continue;
+            }
         }
-        if !layer.visible || crate::omit_above::is_omitted(li) {
-            continue;
-        }
-        if layer.is_folder {
-            continue;
-        }
-        if layer.is_adjustment() {
-            continue;
-        }
-        let layer_opacity = (layer.opacity.clamp(0.0, 1.0) * ancestor_folder_opacity(layers, li)).clamp(0.0, 1.0);
+        let layer_opacity =
+            (layer.opacity.clamp(0.0, 1.0) * ancestor_folder_opacity(layers, li)).clamp(0.0, 1.0);
         if layer_opacity <= 0.0 {
             continue;
-        }
-
-        let clip_below = layer.clip_to_below && li > 0;
-        let has_floating_here = floating.is_some_and(|f| f.layer_idx == li);
-        // Skip sparse/empty layers whose painted bounds miss this dirty rect.
-        // Clip-to-below / floating-owner layers always participate.
-        // `content_bounds() == None` means no tiles — skip (was a silent O(L) walk).
-        if !clip_below && !has_floating_here {
-            let dirty = DirtyRect {
-                x0: x0 as u32,
-                y0: y as u32,
-                x1: x1 as u32,
-                y1: (y as u32).saturating_add(1),
-            };
-            match layer.content_bounds() {
-                Some(bounds) if bounds.intersects(dirty) => {}
-                Some(_) => continue,
-                None => continue,
-            }
         }
 
         let layer_row = &mut scratch[..need];
         layer
             .tiles
             .copy_span_fast(y as u32, x0 as u32, x1 as u32, layer_row);
-        // Merge floating into this layer's scratch before opacity/blend/clip.
         if let Some(f) = floating {
             if f.layer_idx == li {
                 blit_floating_into_span(layer_row, x0, x1, y, f);
@@ -1320,7 +1393,7 @@ fn composite_row_into_skip(
             if layer.mask.is_some() {
                 src_a *= layer.mask_sample(x, y) as f32 / 255.0;
             }
-            if clip_below {
+            if slot.clip_below {
                 if let Some(below_a) =
                     nearest_paintable_alpha(layers, li, x as u32, y as u32, floating)
                 {

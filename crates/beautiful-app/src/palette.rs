@@ -184,21 +184,21 @@ pub fn color_palette(
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("Color")
-                .color(crate::theme::TEXT)
+                .color(crate::theme::text())
                 .strong(),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             egui::ComboBox::from_id_salt("color_picker_kind")
                 .selected_text(
                     egui::RichText::new(state.picker.label())
-                        .color(crate::theme::TEXT)
+                        .color(crate::theme::text())
                         .size(12.0),
                 )
                 .width(160.0)
                 .show_ui(ui, |ui| {
                     ui.set_min_width(180.0);
-                    ui.visuals_mut().override_text_color = Some(crate::theme::TEXT);
-                    ui.visuals_mut().window_fill = crate::theme::BG_MENU;
+                    ui.visuals_mut().override_text_color = Some(crate::theme::text());
+                    ui.visuals_mut().window_fill = crate::theme::bg_menu();
                     for kind in ColorPickerKind::ALL {
                         let on = state.picker == kind;
                         let label = if on {
@@ -209,12 +209,12 @@ pub fn color_palette(
                         if ui
                             .add(
                                 egui::Button::new(
-                                    egui::RichText::new(label).color(crate::theme::TEXT),
+                                    egui::RichText::new(label).color(crate::theme::text()),
                                 )
                                 .fill(if on {
-                                    crate::theme::BG_TAB_ACTIVE
+                                    crate::theme::bg_tab_active()
                                 } else {
-                                    crate::theme::BG_MENU_ITEM
+                                    crate::theme::bg_menu_item()
                                 })
                                 .min_size(egui::vec2(ui.available_width(), 22.0)),
                             )
@@ -432,7 +432,7 @@ pub fn color_palette(
         if ui
             .add(
                 egui::Button::new(crate::theme::label(open_label))
-                    .fill(crate::theme::BG_MENU_ITEM)
+                    .fill(crate::theme::bg_menu_item())
                     .min_size(egui::vec2(ui.available_width(), 22.0)),
             )
             .clicked()
@@ -784,7 +784,7 @@ fn web_colors(ui: &mut egui::Ui, color: &mut Rgba, state: &mut ColorState) -> bo
         let resp = ui.add(
             egui::TextEdit::singleline(&mut state.web_hex)
                 .desired_width(90.0)
-                .text_color(crate::theme::TEXT),
+                .text_color(crate::theme::text()),
         );
         if resp.lost_focus() || (resp.changed() && state.web_hex.len() >= 7) {
             if let Some((r, g, b)) = parse_hex(&state.web_hex) {
@@ -865,7 +865,7 @@ fn grayscale_bar(ui: &mut egui::Ui, state: &mut ColorState, width: f32) -> bool 
     ui.painter().rect_stroke(
         rect,
         0.0,
-        Stroke::new(1.0_f32, crate::theme::STROKE),
+        Stroke::new(1.0_f32, crate::theme::stroke()),
         egui::StrokeKind::Outside,
     );
 
@@ -971,7 +971,7 @@ fn bright_hs_cube(ui: &mut egui::Ui, state: &mut ColorState, size: f32) -> bool 
     ui.painter().rect_stroke(
         sq_rect,
         0.0,
-        Stroke::new(1.0_f32, crate::theme::STROKE),
+        Stroke::new(1.0_f32, crate::theme::stroke()),
         egui::StrokeKind::Outside,
     );
 
@@ -1074,7 +1074,7 @@ fn paint_sv_square(ui: &mut egui::Ui, state: &mut ColorState, sq: egui::Rect) {
     ui.painter().rect_stroke(
         sq,
         0.0,
-        Stroke::new(1.0_f32, crate::theme::STROKE),
+        Stroke::new(1.0_f32, crate::theme::stroke()),
         egui::StrokeKind::Outside,
     );
 }

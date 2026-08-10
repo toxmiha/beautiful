@@ -2,7 +2,7 @@
 
 # Beautiful
 
-**Beautiful** is an open-source digital painting app.
+**Beautiful** is an open-source digital painting app (MIT).
 
 > **Alpha** — not stable. Expect bugs and unfinished tools. Published on GitHub for **beta testers**.
 
@@ -10,14 +10,14 @@ A **beta** release is planned later.
 
 ## Download
 
-Get the latest Windows build from **[Releases](https://github.com/toxmiha/beautiful/releases)**  
-(e.g. `Beautiful-0.4.7.exe`). Source archives are attached to each release as usual.
+Get the latest builds from **[Releases](https://github.com/toxmiha/beautiful/releases)**  
+(e.g. `Beautiful-0.4.8.exe` for Windows, Linux x64 when attached). Source archives are attached to each release as usual.
 
 ## Status
 
 | | |
 |---|---|
-| Stage | **Alpha 0.4.7** |
+| Stage | **Alpha 0.4.8** |
 | Stability | Unstable — bugs are expected |
 | Tools progress | About **~70%** of planned tools implemented |
 | License | [MIT](LICENSE) |
@@ -30,18 +30,32 @@ Get the latest Windows build from **[Releases](https://github.com/toxmiha/beauti
 - **Addons** supported
 - **Open source** (MIT)
 
+## What’s new in 0.4.8
+
+- Brush Engine v2 (opacity/flow, spacing, scatter, dynamics, dual brush path, node editor entry)
+- Editable tablet pressure curves + mouse pressure emulation
+- Filter Studio (stack filters with live preview, then Apply)
+- Discord Rich Presence (session status; NSFW hides canvas name + preview)
+- Boot splash progress, optional update check from GitHub Releases
+- Paint-path and multilayer composite performance work
+
 ## What’s next
 
-- Finish and rework the **brush system**
-- Continue **performance / optimization** work
+- Continue brush and performance work
 - Grow the toolset toward a fuller painting workflow
 - Move from alpha toward a **beta** release
 
-## Requirements (Windows build)
+## Requirements
+
+**Windows**
 
 - Windows 10/11 (64-bit)
 - GPU with DirectX 12 / Vulkan
-- XP-Pen / Wacom / any Windows Ink or WinTab tablet (optional; mouse works)
+- Pen tablet optional (Windows Ink / WinTab); mouse works
+
+**Linux**
+
+- x86_64, Vulkan (Mesa is fine; Steam Deck / SteamOS compatible builds when provided)
 
 ## Build from source
 

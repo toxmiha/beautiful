@@ -1,4 +1,4 @@
-use beautiful_core::{BrushShape, BrushTexture, Document, HairDirection};
+use beautiful_core::{BrushShape, BrushTexture, Document};
 use eframe::egui::{self, Sense};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -18,9 +18,14 @@ use crate::theme;
 pub struct BrushPanelUi {
     pub show_min_size: bool,
     pub show_min_density: bool,
+    pub show_min_flow: bool,
     pub shape_open: bool,
     pub texture_open: bool,
-    /// Cached live stroke preview (Krita-style S-curve).
+    pub dual_open: bool,
+    /// Visual node graph editor (egui-snarl).
+    pub node_editor_open: bool,
+    pub node_editor: crate::brush_nodes::BrushNodeEditorState,
+    /// Cached live stroke preview (S-curve).
     pub stroke_preview_tex: Option<egui::TextureHandle>,
     pub stroke_preview_key: u64,
 }
@@ -34,6 +39,17 @@ pub struct LayerUiState {
     pub rename_buf: String,
     /// Eye clicks coalesced to one apply/frame (last value per layer wins).
     pub pending_visibility: Vec<(usize, bool)>,
+    /// After Ctrl-pick / open: scroll the layer list to this index once.
+    pub scroll_to: Option<usize>,
+}
+
+impl LayerUiState {
+    /// Keep list highlight in sync with document active layer (open / pick).
+    pub fn focus_layer(&mut self, idx: usize) {
+        self.selected = vec![idx];
+        self.anchor = Some(idx);
+        self.scroll_to = Some(idx);
+    }
 }
 
 /// Downscaled unfiltered base for live filter preview (gradient-style: cheap re-run).
@@ -337,13 +353,17 @@ impl FilterUiState {
                 beautiful_core::filters::posterize(&mut mini, self.posterize_levels);
             }
             FilterDialog::ChromaticAberration => {
-                beautiful_core::filters::chromatic_aberration(&mut mini, self.chroma_amount / lod);
+                beautiful_core::filters::chromatic_aberration(
+                    &mut mini,
+                    self.chroma_amount / lod,
+                    0.0,
+                );
             }
             FilterDialog::Noise => {
-                beautiful_core::filters::noise(&mut mini, self.noise_amount);
+                beautiful_core::filters::noise(&mut mini, self.noise_amount, true, true);
             }
             FilterDialog::Glitch => {
-                beautiful_core::filters::glitch(&mut mini, self.glitch_amount);
+                beautiful_core::filters::glitch(&mut mini, self.glitch_amount, 12.0, 20.0);
             }
             FilterDialog::HexPixelize => {
                 let s = (self.hex_size as f32 / lod).round().max(2.0) as u32;
@@ -358,20 +378,28 @@ impl FilterUiState {
                 beautiful_core::filters::hex_dots(&mut mini, s);
             }
             FilterDialog::Fisheye => {
-                beautiful_core::filters::fisheye(&mut mini, self.fisheye_amount);
+                beautiful_core::filters::fisheye(&mut mini, self.fisheye_amount, 100.0, 50.0, 50.0);
             }
             FilterDialog::SphericalLens => {
-                beautiful_core::filters::spherical_lens(&mut mini, self.lens_amount);
+                beautiful_core::filters::spherical_lens(
+                    &mut mini,
+                    self.lens_amount,
+                    100.0,
+                    50.0,
+                    50.0,
+                );
             }
             FilterDialog::Ripple => {
                 beautiful_core::filters::ripple(
                     &mut mini,
                     self.ripple_amount / lod,
                     self.ripple_wavelength / lod,
+                    50.0,
+                    50.0,
                 );
             }
             FilterDialog::Twist => {
-                beautiful_core::filters::twist(&mut mini, self.twist_amount);
+                beautiful_core::filters::twist(&mut mini, self.twist_amount, 100.0, 50.0, 50.0);
             }
             FilterDialog::Vignette => {
                 beautiful_core::filters::vignette(
@@ -557,17 +585,17 @@ impl FilterUiState {
             }
             FilterDialog::ChromaticAberration => {
                 document.apply_active_layer_filter(|layer| {
-                    beautiful_core::filters::chromatic_aberration(layer, self.chroma_amount)
+                    beautiful_core::filters::chromatic_aberration(layer, self.chroma_amount, 0.0)
                 });
             }
             FilterDialog::Noise => {
                 document.apply_active_layer_filter(|layer| {
-                    beautiful_core::filters::noise(layer, self.noise_amount)
+                    beautiful_core::filters::noise(layer, self.noise_amount, true, true)
                 });
             }
             FilterDialog::Glitch => {
                 document.apply_active_layer_filter(|layer| {
-                    beautiful_core::filters::glitch(layer, self.glitch_amount)
+                    beautiful_core::filters::glitch(layer, self.glitch_amount, 12.0, 20.0)
                 });
             }
             FilterDialog::HexPixelize => {
@@ -587,12 +615,18 @@ impl FilterUiState {
             }
             FilterDialog::Fisheye => {
                 document.apply_active_layer_filter(|layer| {
-                    beautiful_core::filters::fisheye(layer, self.fisheye_amount)
+                    beautiful_core::filters::fisheye(layer, self.fisheye_amount, 100.0, 50.0, 50.0)
                 });
             }
             FilterDialog::SphericalLens => {
                 document.apply_active_layer_filter(|layer| {
-                    beautiful_core::filters::spherical_lens(layer, self.lens_amount)
+                    beautiful_core::filters::spherical_lens(
+                        layer,
+                        self.lens_amount,
+                        100.0,
+                        50.0,
+                        50.0,
+                    )
                 });
             }
             FilterDialog::Ripple => {
@@ -601,12 +635,14 @@ impl FilterUiState {
                         layer,
                         self.ripple_amount,
                         self.ripple_wavelength,
+                        50.0,
+                        50.0,
                     )
                 });
             }
             FilterDialog::Twist => {
                 document.apply_active_layer_filter(|layer| {
-                    beautiful_core::filters::twist(layer, self.twist_amount)
+                    beautiful_core::filters::twist(layer, self.twist_amount, 100.0, 50.0, 50.0)
                 });
             }
             FilterDialog::Vignette => {
@@ -1004,7 +1040,7 @@ fn tool_pages_path() -> PathBuf {
     PathBuf::from("beautiful-tool-pages.json")
 }
 
-/// Blender-style Open Recent hover: canvas thumbnail to the right of the menu row.
+/// Open Recent hover: canvas thumbnail to the right of the menu row.
 fn show_recent_hover_preview(
     ctx: &egui::Context,
     response: &egui::Response,
@@ -1044,8 +1080,8 @@ fn show_recent_hover_preview(
         .interactable(false)
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style())
-                .fill(theme::BG_MENU)
-                .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                .fill(theme::bg_menu())
+                .stroke(egui::Stroke::new(1.0_f32, theme::stroke()))
                 .corner_radius(8.0)
                 .inner_margin(10.0)
                 .shadow(egui::Shadow {
@@ -1071,6 +1107,11 @@ fn show_recent_hover_preview(
         });
 }
 
+const APP_TITLE: &str = "Beautiful · Alpha 0.4.8";
+const TITLE_BAR_H: f32 = 28.0;
+const TITLE_LOGO_PNG: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../vendor/eframe/data/icon.png"));
+
 pub fn top_menu(
     ctx: &egui::Context,
     dock: &mut DockLayout,
@@ -1089,21 +1130,29 @@ pub fn top_menu(
     request_open_canvas: &mut bool,
     request_new_canvas: &mut bool,
     request_open_paths: &mut Vec<std::path::PathBuf>,
+    filter_studio: &mut crate::filter_studio::FilterStudioState,
 ) {
     let transform_lock = canvas.tool_edit_lock();
-    egui::TopBottomPanel::top("menu_bar")
-        .exact_height(28.0)
-        .frame(theme::chrome_frame())
+    // Custom title bar (OS decorations off): logo + menus + drag strip + window controls.
+    let title_frame = egui::Frame::new()
+        .fill(theme::chrome_fill())
+        .stroke(egui::Stroke::NONE)
+        .inner_margin(egui::Margin::symmetric(6, 2));
+    egui::TopBottomPanel::top("title_bar")
+        .exact_height(TITLE_BAR_H)
+        .frame(title_frame)
         .show(ctx, |ui| {
             // Force readable dark-chrome menu labels (avoid white-on-white / white pills).
             ui.visuals_mut().widgets.inactive.fg_stroke =
-                egui::Stroke::new(1.0_f32, theme::TEXT);
+                egui::Stroke::new(1.0_f32, theme::text());
             ui.visuals_mut().widgets.hovered.fg_stroke =
-                egui::Stroke::new(1.0_f32, theme::TEXT);
-            ui.visuals_mut().widgets.inactive.bg_fill = theme::BG_PANEL_2;
+                egui::Stroke::new(1.0_f32, theme::text());
+            ui.visuals_mut().widgets.inactive.bg_fill = theme::bg_panel_2_solid();
             ui.visuals_mut().widgets.hovered.bg_fill = theme::BG_HOVER;
-            ui.horizontal(|ui| {
+            ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().button_padding = egui::vec2(8.0, 2.0);
+                let row_h = ui.available_height().max(22.0);
                 // Opaque chips — translucent fills read as white on acrylic.
                 let bar_fill = egui::Color32::from_rgb(40, 40, 46);
                 let bar_hover = egui::Color32::from_rgb(52, 52, 60);
@@ -1111,8 +1160,12 @@ pub fn top_menu(
                 ui.visuals_mut().widgets.inactive.weak_bg_fill = bar_fill;
                 ui.visuals_mut().widgets.hovered.bg_fill = bar_hover;
                 ui.visuals_mut().widgets.hovered.weak_bg_fill = bar_hover;
+
+                title_bar_app_logo(ui, row_h - 2.0);
+                ui.add_space(2.0);
+
                 for label in [
-                    "File", "Edit", "Canvas", "Selection", "Filters", "View", "Window", "Help",
+                    "File", "Edit", "Canvas", "Selection", "Filters", "View", "Window",
                 ] {
                     let doc_menu = matches!(
                         label,
@@ -1140,7 +1193,16 @@ pub fn top_menu(
                         .fill(menu_fill)
                         .stroke(egui::Stroke::NONE)
                         .corner_radius(4.0)
-                        .min_size(egui::vec2(0.0, 20.0));
+                        .min_size(egui::vec2(0.0, row_h));
+                    // Filters opens studio immediately (no submenu).
+                    if label == "Filters" {
+                        ui.add_enabled_ui(allowed, |ui| {
+                            if ui.add(btn).clicked() {
+                                let _ = filter_studio.request_open(document);
+                            }
+                        });
+                        continue;
+                    }
                     ui.add_enabled_ui(allowed, |ui| {
                     let _ = egui::containers::menu::MenuButton::from_button(btn).ui(ui, |ui| {
                         ui.set_min_width(160.0);
@@ -1149,15 +1211,15 @@ pub fn top_menu(
                         ui.visuals_mut().panel_fill = theme::menu_fill();
                         ui.visuals_mut().extreme_bg_color = theme::menu_fill();
                         ui.visuals_mut().faint_bg_color = theme::menu_item_fill();
-                        ui.visuals_mut().override_text_color = Some(theme::TEXT);
+                        ui.visuals_mut().override_text_color = Some(theme::text());
                         ui.visuals_mut().widgets.inactive.bg_fill = theme::menu_item_fill();
                         ui.visuals_mut().widgets.inactive.weak_bg_fill = theme::menu_item_fill();
                         ui.visuals_mut().widgets.inactive.fg_stroke =
-                            egui::Stroke::new(1.0_f32, theme::TEXT);
-                        ui.visuals_mut().widgets.hovered.bg_fill = theme::BG_TAB_ACTIVE;
-                        ui.visuals_mut().widgets.hovered.weak_bg_fill = theme::BG_TAB_ACTIVE;
+                            egui::Stroke::new(1.0_f32, theme::text());
+                        ui.visuals_mut().widgets.hovered.bg_fill = theme::bg_tab_active();
+                        ui.visuals_mut().widgets.hovered.weak_bg_fill = theme::bg_tab_active();
                         ui.visuals_mut().widgets.hovered.fg_stroke =
-                            egui::Stroke::new(1.0_f32, theme::TEXT);
+                            egui::Stroke::new(1.0_f32, theme::text());
                         match label {
                         "File" => {
                             if icons::menu_icon_btn(ui, ToolIcon::NewDoc, "New Canvas…").clicked() {
@@ -1295,155 +1357,6 @@ pub fn top_menu(
                                 }
                             }
                         }
-                        "Filters" => {
-                            let open_filter = |filters: &mut FilterUiState,
-                                               document: &mut Document,
-                                               d: FilterDialog,
-                                               ui: &mut egui::Ui| {
-                                if document.require_paintable("Фильтр") {
-                                    filters.dialog = Some(d);
-                                    ui.close();
-                                }
-                            };
-                            ui.menu_button(theme::label("Blur"), |ui| {
-                                if theme::btn(ui, theme::label("Gaussian Blur…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::Gaussian, ui);
-                                }
-                                if theme::btn(ui, theme::label("Motion Blur…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::Motion, ui);
-                                }
-                                if theme::btn(ui, theme::label("Radial Blur…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::Radial, ui);
-                                }
-                                if theme::btn(ui, theme::label("Unsharp Mask…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::Unsharp, ui);
-                                }
-                            });
-                            ui.menu_button(theme::label("Correction"), |ui| {
-                                if theme::btn(ui, theme::label("Brightness/Contrast…")).clicked() {
-                                    open_filter(
-                                        filters,
-                                        document,
-                                        FilterDialog::BrightnessContrast,
-                                        ui,
-                                    );
-                                }
-                                if theme::btn(ui, theme::label("Levels…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::Levels, ui);
-                                }
-                                if theme::btn(ui, theme::label("Hue/Saturation…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::HueSaturation, ui);
-                                }
-                                if theme::btn(ui, theme::label("Color Balance…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::ColorBalance, ui);
-                                }
-                                if theme::btn(ui, theme::label("Invert")).clicked() {
-                                    if document.require_paintable("Инверсия") {
-                                        document.apply_active_layer_filter(
-                                            beautiful_core::filters::invert,
-                                        );
-                                        ui.close();
-                                    }
-                                }
-                            });
-                            ui.menu_button(theme::label("Pixelate"), |ui| {
-                                if theme::btn(ui, theme::label("Pixelization…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::Pixelize, ui);
-                                }
-                                if theme::btn(ui, theme::label("Hex Pixelization…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::HexPixelize, ui);
-                                }
-                                if theme::btn(ui, theme::label("Triangle Pixelization…")).clicked()
-                                {
-                                    open_filter(filters, document, FilterDialog::TriPixelize, ui);
-                                }
-                                if theme::btn(ui, theme::label("Hex Dots…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::HexDots, ui);
-                                }
-                                if theme::btn(ui, theme::label("Posterize…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::Posterize, ui);
-                                }
-                            });
-                            ui.menu_button(theme::label("Distort"), |ui| {
-                                if theme::btn(ui, theme::label("Fisheye…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::Fisheye, ui);
-                                }
-                                if theme::btn(ui, theme::label("Spherical Lens…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::SphericalLens, ui);
-                                }
-                                if theme::btn(ui, theme::label("Ripple…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::Ripple, ui);
-                                }
-                                if theme::btn(ui, theme::label("Twist…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::Twist, ui);
-                                }
-                            });
-                            ui.menu_button(theme::label("Effects"), |ui| {
-                                if theme::btn(ui, theme::label("Chromatic Aberration…")).clicked() {
-                                    open_filter(
-                                        filters,
-                                        document,
-                                        FilterDialog::ChromaticAberration,
-                                        ui,
-                                    );
-                                }
-                                if theme::btn(ui, theme::label("Noise…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::Noise, ui);
-                                }
-                                if theme::btn(ui, theme::label("Glitch…")).clicked() {
-                                    open_filter(filters, document, FilterDialog::Glitch, ui);
-                                }
-                                if icons::menu_icon_btn(ui, ToolIcon::Vignette, "Vignette…")
-                                    .clicked()
-                                {
-                                    open_filter(filters, document, FilterDialog::Vignette, ui);
-                                }
-                                if icons::menu_icon_btn(ui, ToolIcon::Glow, "Glow…").clicked() {
-                                    open_filter(filters, document, FilterDialog::Glow, ui);
-                                }
-                            });
-                            if !addons.filters.is_empty() || !addons.menus.is_empty() {
-                                ui.separator();
-                                ui.menu_button(theme::label("Add-ons"), |ui| {
-                                    let entries = addons.filters.clone();
-                                    for entry in entries {
-                                        if theme::btn(ui, theme::label(&entry.label)).clicked() {
-                                            if let Ok(cmds) =
-                                                addons.run_action(&entry.addon_id, &entry.fn_name)
-                                            {
-                                                for cmd in cmds {
-                                                    apply_addon_host_command(cmd, document, file);
-                                                }
-                                            }
-                                            ui.close();
-                                        }
-                                    }
-                                    let menus = addons.menus.clone();
-                                    if !menus.is_empty() {
-                                        ui.separator();
-                                        for entry in menus {
-                                            let label = entry
-                                                .path
-                                                .rsplit('/')
-                                                .next()
-                                                .unwrap_or(entry.path.as_str());
-                                            if theme::btn(ui, theme::label(label)).clicked() {
-                                                if let Ok(cmds) = addons
-                                                    .run_action(&entry.addon_id, &entry.fn_name)
-                                                {
-                                                    for cmd in cmds {
-                                                        apply_addon_host_command(
-                                                            cmd, document, file,
-                                                        );
-                                                    }
-                                                }
-                                                ui.close();
-                                            }
-                                        }
-                                    }
-                                });
-                            }
-                        }
                         "View" => {
                             if theme::btn(ui, theme::label("Flip view horizontal")).clicked() {
                                 document.view_flip_h = !document.view_flip_h;
@@ -1467,28 +1380,23 @@ pub fn top_menu(
                         }
                         "Edit" => {
                             if theme::btn(ui, theme::label("Undo")).clicked() {
-                                if document.active_is_folder() {
-                                    document.require_paintable("Отмена");
-                                } else if canvas.cancel_sel_pixel_move(document) {
+                                if canvas.cancel_sel_pixel_move(document) {
                                     canvas.clear_drawing_gesture(document);
                                     canvas.mark_dirty();
-                                    canvas.invalidate_nav();
+                                    canvas.defer_nav_thumbs();
                                 } else {
                                     document.undo();
                                     canvas.clear_drawing_gesture(document);
                                     canvas.mark_dirty();
-                                    canvas.invalidate_nav();
+                                    // Defer nav — full thumb walk was the Ctrl+Z hitch.
+                                    canvas.defer_nav_thumbs();
                                 }
                             }
                             if theme::btn(ui, theme::label("Redo")).clicked() {
-                                if document.active_is_folder() {
-                                    document.require_paintable("Повтор");
-                                } else {
-                                    document.redo();
-                                    canvas.clear_drawing_gesture(document);
-                                    canvas.mark_dirty();
-                                    canvas.invalidate_nav();
-                                }
+                                document.redo();
+                                canvas.clear_drawing_gesture(document);
+                                canvas.mark_dirty();
+                                canvas.defer_nav_thumbs();
                             }
                             ui.separator();
                             if theme::btn(ui, theme::label("Canvas Size…")).clicked() {
@@ -1574,10 +1482,148 @@ pub fn top_menu(
                     });
                     });
                 }
+
+                // Drag strip + app title (between menus and window controls).
+                const WIN_BTN_W: f32 = 46.0;
+                let btn_reserve = WIN_BTN_W * 3.0 + 4.0;
+                let drag_w = (ui.available_width() - btn_reserve).max(32.0);
+                let (drag_rect, drag_resp) = ui.allocate_exact_size(
+                    egui::vec2(drag_w, row_h),
+                    egui::Sense::click_and_drag(),
+                );
+                ui.painter().text(
+                    drag_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    APP_TITLE,
+                    egui::FontId::proportional(13.0),
+                    theme::text_dim(),
+                );
+                if drag_resp.double_clicked() {
+                    let is_maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
+                }
+                if drag_resp.drag_started_by(egui::PointerButton::Primary) {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+
+                title_bar_window_buttons(ui, WIN_BTN_W, row_h);
             });
         });
     filter_dialog(ctx, document, canvas, filters);
     canvas_size_dialog(ctx, document, canvas, filters);
+}
+
+fn title_logo_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let key = egui::Id::new("beautiful_title_logo_tex");
+    if let Some(tex) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(key)) {
+        return tex;
+    }
+    let icon = eframe::icon_data::from_png_bytes(TITLE_LOGO_PNG)
+        .expect("bundled title-bar icon.png");
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [icon.width as usize, icon.height as usize],
+        &icon.rgba,
+    );
+    let tex = ctx.load_texture(
+        "beautiful_title_logo",
+        image,
+        egui::TextureOptions::LINEAR,
+    );
+    ctx.data_mut(|d| d.insert_temp(key, tex.clone()));
+    tex
+}
+
+fn title_bar_app_logo(ui: &mut egui::Ui, size: f32) {
+    let size = size.clamp(16.0, 24.0);
+    let tex = title_logo_texture(ui.ctx());
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click_and_drag());
+    ui.painter().image(
+        tex.id(),
+        rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+    if resp.drag_started_by(egui::PointerButton::Primary) {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+    if resp.double_clicked() {
+        let is_maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
+    }
+}
+
+fn title_bar_window_buttons(ui: &mut egui::Ui, btn_w: f32, btn_h: f32) {
+    let is_maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+    let mk = |label: &str| {
+        egui::Button::new(egui::RichText::new(label).size(14.0).color(theme::text()))
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::NONE)
+            .corner_radius(0.0)
+            .min_size(egui::vec2(btn_w, btn_h))
+    };
+
+    let min_r = ui.add(mk("–")).on_hover_text("Minimize");
+    if min_r.hovered() {
+        ui.painter()
+            .rect_filled(min_r.rect, 0.0, egui::Color32::from_rgb(52, 52, 60));
+        // Repaint label above hover fill.
+        ui.painter().text(
+            min_r.rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "–",
+            egui::FontId::proportional(14.0),
+            theme::text(),
+        );
+    }
+    if min_r.clicked() {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+    }
+
+    let max_label = if is_maximized { "❐" } else { "□" };
+    let max_tip = if is_maximized {
+        "Restore"
+    } else {
+        "Maximize"
+    };
+    let max_r = ui.add(mk(max_label)).on_hover_text(max_tip);
+    if max_r.hovered() {
+        ui.painter()
+            .rect_filled(max_r.rect, 0.0, egui::Color32::from_rgb(52, 52, 60));
+        ui.painter().text(
+            max_r.rect.center(),
+            egui::Align2::CENTER_CENTER,
+            max_label,
+            egui::FontId::proportional(14.0),
+            theme::text(),
+        );
+    }
+    if max_r.clicked() {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Maximized(!is_maximized));
+    }
+
+    let close_r = ui.add(mk("×")).on_hover_text("Close");
+    if close_r.hovered() {
+        ui.painter()
+            .rect_filled(close_r.rect, 0.0, egui::Color32::from_rgb(232, 17, 35));
+        ui.painter().text(
+            close_r.rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            egui::FontId::proportional(14.0),
+            egui::Color32::WHITE,
+        );
+    }
+    if close_r.clicked() {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::Close);
+    }
 }
 
 fn canvas_size_dialog(
@@ -1592,15 +1638,17 @@ fn canvas_size_dialog(
     let mut open = true;
     egui::Window::new("Canvas Size")
         .collapsible(false)
-        .resizable(false)
+        .resizable(true)
+        .default_size([360.0, 160.0])
+        .min_size([280.0, 120.0])
         .open(&mut open)
         .frame(
             egui::Frame::window(&ctx.style())
-                .fill(theme::BG_MENU)
-                .stroke(egui::Stroke::new(1.0_f32, theme::STROKE)),
+                .fill(theme::bg_menu())
+                .stroke(egui::Stroke::new(1.0_f32, theme::stroke())),
         )
         .show(ctx, |ui| {
-            ui.visuals_mut().override_text_color = Some(theme::TEXT);
+            ui.visuals_mut().override_text_color = Some(theme::text());
             ui.horizontal(|ui| {
                 ui.label(theme::label("Width"));
                 ui.add(
@@ -1711,12 +1759,12 @@ fn filter_dialog(
         .open(&mut open)
         .frame(
             egui::Frame::window(&ctx.style())
-                .fill(theme::BG_MENU)
-                .stroke(egui::Stroke::new(1.0_f32, theme::STROKE)),
+                .fill(theme::bg_menu())
+                .stroke(egui::Stroke::new(1.0_f32, theme::stroke())),
         )
         .show(ctx, |ui| {
-            ui.visuals_mut().override_text_color = Some(theme::TEXT);
-            ui.visuals_mut().widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, theme::TEXT);
+            ui.visuals_mut().override_text_color = Some(theme::text());
+            ui.visuals_mut().widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, theme::text());
             match dialog {
                 FilterDialog::Gaussian => {
                     ui.add(
@@ -2097,20 +2145,20 @@ fn tool_page_tabs(ui: &mut egui::Ui, pages: &mut ToolPages) {
         ui.spacing_mut().item_spacing.x = 4.0;
         {
             let (irect, _) = ui.allocate_exact_size(egui::vec2(12.0, 16.0), egui::Sense::hover());
-            icons::paint(ui.painter(), irect, ToolIcon::Grip, theme::TEXT_DIM);
+            icons::paint(ui.painter(), irect, ToolIcon::Grip, theme::text_dim());
         }
         for i in 0..pages.pages.len() {
             let name = pages.pages[i].name.clone();
             let selected = pages.active == i;
             let fill = if selected {
-                theme::BG_TAB_ACTIVE
+                theme::bg_tab_active()
             } else {
-                theme::BG_TAB
+                theme::bg_tab()
             };
             let stroke = if selected {
                 egui::Stroke::new(1.0_f32, theme::ACCENT)
             } else {
-                egui::Stroke::new(1.0_f32, theme::STROKE)
+                egui::Stroke::new(1.0_f32, theme::stroke())
             };
             if ui
                 .add(
@@ -2211,9 +2259,9 @@ fn tool_icon_grid(
             let col_line = if is_dst {
                 theme::ACCENT
             } else if is_src {
-                theme::TEXT_DIM
+                theme::text_dim()
             } else {
-                theme::STROKE
+                theme::stroke()
             };
             ui.painter().line_segment(
                 [
@@ -2267,19 +2315,19 @@ fn tool_icon_grid(
                 } else if resp.hovered() {
                     theme::BG_HOVER
                 } else {
-                    theme::BG_PANEL_2
+                    theme::bg_panel_2_solid()
                 };
                 let border = if is_dst || selected {
                     theme::ACCENT
                 } else {
-                    theme::STROKE
+                    theme::stroke()
                 };
                 let fg = if is_src {
-                    theme::TEXT_DIM
+                    theme::text_dim()
                 } else if selected {
                     theme::ACCENT
                 } else {
-                    theme::TEXT
+                    theme::text()
                 };
                 ui.painter().rect_filled(rect, 6.0, bg);
                 ui.painter().rect_stroke(
@@ -2344,7 +2392,7 @@ fn tool_icon_grid(
             let border = if resp.hovered() {
                 theme::ACCENT
             } else {
-                theme::STROKE.gamma_multiply(0.7)
+                theme::stroke().gamma_multiply(0.7)
             };
             ui.painter().rect_stroke(
                 rect,
@@ -2352,7 +2400,7 @@ fn tool_icon_grid(
                 egui::Stroke::new(1.0_f32, border),
                 egui::StrokeKind::Inside,
             );
-            let fg = theme::TEXT_DIM;
+            let fg = theme::text_dim();
             let c = rect.center();
             ui.painter().line_segment(
                 [c + egui::vec2(-6.0, 0.0), c + egui::vec2(6.0, 0.0)],
@@ -2419,7 +2467,7 @@ fn tool_icon_grid(
                 egui::Id::new("tool_rmb_ghost"),
             );
             let painter = ui.ctx().layer_painter(layer);
-            painter.rect_filled(ghost, 6.0, theme::BG_PANEL_2.gamma_multiply(0.9));
+            painter.rect_filled(ghost, 6.0, theme::bg_panel_2_solid().gamma_multiply(0.9));
             painter.rect_stroke(
                 ghost,
                 6.0,
@@ -2462,8 +2510,8 @@ fn tool_icon_grid(
             .constrain(true)
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style())
-                    .fill(theme::BG_MENU)
-                    .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+                    .fill(theme::bg_menu())
+                    .stroke(egui::Stroke::new(1.0_f32, theme::stroke()))
                     .corner_radius(4.0)
                     .inner_margin(egui::Margin::same(4))
                     .show(ui, |ui| {
@@ -2747,7 +2795,7 @@ fn selection_settings_panel(
         for (mode, title, tip, icon) in modes {
             ui.horizontal(|ui| {
                 let (irect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
-                icons::paint(ui.painter(), irect, icon, theme::TEXT);
+                icons::paint(ui.painter(), irect, icon, theme::text());
                 if ui
                     .add(
                         egui::Button::new(theme::label(title))
@@ -3451,7 +3499,7 @@ fn brush_settings_panel(ui: &mut egui::Ui, document: &mut Document, panel: &mut 
             ui.painter().rect_stroke(
                 preview_rect,
                 4.0,
-                egui::Stroke::new(1.0_f32, theme::STROKE),
+                egui::Stroke::new(1.0_f32, theme::stroke()),
                 egui::StrokeKind::Inside,
             );
         }
@@ -3471,16 +3519,16 @@ fn brush_settings_panel(ui: &mut egui::Ui, document: &mut Document, panel: &mut 
             );
             ui.painter().circle_filled(c, r, col.gamma_multiply(0.92));
             ui.painter()
-                .circle_stroke(c, r, egui::Stroke::new(1.0_f32, theme::TEXT));
+                .circle_stroke(c, r, egui::Stroke::new(1.0_f32, theme::text()));
             let inner = r * document.brush.hardness.clamp(0.15, 1.0);
             if inner + 1.0 < r {
                 ui.painter()
-                    .circle_stroke(c, inner, egui::Stroke::new(1.0_f32, theme::TEXT_DIM));
+                    .circle_stroke(c, inner, egui::Stroke::new(1.0_f32, theme::text_dim()));
             }
             ui.painter().rect_stroke(
                 size_rect,
                 4.0,
-                egui::Stroke::new(1.0_f32, theme::STROKE),
+                egui::Stroke::new(1.0_f32, theme::stroke()),
                 egui::StrokeKind::Inside,
             );
         }
@@ -3498,7 +3546,7 @@ fn brush_settings_panel(ui: &mut egui::Ui, document: &mut Document, panel: &mut 
             orange_slider_capped(
                 ui,
                 &mut document.brush.size,
-                1.0..=256.0,
+                beautiful_core::BRUSH_SIZE_MIN..=beautiful_core::BRUSH_SIZE_MAX,
                 true,
                 140.0,
                 |v| format!("{v:.0}"),
@@ -3511,12 +3559,12 @@ fn brush_settings_panel(ui: &mut egui::Ui, document: &mut Document, panel: &mut 
         });
     }
 
-    // density [▸] [stylus] [checker] value
+    // Opacity × Flow per stamp. Mode: Accumulate (default) vs Wash (opacity lock).
     brush_row_labeled(
         ui,
-        "density",
-        Some((&mut panel.show_min_density, "Show / hide min density")),
-        Some((&mut document.brush.pressure_density, "Pressure → density")),
+        "Opacity",
+        Some((&mut panel.show_min_density, "Show / hide min opacity")),
+        Some((&mut document.brush.pressure_density, "Pressure → opacity")),
         |ui| {
             checker_slider_sized(ui, &mut document.brush.density, 0.0..=1.0, 110.0, |v| {
                 format!("{:.0}%", v * 100.0)
@@ -3525,9 +3573,74 @@ fn brush_settings_panel(ui: &mut egui::Ui, document: &mut Document, panel: &mut 
     );
     if panel.show_min_density {
         ui.indent("min_dens_row", |ui| {
-            short_orange_pct_row(ui, "min dens.", &mut document.brush.min_density);
+            short_orange_pct_row(ui, "min opac.", &mut document.brush.min_density);
         });
     }
+
+    brush_row_labeled(
+        ui,
+        "Flow",
+        Some((&mut panel.show_min_flow, "Show / hide min flow")),
+        Some((&mut document.brush.pressure_flow, "Pressure → flow")),
+        |ui| {
+            checker_slider_sized(ui, &mut document.brush.flow, 0.0..=1.0, 110.0, |v| {
+                format!("{:.0}%", v * 100.0)
+            });
+        },
+    );
+    if panel.show_min_flow {
+        ui.indent("min_flow_row", |ui| {
+            short_orange_pct_row(ui, "min flow", &mut document.brush.min_flow);
+        });
+    }
+
+    ui.horizontal(|ui| {
+        ui.add_sized([64.0, 18.0], egui::Label::new(theme::label_dim("Speed →")));
+        toggle_chip(ui, "Size", &mut document.brush.speed_size);
+        toggle_chip(ui, "Opac.", &mut document.brush.speed_opacity);
+        toggle_chip(ui, "Flow", &mut document.brush.speed_flow);
+    });
+    ui.label(
+        egui::RichText::new("Speed: fast stroke → thinner / lighter (toward min).")
+            .color(egui::Color32::from_rgb(140, 140, 150))
+            .size(11.0),
+    );
+
+    ui.horizontal(|ui| {
+        ui.label(theme::label_dim("Mode"));
+        egui::ComboBox::from_id_salt("paint_mode_combo")
+            .selected_text(match document.brush.paint_mode {
+                beautiful_core::PaintMode::BuildUp => "Accumulate",
+                beautiful_core::PaintMode::Wash => "Wash",
+            })
+            .width(120.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut document.brush.paint_mode,
+                    beautiful_core::PaintMode::BuildUp,
+                    "Accumulate (self-overlap)",
+                );
+                ui.selectable_value(
+                    &mut document.brush.paint_mode,
+                    beautiful_core::PaintMode::Wash,
+                    "Wash (opacity lock)",
+                );
+            });
+    });
+    // Phase 4 cutover: V2 only (Legacy facade kept for pixel/smudge internals).
+    document.brush_backend = beautiful_core::BrushBackend::V2;
+    ui.label(
+        egui::RichText::new(match document.brush.paint_mode {
+            beautiful_core::PaintMode::BuildUp => {
+                "Accumulate: stamp alpha = Opacity×Flow; натирание в одном мазке темнеет."
+            }
+            beautiful_core::PaintMode::Wash => {
+                "Wash: в одном мазке не темнее Opacity; новый набор — после отпускания ЛКМ."
+            }
+        })
+        .color(egui::Color32::from_rgb(140, 140, 150))
+        .size(11.0),
+    );
 
     labeled_orange_pct(ui, "Hardness", &mut document.brush.hardness);
     ui.label(
@@ -3535,6 +3648,70 @@ fn brush_settings_panel(ui: &mut egui::Ui, document: &mut Document, panel: &mut 
             .color(egui::Color32::from_rgb(140, 140, 150))
             .size(11.0),
     );
+
+    // Spacing = dab interval as % of brush diameter (wired to DabPlanner).
+    brush_row_labeled(ui, "Spacing", None, None, |ui| {
+        let mut pct = (document.brush.spacing * 100.0).clamp(2.5, 100.0);
+        orange_slider_capped(ui, &mut pct, 2.5..=100.0, true, 140.0, |v| {
+            format!("{v:.0}%")
+        });
+        document.brush.spacing = (pct / 100.0).clamp(0.025, 1.0);
+    });
+
+    labeled_orange_pct(ui, "Scatter", &mut document.brush.scatter);
+    ui.horizontal(|ui| {
+        ui.add_sized([64.0, 18.0], egui::Label::new(theme::label_dim("Count")));
+        let mut count = document.brush.scatter_count.clamp(1, 4) as i32;
+        if ui
+            .add(egui::Slider::new(&mut count, 1..=4).trailing_fill(true))
+            .changed()
+        {
+            document.brush.scatter_count = count.clamp(1, 4) as u8;
+        }
+    });
+    labeled_orange_pct(ui, "Jitter", &mut document.brush.jitter);
+    labeled_orange_pct(ui, "Taper in", &mut document.brush.taper_in);
+    labeled_orange_pct(ui, "Taper out", &mut document.brush.taper_out);
+    labeled_orange_pct(ui, "Fuzzy", &mut document.brush.fuzzy);
+
+    ui.add_space(4.0);
+    // Phase 3 dual tip (second circular stamp; tip-as-mask / 2D tip later).
+    ui.horizontal(|ui| {
+        square_disclosure(ui, &mut panel.dual_open, "Dual brush settings");
+        ui.checkbox(
+            &mut document.brush.dual_enabled,
+            theme::label_dim("Dual brush"),
+        );
+    });
+    if panel.dual_open || document.brush.dual_enabled {
+        ui.indent("dual_sheet", |ui| {
+            brush_row_labeled(ui, "Dual size", None, None, |ui| {
+                orange_slider_capped(
+                    ui,
+                    &mut document.brush.dual_size_pct,
+                    0.1..=2.0,
+                    false,
+                    140.0,
+                    |v| format!("{v:.2}×"),
+                );
+            });
+            labeled_orange_pct(ui, "Dual opac.", &mut document.brush.dual_opacity);
+            labeled_orange_pct(ui, "Dual scat.", &mut document.brush.dual_scatter);
+        });
+    }
+
+    labeled_orange_pct(ui, "Color jit.", &mut document.brush.color_jitter);
+    labeled_orange_pct(ui, "Wet rate", &mut document.brush.wet_rate);
+
+    ui.add_space(4.0);
+    if ui
+        .button(theme::label("Node Editor…"))
+        .on_hover_text("Visual node graph (wires) → compile into brush sheet")
+        .clicked()
+    {
+        panel.node_editor_open = true;
+        panel.node_editor.ensure_seeded(&document.brush);
+    }
 
     ui.add_space(4.0);
     shape_texture_block(ui, document, panel);
@@ -3579,10 +3756,40 @@ fn brush_settings_panel(ui: &mut egui::Ui, document: &mut Document, panel: &mut 
         &mut document.brush.keep_opacity,
         theme::label_dim("Keep Opacity"),
     );
+
+    brush_node_editor_window(ui.ctx(), document, panel);
+}
+
+fn brush_node_editor_window(
+    ctx: &egui::Context,
+    document: &mut Document,
+    panel: &mut BrushPanelUi,
+) {
+    if !panel.node_editor_open {
+        return;
+    }
+    panel.node_editor.ensure_seeded(&document.brush);
+    let mut open = panel.node_editor_open;
+    egui::Window::new("Brush Node Editor")
+        .open(&mut open)
+        .default_size([780.0, 560.0])
+        .resizable(true)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            let applied = crate::brush_nodes::show_brush_node_editor(
+                ui,
+                &mut panel.node_editor,
+                &mut document.brush,
+            );
+            if applied {
+                document.brush_backend = beautiful_core::BrushBackend::V2;
+                document.warm_tip_cache();
+            }
+        });
+    panel.node_editor_open = open;
 }
 
 fn shape_texture_block(ui: &mut egui::Ui, document: &mut Document, panel: &mut BrushPanelUi) {
-    // Soft Edge / shape — dropdown on its own row, then Hair slider (no overlap).
     ui.horizontal(|ui| {
         square_disclosure(ui, &mut panel.shape_open, "Shape settings");
         egui::ComboBox::from_id_salt("brush_shape_combo")
@@ -3594,54 +3801,50 @@ fn shape_texture_block(ui: &mut egui::Ui, document: &mut Document, panel: &mut B
                 }
             });
     });
+
+    // Pose: roundness, follow stroke, angle, flips (always visible — Phase 3 fuller pose).
+    labeled_orange_pct(ui, "Roundness", &mut document.brush.roundness);
+    ui.checkbox(
+        &mut document.brush.follow_stroke,
+        theme::label_dim("Follow stroke"),
+    );
     ui.horizontal(|ui| {
-        ui.label(theme::label_dim("Hair"));
-        let mut hair = document.brush.hair;
-        let hair_txt = format!("{:.0}%", hair * 100.0);
-        let w = ui.available_width().min(160.0).max(64.0);
-        if slider_with_inner_text(ui, &mut hair, 0.0..=1.0, false, w, None, Some(&hair_txt)) {
-            document.brush.hair = hair;
-        }
+        ui.add_sized([72.0, 18.0], egui::Label::new(theme::label_dim("Angle°")));
+        let mut deg = document.brush.angle.to_degrees();
+        let avail = ui.available_width().min(120.0);
+        ui.scope(|ui| {
+            style_orange_slider(ui);
+            if ui
+                .add_sized(
+                    [avail.max(40.0), 18.0],
+                    egui::Slider::new(&mut deg, -180.0..=180.0)
+                        .show_value(false)
+                        .trailing_fill(true),
+                )
+                .changed()
+            {
+                document.brush.angle = deg.to_radians();
+            }
+        });
+        ui.label(theme::label(format!("{deg:.0}")).monospace());
+    });
+    ui.horizontal(|ui| {
+        toggle_chip(ui, "Flip X", &mut document.brush.tip_flip_x);
+        toggle_chip(ui, "Flip Y", &mut document.brush.tip_flip_y);
     });
 
     if panel.shape_open {
         ui.indent("shape_sheet", |ui| {
-            if document.brush.kind.uses_hair_shape_ui() {
-                short_orange_pct_row(ui, "Min Hair", &mut document.brush.min_hair);
-                short_orange_pct_row(ui, "Randomize", &mut document.brush.randomize);
-                ui.horizontal(|ui| {
-                    ui.label(theme::label_dim("Direction"));
-                    egui::ComboBox::from_id_salt("hair_dir")
-                        .selected_text(document.brush.hair_direction.label())
-                        .width(120.0)
-                        .show_ui(ui, |ui| {
-                            for d in HairDirection::all() {
-                                ui.selectable_value(
-                                    &mut document.brush.hair_direction,
-                                    *d,
-                                    d.label(),
-                                );
-                            }
-                        });
-                });
-            } else {
-                short_orange_pct_row(ui, "Shape size", &mut document.brush.shape_size);
-                ui.horizontal(|ui| {
-                    toggle_chip(ui, "Invert", &mut document.brush.shape_invert);
-                    toggle_chip(
-                        ui,
-                        "Invert for transparency",
-                        &mut document.brush.shape_invert_transparency,
-                    );
-                });
-                short_orange_pct_row(ui, "Sharpen", &mut document.brush.shape_sharpen);
-            }
+            ui.label(
+                egui::RichText::new("Hair / sharpen reserved for bitmap tip (later).")
+                    .color(egui::Color32::from_rgb(140, 140, 150))
+                    .size(11.0),
+            );
         });
     }
 
     ui.add_space(4.0);
 
-    // Paper / texture — separate rows so intens. never overlaps the combo.
     ui.horizontal(|ui| {
         square_disclosure(ui, &mut panel.texture_open, "Texture settings");
         egui::ComboBox::from_id_salt("brush_tex_combo")
@@ -3696,9 +3899,29 @@ fn shape_texture_block(ui: &mut egui::Ui, document: &mut Document, panel: &mut B
                 toggle_chip(ui, "Invert", &mut document.brush.texture_invert);
                 toggle_chip(
                     ui,
-                    "Invert for transparency",
-                    &mut document.brush.texture_invert_transparency,
+                    "Move w/ stroke",
+                    &mut document.brush.texture_move_with_stroke,
                 );
+            });
+            ui.horizontal(|ui| {
+                ui.add_sized([72.0, 18.0], egui::Label::new(theme::label_dim("Tex angle°")));
+                let mut deg = document.brush.texture_angle.to_degrees();
+                let avail = ui.available_width().min(120.0);
+                ui.scope(|ui| {
+                    style_orange_slider(ui);
+                    if ui
+                        .add_sized(
+                            [avail.max(40.0), 18.0],
+                            egui::Slider::new(&mut deg, -180.0..=180.0)
+                                .show_value(false)
+                                .trailing_fill(true),
+                        )
+                        .changed()
+                    {
+                        document.brush.texture_angle = deg.to_radians();
+                    }
+                });
+                ui.label(theme::label(format!("{deg:.0}")).monospace());
             });
         });
     }
@@ -3722,7 +3945,7 @@ fn square_disclosure(ui: &mut egui::Ui, open: &mut bool, tip: &str) {
     ui.painter().rect_stroke(
         rect,
         2.0,
-        egui::Stroke::new(1.0_f32, theme::STROKE),
+        egui::Stroke::new(1.0_f32, theme::stroke()),
         egui::StrokeKind::Inside,
     );
     ui.painter().text(
@@ -3730,7 +3953,7 @@ fn square_disclosure(ui: &mut egui::Ui, open: &mut bool, tip: &str) {
         egui::Align2::CENTER_CENTER,
         mark,
         egui::FontId::proportional(11.0),
-        theme::TEXT_DIM,
+        theme::text_dim(),
     );
     if resp.on_hover_text(tip).clicked() {
         *open = !*open;
@@ -3748,7 +3971,7 @@ fn stylus_pressure_button(ui: &mut egui::Ui, on: &mut bool, tip: &str) {
     ui.painter().rect_stroke(
         rect,
         2.0,
-        egui::Stroke::new(1.0_f32, if *on { theme::TEXT } else { theme::STROKE }),
+        egui::Stroke::new(1.0_f32, if *on { theme::text() } else { theme::stroke() }),
         egui::StrokeKind::Inside,
     );
     icons::paint(ui.painter(), rect.shrink(2.5), ToolIcon::Brush, icon_col);
@@ -4030,7 +4253,7 @@ fn brush_size_grid(ui: &mut egui::Ui, document: &mut Document) {
     const GAP: f32 = 3.0;
     const SIZES: &[f32] = &[
         1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 28.0, 36.0, 48.0,
-        64.0, 96.0, 128.0, 160.0, 192.0, 224.0, 256.0,
+        64.0, 96.0, 128.0, 160.0, 192.0, 224.0, 256.0, 320.0, 384.0, 448.0, 512.0, 560.0, 600.0,
     ];
 
     let avail_w = ui.available_width().max(CELL_W);
@@ -4047,7 +4270,7 @@ fn brush_size_grid(ui: &mut egui::Ui, document: &mut Document) {
                 let bg = if selected {
                     theme::BG_HOVER
                 } else {
-                    theme::BG_PANEL_2
+                    theme::bg_panel_2_solid()
                 };
                 ui.painter().rect_filled(rect, 3.0, bg);
                 ui.painter().rect_stroke(
@@ -4058,7 +4281,7 @@ fn brush_size_grid(ui: &mut egui::Ui, document: &mut Document) {
                         if selected {
                             theme::ACCENT
                         } else {
-                            theme::STROKE
+                            theme::stroke()
                         },
                     ),
                     egui::StrokeKind::Inside,
@@ -4087,7 +4310,7 @@ fn brush_size_grid(ui: &mut egui::Ui, document: &mut Document) {
                     if selected {
                         theme::ACCENT
                     } else {
-                        theme::TEXT_DIM
+                        theme::text_dim()
                     },
                 );
                 if resp.clicked() {
@@ -4136,8 +4359,11 @@ pub fn options_bar(
                     WorkspaceTool::Brush | WorkspaceTool::Pencil | WorkspaceTool::PixelBrush | WorkspaceTool::Airbrush | WorkspaceTool::Mixer | WorkspaceTool::Eraser | WorkspaceTool::Smudge | WorkspaceTool::CloneStamp => {
                         ui.label(theme::label_dim("Size"));
                         let size_resp = ui.add(
-                            egui::Slider::new(&mut document.brush.size, 1.0..=256.0)
-                                .trailing_fill(true),
+                            egui::Slider::new(
+                                &mut document.brush.size,
+                                beautiful_core::BRUSH_SIZE_MIN..=beautiful_core::BRUSH_SIZE_MAX,
+                            )
+                            .trailing_fill(true),
                         );
                         if matches!(tool, WorkspaceTool::PixelBrush) && size_resp.changed() {
                             document.brush.size = document.brush.size.round().max(1.0);
@@ -4207,9 +4433,9 @@ pub fn options_bar(
                         ] {
                             let on = canvas.crop_aspect == aspect;
                             let fill = if on {
-                                theme::BG_TAB_ACTIVE
+                                theme::bg_tab_active()
                             } else {
-                                theme::BG_TAB
+                                theme::bg_tab()
                             };
                             if ui
                                 .add(
@@ -4217,7 +4443,7 @@ pub fn options_bar(
                                         .fill(fill)
                                         .stroke(egui::Stroke::new(
                                             1.0_f32,
-                                            if on { theme::ACCENT } else { theme::STROKE },
+                                            if on { theme::ACCENT } else { theme::stroke() },
                                         ))
                                         .corner_radius(4.0),
                                 )
@@ -4316,6 +4542,17 @@ pub fn layers_panel(
     canvas: &mut CanvasState,
     layer_ui: &mut LayerUiState,
 ) {
+    // `active_layer` (document) and `selected` (UI highlight) are separate — on open
+    // / replace selected can be empty or stale so the row looked unselected despite the thumb.
+    if !document.layers.is_empty() {
+        let active = document.active_layer.min(document.layers.len() - 1);
+        let selection_ok = !layer_ui.selected.is_empty()
+            && layer_ui.selected.iter().all(|&i| i < document.layers.len());
+        if !selection_ok {
+            layer_ui.focus_layer(active);
+        }
+    }
+
     ui.label(theme::heading("Layers"));
 
     // toolbar: new / folder / adjustment / mask / lock / merge / transfer / clear / delete
@@ -4390,11 +4627,9 @@ pub fn layers_panel(
                 document.layers.get(i).is_some_and(|l| l.visible)
             });
             for &i in &selection {
-                if let Some(layer) = document.layers.get_mut(i) {
-                    let vis = !hide;
-                    layer.visible = vis;
-                    layer_ui.pending_visibility.push((i, vis));
-                }
+                let vis = !hide;
+                document.apply_visibility_flags(i, vis);
+                layer_ui.pending_visibility.push((i, vis));
             }
         }
         if layer_tool_btn(ui, ToolIcon::MergeDown, "Merge down").clicked() {
@@ -4599,9 +4834,9 @@ pub fn layers_panel(
                 let editing_mask = is_active && canvas.editing_mask;
 
                 let base_fill = if selected {
-                    theme::BG_LAYER_SELECTED
+                    theme::bg_layer_selected()
                 } else {
-                    theme::BG_PANEL_2
+                    theme::bg_panel_2_solid()
                 };
                 // Children of a colored folder get a stronger wash than the folder row itself.
                 let tint_amt = if is_folder { 0.40 } else { 0.55 };
@@ -4609,7 +4844,7 @@ pub fn layers_panel(
                 let stroke_color = if selected {
                     theme::ACCENT
                 } else {
-                    theme::STROKE
+                    theme::stroke()
                 };
 
                 // Row: eye | thumbs (layer+mask left) | name body | folder color (folders)
@@ -4680,19 +4915,19 @@ pub fn layers_panel(
                                 ui.painter().rect_filled(
                                     thumb_rect.shrink(2.0),
                                     3.0,
-                                    theme::BG_PANEL,
+                                    theme::bg_panel_solid(),
                                 );
                                 ui.painter().rect_stroke(
                                     thumb_rect.shrink(2.0),
                                     3.0,
-                                    egui::Stroke::new(1.0_f32, theme::STROKE),
+                                    egui::Stroke::new(1.0_f32, theme::stroke()),
                                     egui::StrokeKind::Inside,
                                 );
                                 icons::paint(
                                     ui.painter(),
                                     thumb_rect.shrink(if nested { 7.0 } else { 10.0 }),
                                     ToolIcon::Folder,
-                                    theme::TEXT_DIM,
+                                    theme::text_dim(),
                                 );
                                 if thumb_resp.clicked() {
                                     edit_target = Some((idx, false));
@@ -4738,7 +4973,7 @@ pub fn layers_panel(
                                         ui.painter(),
                                         lrect.shrink(2.0),
                                         ToolIcon::Link,
-                                        theme::TEXT_DIM,
+                                        theme::text_dim(),
                                     );
                                 }
                                 if lresp.on_hover_text(link_tip).clicked() {
@@ -4789,9 +5024,9 @@ pub fn layers_panel(
                                 Sense::click_and_drag(),
                             );
                             let name_col = if selected {
-                                theme::TEXT_ON_ACCENT
+                                theme::text_on_accent()
                             } else {
-                                theme::TEXT
+                                theme::text()
                             };
                             // Keep name clear of the far-right color dot on folder rows.
                             let text_clip = if is_folder {
@@ -4826,7 +5061,7 @@ pub fn layers_panel(
                                         opacity_label * 100.0
                                     ),
                                     egui::FontId::proportional(meta_size),
-                                    theme::TEXT_DIM,
+                                    theme::text_dim(),
                                 );
                             } else if !is_folder {
                                 painter.text(
@@ -4838,7 +5073,7 @@ pub fn layers_panel(
                                         opacity_label * 100.0
                                     ),
                                     egui::FontId::proportional(meta_size),
-                                    theme::TEXT_DIM,
+                                    theme::text_dim(),
                                 );
                             } else {
                                 painter.text(
@@ -4850,7 +5085,7 @@ pub fn layers_panel(
                                         opacity_label * 100.0
                                     ),
                                     egui::FontId::proportional(meta_size),
-                                    theme::TEXT_DIM,
+                                    theme::text_dim(),
                                 );
                             }
 
@@ -4966,13 +5201,18 @@ pub fn layers_panel(
                                         egui::Align2::LEFT_CENTER,
                                         &layer_name,
                                         egui::FontId::proportional(12.0),
-                                        theme::TEXT,
+                                        theme::text(),
                                     );
                                 }
                             }
                             let _ = body_id;
                         });
                     });
+
+                if layer_ui.scroll_to == Some(idx) {
+                    ui.scroll_to_rect(row.response.rect, Some(egui::Align::Center));
+                    layer_ui.scroll_to = None;
+                }
 
                 // Drop target = whole row. Top/bottom edges = sibling (can leave folder);
                 // middle of a folder = nest into it (common style).
@@ -5090,10 +5330,8 @@ pub fn layers_panel(
             vec![idx]
         };
         for i in targets {
-            if let Some(layer) = document.layers.get_mut(i) {
-                layer.visible = vis;
-                layer_ui.pending_visibility.push((i, vis));
-            }
+            document.apply_visibility_flags(i, vis);
+            layer_ui.pending_visibility.push((i, vis));
         }
     }
     if let Some(idx) = toggle_link {
@@ -5349,16 +5587,16 @@ fn layer_tool_btn(ui: &mut egui::Ui, icon: ToolIcon, tip: &str) -> egui::Respons
     let bg = if resp.hovered() {
         theme::BG_HOVER
     } else {
-        theme::BG_PANEL_2
+        theme::bg_panel_2_solid()
     };
     ui.painter().rect_filled(rect, 4.0, bg);
     ui.painter().rect_stroke(
         rect,
         4.0,
-        egui::Stroke::new(1.0_f32, theme::STROKE),
+        egui::Stroke::new(1.0_f32, theme::stroke()),
         egui::StrokeKind::Inside,
     );
-    icons::paint(ui.painter(), rect.shrink(3.0), icon, theme::TEXT);
+    icons::paint(ui.painter(), rect.shrink(3.0), icon, theme::text());
     resp.on_hover_text(tip)
 }
 
@@ -5398,7 +5636,7 @@ fn layer_thumb_button(
     let border = if active {
         egui::Stroke::new(2.0_f32, egui::Color32::WHITE)
     } else {
-        egui::Stroke::new(1.0_f32, theme::STROKE)
+        egui::Stroke::new(1.0_f32, theme::stroke())
     };
     ui.painter()
         .rect_stroke(draw, 2.0, border, egui::StrokeKind::Inside);
@@ -5434,7 +5672,7 @@ pub fn bottom_bar(
                     let color = if is_err {
                         theme::ACCENT
                     } else {
-                        theme::TEXT_DIM
+                        theme::text_dim()
                     };
                     ui.label(egui::RichText::new(msg).color(color).small());
                 }
@@ -5451,7 +5689,7 @@ pub fn bottom_bar(
                         } else if fps < 45.0 {
                             egui::Color32::from_rgb(220, 180, 80)
                         } else {
-                            theme::TEXT_DIM
+                            theme::text_dim()
                         };
                         ui.label(
                             egui::RichText::new(format!("{fps:>4.0} fps  {frame_ms:>4.1} ms"))
@@ -5581,31 +5819,26 @@ pub fn handle_shortcuts(
     }
 
     if do_undo {
-        if document.active_is_folder() {
-            document.require_paintable("Отмена");
-        } else if canvas.cancel_sel_pixel_move(document) {
+        if canvas.cancel_sel_pixel_move(document) {
             canvas.clear_drawing_gesture(document);
             canvas.mark_dirty();
-            canvas.invalidate_nav();
+            canvas.defer_nav_thumbs();
             need_repaint = true;
         } else {
             document.undo();
             canvas.clear_drawing_gesture(document);
             canvas.mark_dirty();
-            canvas.invalidate_nav();
+            // Defer nav — restore is cheap; nav.ensure_thumb was the hitch.
+            canvas.defer_nav_thumbs();
             need_repaint = true;
         }
     }
     if do_redo {
-        if document.active_is_folder() {
-            document.require_paintable("Повтор");
-        } else {
-            document.redo();
-            canvas.clear_drawing_gesture(document);
-            canvas.mark_dirty();
-            canvas.invalidate_nav();
-            need_repaint = true;
-        }
+        document.redo();
+        canvas.clear_drawing_gesture(document);
+        canvas.mark_dirty();
+        canvas.defer_nav_thumbs();
+        need_repaint = true;
     }
     if do_deselect {
         document.deselect();
@@ -5633,7 +5866,10 @@ pub fn handle_shortcuts(
         }
     }
     if brush_size_delta != 0.0 {
-        document.brush.size = (document.brush.size + brush_size_delta).clamp(1.0, 512.0);
+        document.brush.size = (document.brush.size + brush_size_delta).clamp(
+            beautiful_core::BRUSH_SIZE_MIN,
+            beautiful_core::BRUSH_SIZE_MAX,
+        );
     }
 
     if let Some(t) = pick_tool {
@@ -5713,7 +5949,10 @@ pub fn apply_addon_host_command(
             }
         }
         HostCommand::SetBrushSize(size) => {
-            document.brush.size = size.clamp(1.0, 512.0);
+            document.brush.size = size.clamp(
+                beautiful_core::BRUSH_SIZE_MIN,
+                beautiful_core::BRUSH_SIZE_MAX,
+            );
         }
         HostCommand::SetBrushOpacity(o) => {
             document.brush.density = o.clamp(0.0, 1.0);

@@ -1,4 +1,4 @@
-//! Home / gallery screen — Steam-library style layout.
+//! Home / gallery screen — library-style layout.
 
 use std::path::PathBuf;
 
@@ -79,7 +79,7 @@ impl Default for GalleryState {
     }
 }
 
-/// Steam-library inspired home screen.
+/// Library-inspired home screen.
 /// Returns a path the user wants to open as a canvas tab (caller opens it).
 pub fn show(
     ctx: &egui::Context,

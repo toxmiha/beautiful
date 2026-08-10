@@ -238,7 +238,7 @@ pub fn show_new_canvas_dialog(
 
     let frame = egui::Frame::window(&ctx.style())
         .fill(theme::menu_fill())
-        .stroke(egui::Stroke::new(1.0_f32, theme::STROKE))
+        .stroke(egui::Stroke::new(1.0_f32, theme::stroke()))
         .corner_radius(12.0)
         .inner_margin(egui::Margin::same(14));
 
@@ -250,9 +250,15 @@ pub fn show_new_canvas_dialog(
         .movable(true)
         .default_pos(center - egui::vec2(460.0, 290.0))
         .default_size(egui::vec2(920.0, 580.0))
+        .min_size(egui::vec2(640.0, 420.0))
         .frame(frame)
         .show(ctx, |ui| {
             theme::apply_opaque_chrome(ui);
+            // Keep dialog size stable while editing W/H — content must not grow the window
+            // (DragValue digit width + preview aspect used to shove the window around).
+            let full = ui.available_size();
+            ui.set_min_size(full);
+            ui.set_max_size(full);
 
             ui.horizontal(|ui| {
                 // —— Left: settings ——
@@ -267,14 +273,15 @@ pub fn show_new_canvas_dialog(
                         egui::TextEdit::singleline(&mut dlg.name)
                             .desired_width(300.0)
                             .hint_text("Название файла")
-                            .text_color(theme::TEXT),
+                            .text_color(theme::text()),
                     );
                     ui.add_space(8.0);
 
                     ui.label(theme::label_dim("Размер"));
                     ui.horizontal(|ui| {
                         let w_changed = ui
-                            .add(
+                            .add_sized(
+                                [88.0, 20.0],
                                 egui::DragValue::new(&mut dlg.width)
                                     .speed(1.0)
                                     .range(0.01..=65536.0)
@@ -282,7 +289,8 @@ pub fn show_new_canvas_dialog(
                             )
                             .changed();
                         let h_changed = ui
-                            .add(
+                            .add_sized(
+                                [88.0, 20.0],
                                 egui::DragValue::new(&mut dlg.height)
                                     .speed(1.0)
                                     .range(0.01..=65536.0)
@@ -330,7 +338,8 @@ pub fn show_new_canvas_dialog(
                     ui.add_space(6.0);
                     ui.label(theme::label_dim("Разрешение"));
                     ui.horizontal(|ui| {
-                        ui.add(
+                        ui.add_sized(
+                            [72.0, 20.0],
                             egui::DragValue::new(&mut dlg.resolution)
                                 .speed(1.0)
                                 .range(1.0..=2400.0),
@@ -365,7 +374,7 @@ pub fn show_new_canvas_dialog(
                         ui.painter().rect_stroke(
                             rect,
                             4.0,
-                            egui::Stroke::new(1.0_f32, theme::STROKE),
+                            egui::Stroke::new(1.0_f32, theme::stroke()),
                             egui::StrokeKind::Outside,
                         );
 
@@ -414,7 +423,7 @@ pub fn show_new_canvas_dialog(
                             egui::TextEdit::singleline(&mut dlg.collection)
                                 .desired_width(240.0)
                                 .hint_text("или введите новую…")
-                                .text_color(theme::TEXT),
+                                .text_color(theme::text()),
                         );
                         if theme::menu_btn(ui, theme::label("Очистить")).clicked() {
                             dlg.collection.clear();
@@ -444,7 +453,7 @@ pub fn show_new_canvas_dialog(
                                 })
                                 .unwrap_or(theme::ACCENT);
                             let chip = egui::Button::new(
-                                egui::RichText::new(format!("  {tag} ×  ")).color(theme::TEXT),
+                                egui::RichText::new(format!("  {tag} ×  ")).color(theme::text()),
                             )
                             .fill(egui::Color32::from_rgb(
                                 (color.r() as u16 * 90 / 255) as u8 + 30,
@@ -467,7 +476,7 @@ pub fn show_new_canvas_dialog(
                             egui::TextEdit::singleline(&mut dlg.tag_draft)
                                 .desired_width(180.0)
                                 .hint_text("новый тег")
-                                .text_color(theme::TEXT),
+                                .text_color(theme::text()),
                         );
                         if te.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             add_tag = true;
@@ -506,9 +515,9 @@ pub fn show_new_canvas_dialog(
                                 );
                                 let chip = egui::Button::new(
                                     egui::RichText::new(format!("+ {}", tag.name))
-                                        .color(theme::TEXT),
+                                        .color(theme::text()),
                                 )
-                                .fill(theme::BG_MENU_ITEM)
+                                .fill(theme::bg_menu_item())
                                 .stroke(egui::Stroke::new(1.0_f32, color));
                                 if ui.add(chip).clicked() {
                                     dlg.tags.push(tag.name.clone());
@@ -551,19 +560,21 @@ pub fn show_new_canvas_dialog(
 
                 // —— Center: preview ——
                 ui.vertical(|ui| {
-                    ui.set_min_width(360.0);
+                    ui.set_min_width(280.0);
+                    ui.set_max_width(ui.available_width());
                     ui.heading(theme::heading("Предпросмотр"));
                     ui.add_space(8.0);
                     let (pw, ph) = dlg.pixel_size();
+                    // Exact remaining space only — never .max() up (that grew the window).
                     let avail = ui.available_size();
-                    let preview_area = egui::vec2(avail.x.max(320.0), (avail.y - 60.0).max(280.0));
+                    let preview_area = egui::vec2(avail.x.max(1.0), (avail.y - 56.0).max(1.0));
                     let (rect, _) = ui.allocate_exact_size(preview_area, egui::Sense::hover());
                     ui.painter()
                         .rect_filled(rect, 10.0, egui::Color32::from_rgb(18, 18, 22));
 
                     let aspect = (pw as f32 / ph as f32).max(0.05);
-                    let max_w = rect.width() - 48.0;
-                    let max_h = rect.height() - 48.0;
+                    let max_w = (rect.width() - 48.0).max(8.0);
+                    let max_h = (rect.height() - 48.0).max(8.0);
                     let (cw, ch) = if max_w / aspect <= max_h {
                         (max_w, max_w / aspect)
                     } else {
@@ -592,22 +603,23 @@ pub fn show_new_canvas_dialog(
                         egui::Stroke::new(1.5_f32, theme::ACCENT.gamma_multiply(0.7)),
                         egui::StrokeKind::Outside,
                     );
+                    // Label inside the preview plate so it cannot expand the dialog.
                     ui.painter().text(
-                        egui::pos2(canvas_rect.center().x, canvas_rect.bottom() + 18.0),
-                        egui::Align2::CENTER_TOP,
+                        egui::pos2(rect.center().x, rect.bottom() - 10.0),
+                        egui::Align2::CENTER_BOTTOM,
                         format!("{pw} × {ph}"),
                         egui::FontId::proportional(13.0),
-                        theme::TEXT_DIM,
+                        theme::text_dim(),
                     );
 
-                    ui.add_space(16.0);
+                    ui.add_space(8.0);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if theme::menu_btn(ui, theme::label("Отмена")).clicked() {
                             cancel = true;
                         }
                         let create_btn = egui::Button::new(
                             egui::RichText::new("  Создать  ")
-                                .color(theme::TEXT_ON_ACCENT)
+                                .color(theme::text_on_accent())
                                 .strong(),
                         )
                         .fill(theme::accent())
@@ -665,12 +677,12 @@ fn combo_item(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
             } else {
                 format!("  {text}")
             })
-            .color(theme::TEXT),
+            .color(theme::text()),
         )
         .fill(if selected {
-            theme::BG_TAB_ACTIVE
+            theme::bg_tab_active()
         } else {
-            theme::BG_MENU_ITEM
+            theme::bg_menu_item()
         })
         .min_size(egui::vec2(ui.available_width(), 24.0)),
     )

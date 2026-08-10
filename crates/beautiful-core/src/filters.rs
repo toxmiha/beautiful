@@ -149,16 +149,37 @@ fn radial_blur_dense(layer: &mut Layer, amount: f32, zoom_mode: bool) {
 }
 
 pub fn pixelize(layer: &mut Layer, block_size: u32) {
-    pixelize_with_cancel(layer, block_size, None);
+    pixelize_ex(layer, block_size, PixelizeMethod::Mosaic, 100.0);
 }
 
-pub fn pixelize_with_cancel(layer: &mut Layer, block_size: u32, cancel: Option<&CancelToken>) {
+pub fn pixelize_ex(
+    layer: &mut Layer,
+    block_size: u32,
+    method: PixelizeMethod,
+    soft_amount: f32,
+) {
+    pixelize_with_cancel(layer, block_size, method, soft_amount, None);
+}
+
+pub fn pixelize_with_cancel(
+    layer: &mut Layer,
+    block_size: u32,
+    method: PixelizeMethod,
+    soft_amount: f32,
+    cancel: Option<&CancelToken>,
+) {
     with_content_region(layer, block_size.clamp(2, 64), |region| {
-        pixelize_dense(region, block_size, cancel)
+        pixelize_dense(region, block_size, method, soft_amount, cancel)
     });
 }
 
-fn pixelize_dense(layer: &mut Layer, block_size: u32, cancel: Option<&CancelToken>) {
+fn pixelize_dense(
+    layer: &mut Layer,
+    block_size: u32,
+    method: PixelizeMethod,
+    soft_amount: f32,
+    cancel: Option<&CancelToken>,
+) {
     let block = block_size.clamp(2, 64);
     if cancelled(cancel) {
         return;
@@ -199,6 +220,10 @@ fn pixelize_dense(layer: &mut Layer, block_size: u32, cancel: Option<&CancelToke
     if cancelled(cancel) {
         return;
     }
+    let soft = match method {
+        PixelizeMethod::Mosaic => 1.0,
+        PixelizeMethod::Soft => (soft_amount / 100.0).clamp(0.0, 1.0),
+    };
     for (avg, x0, y0, x1, y1) in results {
         if y0 % 64 == 0 && cancelled(cancel) {
             return;
@@ -206,7 +231,15 @@ fn pixelize_dense(layer: &mut Layer, block_size: u32, cancel: Option<&CancelToke
         for y in y0..y1 {
             for x in x0..x1 {
                 let i = ((y * width + x) * 4) as usize;
-                pixels[i..i + 4].copy_from_slice(&avg);
+                if soft >= 0.999 {
+                    pixels[i..i + 4].copy_from_slice(&avg);
+                } else {
+                    for c in 0..4 {
+                        let s = source[i + c] as f32;
+                        let a = avg[c] as f32;
+                        pixels[i + c] = (s + (a - s) * soft).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
             }
         }
     }
@@ -214,24 +247,47 @@ fn pixelize_dense(layer: &mut Layer, block_size: u32, cancel: Option<&CancelToke
 }
 
 pub fn hue_saturation(layer: &mut Layer, hue_deg: f32, saturation: f32, lightness: f32) {
+    hue_saturation_ex(layer, hue_deg, saturation, lightness, false);
+}
+
+/// Hue/Saturation with optional Colorize (тонирование): absolute hue/sat, keep luma.
+pub fn hue_saturation_ex(
+    layer: &mut Layer,
+    hue_deg: f32,
+    saturation: f32,
+    lightness: f32,
+    colorize: bool,
+) {
     with_content_region(layer, 0, |region| {
-        hue_saturation_dense(region, hue_deg, saturation, lightness)
+        hue_saturation_dense(region, hue_deg, saturation, lightness, colorize)
     });
 }
 
-fn hue_saturation_dense(layer: &mut Layer, hue_deg: f32, saturation: f32, lightness: f32) {
-    let hue_shift = hue_deg / 360.0;
-    let sat_add = saturation / 100.0;
+fn hue_saturation_dense(
+    layer: &mut Layer,
+    hue_deg: f32,
+    saturation: f32,
+    lightness: f32,
+    colorize: bool,
+) {
     let lit_add = lightness / 100.0;
     let mut pixels = layer.pixels_dense();
     pixels.par_chunks_mut(4).for_each(|px| {
         if px[3] == 0 {
             return;
         }
-        let (mut h, mut s, mut l) = rgb_to_hsl(px[0], px[1], px[2]);
-        h = (h + hue_shift).rem_euclid(1.0);
-        s = (s + sat_add).clamp(0.0, 1.0);
-        l = (l + lit_add).clamp(0.0, 1.0);
+        let (h0, s0, l0) = rgb_to_hsl(px[0], px[1], px[2]);
+        let (h, s, l) = if colorize {
+            let h = (hue_deg / 360.0).rem_euclid(1.0);
+            let s = (saturation / 100.0).clamp(0.0, 1.0);
+            let l = (l0 + lit_add).clamp(0.0, 1.0);
+            (h, s, l)
+        } else {
+            let h = (h0 + hue_deg / 360.0).rem_euclid(1.0);
+            let s = (s0 + saturation / 100.0).clamp(0.0, 1.0);
+            let l = (l0 + lit_add).clamp(0.0, 1.0);
+            (h, s, l)
+        };
         let rgb = hsl_to_rgb(h, s, l);
         px[..3].copy_from_slice(&rgb);
     });
@@ -856,20 +912,57 @@ pub fn apply_adjustment_rgba(pixels: &mut [u8], w: u32, h: u32, kind: Adjustment
         AdjustmentKind::Levels { black, mid, white } => levels_rgba(pixels, black, mid, white),
         AdjustmentKind::Invert => invert_rgba(pixels),
         AdjustmentKind::Posterize { levels } => posterize_rgba(pixels, levels),
-        AdjustmentKind::ChromaticAberration { amount } => {
-            chromatic_aberration_rgba(pixels, w, h, amount)
+        AdjustmentKind::ChromaticAberration { amount } => chromatic_aberration_rgba(
+            pixels,
+            w,
+            h,
+            ChromaMode::Radial,
+            amount,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+        ),
+        AdjustmentKind::Noise { amount } => {
+            noise_rgba(pixels, NoiseMethod::Soft, amount, true)
         }
-        AdjustmentKind::Noise { amount } => noise_rgba(pixels, amount),
-        AdjustmentKind::Glitch { amount } => glitch_rgba(pixels, w, h, amount),
+        AdjustmentKind::Glitch { amount } => glitch_rgba(
+            pixels,
+            w,
+            h,
+            GlitchMethod::SliceShift,
+            amount,
+            12.0,
+            20.0,
+        ),
         AdjustmentKind::HexPixelize { size } => hex_pixelize_rgba(pixels, w, h, size),
         AdjustmentKind::TriPixelize { size } => tri_pixelize_rgba(pixels, w, h, size),
-        AdjustmentKind::HexDots { size } => hex_dots_rgba(pixels, w, h, size),
-        AdjustmentKind::Fisheye { amount } => fisheye_rgba(pixels, w, h, amount),
-        AdjustmentKind::SphericalLens { amount } => spherical_lens_rgba(pixels, w, h, amount),
-        AdjustmentKind::Ripple { amount, wavelength } => {
-            ripple_rgba(pixels, w, h, amount, wavelength)
+        AdjustmentKind::HexDots { size } => hex_dots_rgba(pixels, w, h, size, 38.0, false),
+        AdjustmentKind::Fisheye { amount } => fisheye_rgba(
+            pixels,
+            w,
+            h,
+            amount,
+            100.0,
+            50.0,
+            50.0,
+            FisheyeModel::Barrel,
+        ),
+        AdjustmentKind::SphericalLens { amount } => {
+            spherical_lens_rgba(pixels, w, h, amount, 100.0, 50.0, 50.0)
         }
-        AdjustmentKind::Twist { amount } => twist_rgba(pixels, w, h, amount),
+        AdjustmentKind::Ripple { amount, wavelength } => ripple_rgba(
+            pixels,
+            w,
+            h,
+            amount,
+            wavelength,
+            50.0,
+            50.0,
+            RippleMode::Circular,
+            0.0,
+        ),
+        AdjustmentKind::Twist { amount } => twist_rgba(pixels, w, h, amount, 100.0, 50.0, 50.0),
     }
 }
 
@@ -896,63 +989,281 @@ fn posterize_rgba(pixels: &mut [u8], levels: u32) {
     }
 }
 
-pub fn chromatic_aberration(layer: &mut Layer, amount: f32) {
-    with_rgba_buffer(layer, |px, w, h| chromatic_aberration_rgba(px, w, h, amount));
+pub fn chromatic_aberration(layer: &mut Layer, amount: f32, angle_deg: f32) {
+    chromatic_aberration_ex(
+        layer,
+        ChromaMode::Radial,
+        amount,
+        angle_deg,
+        0.0,
+        1.0,
+        1.0,
+    );
 }
-fn chromatic_aberration_rgba(pixels: &mut [u8], w: u32, h: u32, amount: f32) {
-    let amount = amount.clamp(0.0, 40.0);
-    if amount < 0.5 || w == 0 || h == 0 { return; }
-    let src = pixels.to_vec();
-    let cx = (w as f32 - 1.0) * 0.5;
-    let cy = (h as f32 - 1.0) * 0.5;
-    let shift = amount;
-    pixels.par_chunks_mut(4).enumerate().for_each(|(idx, px)| {
-        let x = (idx as u32 % w) as f32;
-        let y = (idx as u32 / w) as f32;
-        let dx = (x - cx) / cx.max(1.0);
-        let dy = (y - cy) / cy.max(1.0);
-        px[0] = sample_channel(&src, w, h, x + dx * shift, y + dy * shift, 0);
-        px[1] = sample_channel(&src, w, h, x, y, 1);
-        px[2] = sample_channel(&src, w, h, x - dx * shift, y - dy * shift, 2);
+
+pub fn chromatic_aberration_ex(
+    layer: &mut Layer,
+    mode: ChromaMode,
+    amount: f32,
+    angle_deg: f32,
+    center_atten: f32,
+    red_scale: f32,
+    blue_scale: f32,
+) {
+    with_rgba_buffer(layer, |px, w, h| {
+        chromatic_aberration_rgba(
+            px,
+            w,
+            h,
+            mode,
+            amount,
+            angle_deg,
+            center_atten,
+            red_scale,
+            blue_scale,
+        )
     });
 }
 
-pub fn noise(layer: &mut Layer, amount: f32) {
-    with_rgba_buffer(layer, |px, _, _| noise_rgba(px, amount));
+fn chromatic_aberration_rgba(
+    pixels: &mut [u8],
+    w: u32,
+    h: u32,
+    mode: ChromaMode,
+    amount: f32,
+    angle_deg: f32,
+    center_atten: f32,
+    red_scale: f32,
+    blue_scale: f32,
+) {
+    let amount = amount.clamp(0.0, 64.0);
+    if amount < 0.5 || w == 0 || h == 0 {
+        return;
+    }
+    let src = pixels.to_vec();
+    let cx = (w as f32 - 1.0) * 0.5;
+    let cy = (h as f32 - 1.0) * 0.5;
+    let max_r = cx.hypot(cy).max(1.0);
+    let (sa, ca) = angle_deg.to_radians().sin_cos();
+    let atten = (center_atten / 100.0).clamp(0.0, 1.0);
+    let rs = red_scale.clamp(0.0, 3.0);
+    let bs = blue_scale.clamp(0.0, 3.0);
+    pixels.par_chunks_mut(4).enumerate().for_each(|(idx, px)| {
+        let x = (idx as u32 % w) as f32;
+        let y = (idx as u32 / w) as f32;
+        let dx = x - cx;
+        let dy = y - cy;
+        let r_norm = (dx.hypot(dy) / max_r).clamp(0.0, 1.0);
+        // Attenuation near center: 0 = uniform shift, 100 = fringe only at edges.
+        let edge = if atten < 0.001 {
+            1.0
+        } else {
+            ((r_norm - (1.0 - atten)) / atten.max(0.05)).clamp(0.0, 1.0)
+        };
+        let shift = amount * edge;
+        if shift < 0.25 {
+            return;
+        }
+        let (rdx, rdy) = match mode {
+            ChromaMode::Radial => {
+                let nx = dx / cx.max(1.0);
+                let ny = dy / cy.max(1.0);
+                (nx * ca - ny * sa, nx * sa + ny * ca)
+            }
+            ChromaMode::Linear => (ca, sa),
+            ChromaMode::Tangential => {
+                let len = dx.hypot(dy).max(1e-3);
+                let tx = -dy / len;
+                let ty = dx / len;
+                (tx * ca - ty * sa, tx * sa + ty * ca)
+            }
+        };
+        px[0] = sample_channel(&src, w, h, x + rdx * shift * rs, y + rdy * shift * rs, 0);
+        px[1] = sample_channel(&src, w, h, x, y, 1);
+        px[2] = sample_channel(&src, w, h, x - rdx * shift * bs, y - rdy * shift * bs, 2);
+    });
 }
-fn noise_rgba(pixels: &mut [u8], amount: f32) {
+
+pub fn noise(layer: &mut Layer, amount: f32, monochrome: bool, soft: bool) {
+    let method = if soft {
+        NoiseMethod::Soft
+    } else {
+        NoiseMethod::Uniform
+    };
+    noise_ex(layer, method, amount, monochrome);
+}
+
+pub fn noise_ex(layer: &mut Layer, method: NoiseMethod, amount: f32, monochrome: bool) {
+    with_rgba_buffer(layer, |px, _, _| noise_rgba(px, method, amount, monochrome));
+}
+
+fn noise_rgba(pixels: &mut [u8], method: NoiseMethod, amount: f32, monochrome: bool) {
     let amount = amount.clamp(0.0, 100.0) * 2.55;
-    if amount < 0.5 { return; }
+    if amount < 0.5 {
+        return;
+    }
     for (i, px) in pixels.chunks_exact_mut(4).enumerate() {
-        if px[3] == 0 { continue; }
-        let n = hash_u32(i as u32) as f32 / u32::MAX as f32;
-        let d = (n - 0.5) * 2.0 * amount;
-        for c in 0..3 {
-            px[c] = (px[c] as f32 + d).round().clamp(0.0, 255.0) as u8;
+        if px[3] == 0 {
+            continue;
+        }
+        match method {
+            NoiseMethod::SaltPepper => {
+                let n = hash_u32(i as u32) as f32 / u32::MAX as f32;
+                let thresh = (amount / 255.0).clamp(0.0, 0.45);
+                if n < thresh * 0.5 {
+                    let v = if monochrome { 0 } else { (hash_u32(i as u32 ^ 0xA5) % 40) as u8 };
+                    px[0] = v;
+                    px[1] = if monochrome { v } else { (hash_u32(i as u32 ^ 0x5A) % 40) as u8 };
+                    px[2] = if monochrome { v } else { (hash_u32(i as u32 ^ 0x3C) % 40) as u8 };
+                } else if n > 1.0 - thresh * 0.5 {
+                    let v = if monochrome {
+                        255
+                    } else {
+                        215 + (hash_u32(i as u32 ^ 0x11) % 41) as u8
+                    };
+                    px[0] = v;
+                    px[1] = if monochrome {
+                        v
+                    } else {
+                        215 + (hash_u32(i as u32 ^ 0x22) % 41) as u8
+                    };
+                    px[2] = if monochrome {
+                        v
+                    } else {
+                        215 + (hash_u32(i as u32 ^ 0x33) % 41) as u8
+                    };
+                }
+            }
+            NoiseMethod::Soft | NoiseMethod::Uniform => {
+                let soft = matches!(method, NoiseMethod::Soft);
+                if monochrome {
+                    let n = hash_u32(i as u32) as f32 / u32::MAX as f32;
+                    let d = if soft {
+                        (n - 0.5) * 2.0 * amount
+                    } else if n > 0.5 {
+                        amount
+                    } else {
+                        -amount
+                    };
+                    for c in 0..3 {
+                        px[c] = (px[c] as f32 + d).round().clamp(0.0, 255.0) as u8;
+                    }
+                } else {
+                    for c in 0..3 {
+                        let n = hash_u32((i as u32).wrapping_mul(3).wrapping_add(c as u32)) as f32
+                            / u32::MAX as f32;
+                        let d = (n - 0.5) * 2.0 * amount;
+                        px[c] = (px[c] as f32 + d).round().clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
         }
     }
 }
 
-pub fn glitch(layer: &mut Layer, amount: f32) {
-    with_rgba_buffer(layer, |px, w, h| glitch_rgba(px, w, h, amount));
+pub fn glitch(layer: &mut Layer, amount: f32, slice_height: f32, max_shift: f32) {
+    glitch_ex(
+        layer,
+        GlitchMethod::SliceShift,
+        amount,
+        slice_height,
+        max_shift,
+    );
 }
-fn glitch_rgba(pixels: &mut [u8], w: u32, h: u32, amount: f32) {
+
+pub fn glitch_ex(
+    layer: &mut Layer,
+    method: GlitchMethod,
+    amount: f32,
+    slice_height: f32,
+    max_shift: f32,
+) {
+    with_rgba_buffer(layer, |px, w, h| {
+        glitch_rgba(px, w, h, method, amount, slice_height, max_shift)
+    });
+}
+
+fn glitch_rgba(
+    pixels: &mut [u8],
+    w: u32,
+    h: u32,
+    method: GlitchMethod,
+    amount: f32,
+    slice_height: f32,
+    max_shift: f32,
+) {
     let amount = amount.clamp(0.0, 100.0) / 100.0;
-    if amount < 0.01 || w < 4 || h < 4 { return; }
+    if amount < 0.01 || w < 4 || h < 4 {
+        return;
+    }
     let src = pixels.to_vec();
-    let bands = ((h as f32) * amount * 0.35).round().max(1.0) as u32;
-    for b in 0..bands {
-        let seed = hash_u32(b.wrapping_mul(977) ^ (w * 13));
-        let y0 = (seed % h.max(1)) as usize;
-        let bh = ((seed >> 8) % 12 + 2) as usize;
-        let shift = (((seed >> 16) as i32 % 40) - 20) as i32;
-        let channel = (seed >> 24) % 3;
-        for y in y0..(y0 + bh).min(h as usize) {
-            for x in 0..w as usize {
-                let sx = (x as i32 + shift).rem_euclid(w as i32) as usize;
-                let di = (y * w as usize + x) * 4;
-                let si = (y * w as usize + sx) * 4;
-                pixels[di + channel as usize] = src[si + channel as usize];
+    let slice_h = slice_height.clamp(1.0, 64.0);
+    let shift_span = max_shift.clamp(1.0, 200.0) as i32;
+    match method {
+        GlitchMethod::SliceShift => {
+            let bands = ((h as f32) * amount * 0.35).round().max(1.0) as u32;
+            for b in 0..bands {
+                let seed = hash_u32(b.wrapping_mul(977) ^ (w * 13));
+                let y0 = (seed % h.max(1)) as usize;
+                let bh = (((seed >> 8) as f32 % slice_h) + 2.0) as usize;
+                let shift = ((seed >> 16) as i32 % (shift_span * 2 + 1)) - shift_span;
+                let channel = (seed >> 24) % 3;
+                for y in y0..(y0 + bh).min(h as usize) {
+                    for x in 0..w as usize {
+                        let sx = (x as i32 + shift).rem_euclid(w as i32) as usize;
+                        let di = (y * w as usize + x) * 4;
+                        let si = (y * w as usize + sx) * 4;
+                        pixels[di + channel as usize] = src[si + channel as usize];
+                    }
+                }
+            }
+        }
+        GlitchMethod::ChannelTear => {
+            let bands = ((h as f32) * amount * 0.5).round().max(2.0) as u32;
+            for b in 0..bands {
+                let seed = hash_u32(b.wrapping_mul(131) ^ 0xC0FFEE);
+                let y0 = (seed % h.max(1)) as usize;
+                let bh = (((seed >> 7) as f32 % slice_h) + 1.0) as usize;
+                let shift_r = ((seed >> 10) as i32 % (shift_span + 1)) - shift_span / 2;
+                let shift_b = -shift_r;
+                for y in y0..(y0 + bh).min(h as usize) {
+                    for x in 0..w as usize {
+                        let xr = (x as i32 + shift_r).rem_euclid(w as i32) as usize;
+                        let xb = (x as i32 + shift_b).rem_euclid(w as i32) as usize;
+                        let di = (y * w as usize + x) * 4;
+                        pixels[di] = src[(y * w as usize + xr) * 4];
+                        pixels[di + 2] = src[(y * w as usize + xb) * 4 + 2];
+                    }
+                }
+            }
+        }
+        GlitchMethod::BlockDisplace => {
+            let cell = slice_h.clamp(4.0, 48.0) as u32;
+            let blocks = (((w * h) as f32 / (cell * cell) as f32) * amount * 0.4)
+                .round()
+                .max(1.0) as u32;
+            for b in 0..blocks {
+                let seed = hash_u32(b.wrapping_mul(7331) ^ 0xBADC0DE);
+                let bw = (cell + (seed % cell.max(1))).min(w);
+                let bh = (cell + ((seed >> 8) % cell.max(1))).min(h);
+                let x0 = seed % w.saturating_sub(bw).max(1);
+                let y0 = (seed >> 12) % h.saturating_sub(bh).max(1);
+                let sx = ((seed >> 4) as i32 % (shift_span * 2 + 1)) - shift_span;
+                let sy = ((seed >> 20) as i32 % (shift_span * 2 + 1)) - shift_span;
+                for dy in 0..bh {
+                    for dx in 0..bw {
+                        let x = x0 + dx;
+                        let y = y0 + dy;
+                        if x >= w || y >= h {
+                            continue;
+                        }
+                        let ssx = (x as i32 + sx).rem_euclid(w as i32) as u32;
+                        let ssy = (y as i32 + sy).rem_euclid(h as i32) as u32;
+                        let di = ((y * w + x) * 4) as usize;
+                        let si = ((ssy * w + ssx) * 4) as usize;
+                        pixels[di..di + 4].copy_from_slice(&src[si..si + 4]);
+                    }
+                }
             }
         }
     }
@@ -1001,13 +1312,27 @@ fn tri_pixelize_rgba(pixels: &mut [u8], w: u32, h: u32, size: u32) {
 }
 
 pub fn hex_dots(layer: &mut Layer, size: u32) {
-    with_rgba_buffer(layer, |px, w, h| hex_dots_rgba(px, w, h, size));
+    hex_dots_ex(layer, size, 38.0, false);
 }
-fn hex_dots_rgba(pixels: &mut [u8], w: u32, h: u32, size: u32) {
+
+pub fn hex_dots_ex(layer: &mut Layer, size: u32, fill_pct: f32, soft_edge: bool) {
+    with_rgba_buffer(layer, |px, w, h| {
+        hex_dots_rgba(px, w, h, size, fill_pct, soft_edge)
+    });
+}
+
+fn hex_dots_rgba(
+    pixels: &mut [u8],
+    w: u32,
+    h: u32,
+    size: u32,
+    fill_pct: f32,
+    soft_edge: bool,
+) {
     let size = size.clamp(4, 64) as f32;
     let src = pixels.to_vec();
     let sqrt3 = 1.7320508f32;
-    let r_dot = size * 0.38;
+    let r_dot = size * (fill_pct / 100.0).clamp(0.1, 1.0) * 0.5;
     pixels.par_chunks_mut(4).enumerate().for_each(|(idx, px)| {
         let x = (idx as u32 % w) as f32;
         let y = (idx as u32 / w) as f32;
@@ -1018,67 +1343,223 @@ fn hex_dots_rgba(pixels: &mut [u8], w: u32, h: u32, size: u32) {
         let cy = size * (sqrt3 / 2.0 * q + sqrt3 * r);
         let d = (x - cx).hypot(y - cy);
         if d <= r_dot {
-            px.copy_from_slice(&sample_rgba(&src, w, h, cx, cy));
+            let sample = sample_rgba(&src, w, h, cx, cy);
+            if soft_edge {
+                let t = (1.0 - d / r_dot.max(0.01)).clamp(0.0, 1.0);
+                let t = t * t * (3.0 - 2.0 * t);
+                for c in 0..4 {
+                    px[c] = (sample[c] as f32 * t).round().clamp(0.0, 255.0) as u8;
+                }
+            } else {
+                px.copy_from_slice(&sample);
+            }
         } else {
-            px[0] = 0; px[1] = 0; px[2] = 0; px[3] = 0;
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+            px[3] = 0;
         }
     });
 }
 
-pub fn fisheye(layer: &mut Layer, amount: f32) {
-    with_rgba_buffer(layer, |px, w, h| fisheye_rgba(px, w, h, amount));
-}
-fn fisheye_rgba(pixels: &mut [u8], w: u32, h: u32, amount: f32) {
-    warp_radial(pixels, w, h, amount.clamp(-1.0, 1.0), true);
-}
-
-pub fn spherical_lens(layer: &mut Layer, amount: f32) {
-    with_rgba_buffer(layer, |px, w, h| spherical_lens_rgba(px, w, h, amount));
-}
-fn spherical_lens_rgba(pixels: &mut [u8], w: u32, h: u32, amount: f32) {
-    warp_radial(pixels, w, h, amount.clamp(-1.0, 1.0) * 0.85, false);
+pub fn fisheye(layer: &mut Layer, amount: f32, radius: f32, center_x: f32, center_y: f32) {
+    fisheye_ex(
+        layer,
+        amount,
+        radius,
+        center_x,
+        center_y,
+        FisheyeModel::Barrel,
+    );
 }
 
-pub fn ripple(layer: &mut Layer, amount: f32, wavelength: f32) {
-    with_rgba_buffer(layer, |px, w, h| ripple_rgba(px, w, h, amount, wavelength));
+pub fn fisheye_ex(
+    layer: &mut Layer,
+    amount: f32,
+    radius: f32,
+    center_x: f32,
+    center_y: f32,
+    model: FisheyeModel,
+) {
+    with_rgba_buffer(layer, |px, w, h| {
+        fisheye_rgba(px, w, h, amount, radius, center_x, center_y, model)
+    });
 }
-fn ripple_rgba(pixels: &mut [u8], w: u32, h: u32, amount: f32, wavelength: f32) {
+
+fn fisheye_rgba(
+    pixels: &mut [u8],
+    w: u32,
+    h: u32,
+    amount: f32,
+    radius: f32,
+    center_x: f32,
+    center_y: f32,
+    model: FisheyeModel,
+) {
+    warp_fisheye(
+        pixels,
+        w,
+        h,
+        amount.clamp(-1.0, 1.0),
+        radius,
+        center_x,
+        center_y,
+        model,
+    );
+}
+
+pub fn spherical_lens(
+    layer: &mut Layer,
+    amount: f32,
+    radius: f32,
+    center_x: f32,
+    center_y: f32,
+) {
+    with_rgba_buffer(layer, |px, w, h| {
+        spherical_lens_rgba(px, w, h, amount, radius, center_x, center_y)
+    });
+}
+fn spherical_lens_rgba(
+    pixels: &mut [u8],
+    w: u32,
+    h: u32,
+    amount: f32,
+    radius: f32,
+    center_x: f32,
+    center_y: f32,
+) {
+    warp_radial(
+        pixels,
+        w,
+        h,
+        amount.clamp(-1.0, 1.0) * 0.85,
+        false,
+        radius,
+        center_x,
+        center_y,
+    );
+}
+
+pub fn ripple(
+    layer: &mut Layer,
+    amount: f32,
+    wavelength: f32,
+    center_x: f32,
+    center_y: f32,
+) {
+    ripple_ex(
+        layer,
+        amount,
+        wavelength,
+        center_x,
+        center_y,
+        RippleMode::Circular,
+        0.0,
+    );
+}
+
+pub fn ripple_ex(
+    layer: &mut Layer,
+    amount: f32,
+    wavelength: f32,
+    center_x: f32,
+    center_y: f32,
+    mode: RippleMode,
+    angle_deg: f32,
+) {
+    with_rgba_buffer(layer, |px, w, h| {
+        ripple_rgba(
+            px,
+            w,
+            h,
+            amount,
+            wavelength,
+            center_x,
+            center_y,
+            mode,
+            angle_deg,
+        )
+    });
+}
+
+fn ripple_rgba(
+    pixels: &mut [u8],
+    w: u32,
+    h: u32,
+    amount: f32,
+    wavelength: f32,
+    center_x: f32,
+    center_y: f32,
+    mode: RippleMode,
+    angle_deg: f32,
+) {
     let amount = amount.clamp(0.0, 40.0);
     let wl = wavelength.clamp(4.0, 200.0);
-    if amount < 0.5 { return; }
+    if amount < 0.5 {
+        return;
+    }
     let src = pixels.to_vec();
-    let cx = (w as f32 - 1.0) * 0.5;
-    let cy = (h as f32 - 1.0) * 0.5;
+    let cx = (w as f32 - 1.0) * (center_x / 100.0).clamp(0.0, 1.0);
+    let cy = (h as f32 - 1.0) * (center_y / 100.0).clamp(0.0, 1.0);
+    let (sa, ca) = angle_deg.to_radians().sin_cos();
     pixels.par_chunks_mut(4).enumerate().for_each(|(idx, px)| {
         let x = (idx as u32 % w) as f32;
         let y = (idx as u32 / w) as f32;
-        let dx = x - cx;
-        let dy = y - cy;
-        let dist = dx.hypot(dy);
-        let ang = dist / wl * std::f32::consts::TAU;
-        let offset = ang.sin() * amount;
-        let nx = if dist > 1e-3 { x + dx / dist * offset } else { x };
-        let ny = if dist > 1e-3 { y + dy / dist * offset } else { y };
+        let (nx, ny) = match mode {
+            RippleMode::Circular => {
+                let dx = x - cx;
+                let dy = y - cy;
+                let dist = dx.hypot(dy);
+                let ang = dist / wl * std::f32::consts::TAU;
+                let offset = ang.sin() * amount;
+                if dist > 1e-3 {
+                    (x + dx / dist * offset, y + dy / dist * offset)
+                } else {
+                    (x, y)
+                }
+            }
+            RippleMode::Linear => {
+                let lx = (x - cx) * ca + (y - cy) * sa;
+                let offset = (lx / wl * std::f32::consts::TAU).sin() * amount;
+                (x + ca * offset, y + sa * offset)
+            }
+        };
         px.copy_from_slice(&sample_rgba(&src, w, h, nx, ny));
     });
 }
 
-pub fn twist(layer: &mut Layer, amount: f32) {
-    with_rgba_buffer(layer, |px, w, h| twist_rgba(px, w, h, amount));
+pub fn twist(layer: &mut Layer, amount: f32, radius: f32, center_x: f32, center_y: f32) {
+    with_rgba_buffer(layer, |px, w, h| {
+        twist_rgba(px, w, h, amount, radius, center_x, center_y)
+    });
 }
-fn twist_rgba(pixels: &mut [u8], w: u32, h: u32, amount: f32) {
+fn twist_rgba(
+    pixels: &mut [u8],
+    w: u32,
+    h: u32,
+    amount: f32,
+    radius: f32,
+    center_x: f32,
+    center_y: f32,
+) {
     let amount = amount.clamp(-3.0, 3.0);
-    if amount.abs() < 0.01 { return; }
+    if amount.abs() < 0.01 {
+        return;
+    }
     let src = pixels.to_vec();
-    let cx = (w as f32 - 1.0) * 0.5;
-    let cy = (h as f32 - 1.0) * 0.5;
-    let max_r = cx.hypot(cy).max(1.0);
+    let cx = (w as f32 - 1.0) * (center_x / 100.0).clamp(0.0, 1.0);
+    let cy = (h as f32 - 1.0) * (center_y / 100.0).clamp(0.0, 1.0);
+    let max_r = cx
+        .max((w as f32 - 1.0) - cx)
+        .hypot(cy.max((h as f32 - 1.0) - cy))
+        .max(1.0)
+        * (radius / 100.0).clamp(0.05, 1.5);
     pixels.par_chunks_mut(4).enumerate().for_each(|(idx, px)| {
         let x = (idx as u32 % w) as f32;
         let y = (idx as u32 / w) as f32;
         let dx = x - cx;
         let dy = y - cy;
-        let r = dx.hypot(dy) / max_r;
+        let r = (dx.hypot(dy) / max_r).min(1.0);
         let ang = amount * (1.0 - r);
         let (s, c) = ang.sin_cos();
         let nx = cx + dx * c - dy * s;
@@ -1089,8 +1570,19 @@ fn twist_rgba(pixels: &mut [u8], w: u32, h: u32, amount: f32) {
 
 /// Edge darkening (or tint) toward `color`. `amount` 0..100, `softness` 0..100.
 pub fn vignette(layer: &mut Layer, amount: f32, softness: f32, color: [u8; 3]) {
+    vignette_ex(layer, amount, softness, color, VignetteShape::Circle, 50.0);
+}
+
+pub fn vignette_ex(
+    layer: &mut Layer,
+    amount: f32,
+    softness: f32,
+    color: [u8; 3],
+    shape: VignetteShape,
+    roundness: f32,
+) {
     with_rgba_buffer(layer, |px, w, h| {
-        vignette_rgba(px, w, h, amount, softness, color)
+        vignette_rgba(px, w, h, amount, softness, color, shape, roundness)
     });
 }
 
@@ -1101,6 +1593,8 @@ fn vignette_rgba(
     amount: f32,
     softness: f32,
     color: [u8; 3],
+    shape: VignetteShape,
+    roundness: f32,
 ) {
     let amount = (amount / 100.0).clamp(0.0, 1.0);
     if amount < 0.001 || w == 0 || h == 0 {
@@ -1109,12 +1603,24 @@ fn vignette_rgba(
     let soft = (softness / 100.0).clamp(0.05, 1.0);
     let cx = (w as f32 - 1.0) * 0.5;
     let cy = (h as f32 - 1.0) * 0.5;
-    let max_r = cx.hypot(cy).max(1.0);
+    let round = (roundness / 100.0).clamp(0.0, 1.0);
     let inner = (1.0 - soft).clamp(0.0, 0.95);
     pixels.par_chunks_mut(4).enumerate().for_each(|(idx, px)| {
         let x = (idx as u32 % w) as f32;
         let y = (idx as u32 / w) as f32;
-        let r = (x - cx).hypot(y - cy) / max_r;
+        let dx = (x - cx) / cx.max(1.0);
+        let dy = (y - cy) / cy.max(1.0);
+        let r = match shape {
+            VignetteShape::Circle => {
+                let max_r = cx.hypot(cy).max(1.0);
+                (x - cx).hypot(y - cy) / max_r
+            }
+            VignetteShape::Ellipse => {
+                // roundness 100 = circle in normalized space; 0 = strong box falloff.
+                let p = 2.0 + (1.0 - round) * 6.0;
+                (dx.abs().powf(p) + dy.abs().powf(p)).powf(1.0 / p)
+            }
+        };
         let t = ((r - inner) / (1.0 - inner).max(0.05)).clamp(0.0, 1.0);
         let t = t * t * amount;
         if t < 0.001 {
@@ -1174,30 +1680,280 @@ pub fn glow(layer: &mut Layer, radius: f32, intensity: f32, color: Option<[u8; 3
     });
 }
 
-fn warp_radial(pixels: &mut [u8], w: u32, h: u32, amount: f32, fisheye: bool) {
-    if amount.abs() < 0.01 || w == 0 || h == 0 { return; }
+fn warp_radial(
+    pixels: &mut [u8],
+    w: u32,
+    h: u32,
+    amount: f32,
+    fisheye: bool,
+    radius_pct: f32,
+    center_x: f32,
+    center_y: f32,
+) {
+    if fisheye {
+        warp_fisheye(
+            pixels,
+            w,
+            h,
+            amount,
+            radius_pct,
+            center_x,
+            center_y,
+            FisheyeModel::Barrel,
+        );
+        return;
+    }
+    if amount.abs() < 0.01 || w == 0 || h == 0 {
+        return;
+    }
     let src = pixels.to_vec();
-    let cx = (w as f32 - 1.0) * 0.5;
-    let cy = (h as f32 - 1.0) * 0.5;
-    let max_r = cx.min(cy).max(1.0);
+    let cx = (w as f32 - 1.0) * (center_x / 100.0).clamp(0.0, 1.0);
+    let cy = (h as f32 - 1.0) * (center_y / 100.0).clamp(0.0, 1.0);
+    let base_r = cx
+        .min((w as f32 - 1.0) - cx)
+        .min(cy.min((h as f32 - 1.0) - cy))
+        .max(1.0);
+    let max_r = base_r * (radius_pct / 100.0).clamp(0.05, 2.0);
     pixels.par_chunks_mut(4).enumerate().for_each(|(idx, px)| {
         let x = (idx as u32 % w) as f32;
         let y = (idx as u32 / w) as f32;
         let dx = (x - cx) / max_r;
         let dy = (y - cy) / max_r;
-        let r = dx.hypot(dy).min(1.0);
-        let nr = if fisheye {
-            let k = amount;
-            r * (1.0 + k * r * r)
-        } else {
-            let z = (1.0 - r * r).max(0.0).sqrt();
-            let k = 1.0 + amount;
-            r * k / (z + k).max(0.15)
-        };
+        let r = dx.hypot(dy);
+        if r > 1.0 {
+            return;
+        }
+        let z = (1.0 - r * r).max(0.0).sqrt();
+        let k = 1.0 + amount;
+        let nr = r * k / (z + k).max(0.15);
         let scale = if r > 1e-5 { nr / r } else { 1.0 };
         let nx = cx + dx * max_r * scale;
         let ny = cy + dy * max_r * scale;
         px.copy_from_slice(&sample_rgba(&src, w, h, nx, ny));
+    });
+}
+
+fn warp_fisheye(
+    pixels: &mut [u8],
+    w: u32,
+    h: u32,
+    amount: f32,
+    radius_pct: f32,
+    center_x: f32,
+    center_y: f32,
+    model: FisheyeModel,
+) {
+    if amount.abs() < 0.01 || w == 0 || h == 0 {
+        return;
+    }
+    let src = pixels.to_vec();
+    let cx = (w as f32 - 1.0) * (center_x / 100.0).clamp(0.0, 1.0);
+    let cy = (h as f32 - 1.0) * (center_y / 100.0).clamp(0.0, 1.0);
+    let base_r = cx
+        .min((w as f32 - 1.0) - cx)
+        .min(cy.min((h as f32 - 1.0) - cy))
+        .max(1.0);
+    let max_r = base_r * (radius_pct / 100.0).clamp(0.05, 2.0);
+    let strength = amount.abs().clamp(0.0, 1.0);
+    // FOV half-angle grows with amount (artistic, not calibrated mm).
+    let theta_max = (std::f32::consts::FRAC_PI_2 * (0.35 + 0.65 * strength)).clamp(0.25, 1.55);
+    pixels.par_chunks_mut(4).enumerate().for_each(|(idx, px)| {
+        let x = (idx as u32 % w) as f32;
+        let y = (idx as u32 / w) as f32;
+        let dx = (x - cx) / max_r;
+        let dy = (y - cy) / max_r;
+        let r = dx.hypot(dy);
+        if r > 1.0 {
+            return;
+        }
+        let scale = fisheye_sample_scale(r, amount, theta_max, model);
+        let nx = cx + dx * max_r * scale;
+        let ny = cy + dy * max_r * scale;
+        px.copy_from_slice(&sample_rgba(&src, w, h, nx, ny));
+    });
+}
+
+/// Map destination radius → source sampling scale under a fisheye model.
+fn fisheye_sample_scale(r: f32, amount: f32, theta_max: f32, model: FisheyeModel) -> f32 {
+    if matches!(model, FisheyeModel::Barrel) {
+        return 1.0 + amount * r * r;
+    }
+    if r < 1e-5 {
+        return 1.0;
+    }
+    let theta = match model {
+        FisheyeModel::Barrel => unreachable!(),
+        FisheyeModel::Equidistant => r * theta_max,
+        FisheyeModel::Equisolid => {
+            let arg = (r * (theta_max * 0.5).sin()).clamp(-1.0, 1.0);
+            2.0 * arg.asin()
+        }
+        FisheyeModel::Stereographic => 2.0 * (r * (theta_max * 0.5).tan()).atan(),
+        FisheyeModel::Orthographic => (r * theta_max.sin()).clamp(-1.0, 1.0).asin(),
+    };
+    let r_src = theta.tan() / theta_max.tan().max(1e-4);
+    let scale = (r_src / r).clamp(0.05, 8.0);
+    if amount < 0.0 {
+        (1.0 / scale).clamp(0.05, 8.0)
+    } else {
+        scale
+    }
+}
+
+/// Crystallize — jittered Voronoi cells (peer Pixelate/Crystallize).
+pub fn crystallize(layer: &mut Layer, size: u32) {
+    with_rgba_buffer(layer, |px, w, h| crystallize_rgba(px, w, h, size));
+}
+
+fn crystallize_rgba(pixels: &mut [u8], w: u32, h: u32, size: u32) {
+    let cell = size.clamp(4, 96) as f32;
+    let src = pixels.to_vec();
+    pixels.par_chunks_mut(4).enumerate().for_each(|(idx, px)| {
+        let x = (idx as u32 % w) as f32;
+        let y = (idx as u32 / w) as f32;
+        let gx = (x / cell).floor() as i32;
+        let gy = (y / cell).floor() as i32;
+        let mut best_d = f32::MAX;
+        let mut best = [0u8; 4];
+        for oy in -1..=1 {
+            for ox in -1..=1 {
+                let cx_i = gx + ox;
+                let cy_i = gy + oy;
+                let seed = hash_u32((cx_i as u32).wrapping_mul(73856093) ^ (cy_i as u32).wrapping_mul(19349663));
+                let jx = ((seed & 0xFFFF) as f32 / 65535.0 - 0.5) * cell;
+                let jy = (((seed >> 16) & 0xFFFF) as f32 / 65535.0 - 0.5) * cell;
+                let cx = (cx_i as f32 + 0.5) * cell + jx;
+                let cy = (cy_i as f32 + 0.5) * cell + jy;
+                let d = (x - cx).hypot(y - cy);
+                if d < best_d {
+                    best_d = d;
+                    best = sample_rgba(&src, w, h, cx, cy);
+                }
+            }
+        }
+        px.copy_from_slice(&best);
+    });
+}
+
+/// Pointillize — discrete dots on a jittered lattice.
+pub fn pointillize(layer: &mut Layer, size: u32, density: f32, bg: [u8; 3]) {
+    with_rgba_buffer(layer, |px, w, h| {
+        pointillize_rgba(px, w, h, size, density, bg)
+    });
+}
+
+fn pointillize_rgba(
+    pixels: &mut [u8],
+    w: u32,
+    h: u32,
+    size: u32,
+    density: f32,
+    bg: [u8; 3],
+) {
+    let cell = size.clamp(3, 64) as f32;
+    let dens = (density / 100.0).clamp(0.05, 1.0);
+    let r_dot = cell * 0.42 * dens.sqrt();
+    let src = pixels.to_vec();
+    // Fill background first.
+    for px in pixels.chunks_exact_mut(4) {
+        if px[3] == 0 {
+            continue;
+        }
+        px[0] = bg[0];
+        px[1] = bg[1];
+        px[2] = bg[2];
+    }
+    let cols = (w as f32 / cell).ceil() as i32 + 1;
+    let rows = (h as f32 / cell).ceil() as i32 + 1;
+    for gy in 0..rows {
+        for gx in 0..cols {
+            let seed = hash_u32((gx as u32).wrapping_mul(374761393) ^ (gy as u32).wrapping_mul(668265263));
+            if (seed % 1000) as f32 / 1000.0 > dens {
+                continue;
+            }
+            let jx = ((seed & 0xFF) as f32 / 255.0 - 0.5) * cell * 0.6;
+            let jy = (((seed >> 8) & 0xFF) as f32 / 255.0 - 0.5) * cell * 0.6;
+            let cx = (gx as f32 + 0.5) * cell + jx;
+            let cy = (gy as f32 + 0.5) * cell + jy;
+            if cx < -r_dot || cy < -r_dot || cx > w as f32 + r_dot || cy > h as f32 + r_dot {
+                continue;
+            }
+            let sample = sample_rgba(&src, w, h, cx, cy);
+            let x0 = (cx - r_dot).floor().max(0.0) as u32;
+            let y0 = (cy - r_dot).floor().max(0.0) as u32;
+            let x1 = (cx + r_dot).ceil().min(w as f32) as u32;
+            let y1 = (cy + r_dot).ceil().min(h as f32) as u32;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let d = (x as f32 - cx).hypot(y as f32 - cy);
+                    if d <= r_dot {
+                        let i = ((y * w + x) * 4) as usize;
+                        if src[i + 3] == 0 {
+                            continue;
+                        }
+                        let t = (1.0 - d / r_dot.max(0.01)).clamp(0.0, 1.0);
+                        let t = t * t * (3.0 - 2.0 * t);
+                        for c in 0..3 {
+                            let b = bg[c] as f32;
+                            pixels[i + c] =
+                                (b + (sample[c] as f32 - b) * t).round().clamp(0.0, 255.0) as u8;
+                        }
+                        pixels[i + 3] = src[i + 3];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Color halftone — CMY angled screens (peer Pixelate/Color Halftone).
+pub fn color_halftone(layer: &mut Layer, size: u32, angle_deg: f32) {
+    with_rgba_buffer(layer, |px, w, h| {
+        color_halftone_rgba(px, w, h, size, angle_deg)
+    });
+}
+
+fn color_halftone_rgba(pixels: &mut [u8], w: u32, h: u32, size: u32, angle_deg: f32) {
+    let cell = size.clamp(3, 48) as f32;
+    let src = pixels.to_vec();
+    let base = angle_deg.to_radians();
+    // C, M, Y screen angles (classic offset).
+    let angles = [base + 15f32.to_radians(), base + 75f32.to_radians(), base];
+    let ink = [
+        [0.0f32, 1.0, 1.0], // cyan
+        [1.0, 0.0, 1.0],    // magenta
+        [1.0, 1.0, 0.0],    // yellow
+    ];
+    pixels.par_chunks_mut(4).enumerate().for_each(|(idx, px)| {
+        let x = (idx as u32 % w) as f32;
+        let y = (idx as u32 / w) as f32;
+        let s = sample_rgba(&src, w, h, x, y);
+        if s[3] == 0 {
+            px.copy_from_slice(&s);
+            return;
+        }
+        let mut out = [255.0f32; 3];
+        for ch in 0..3 {
+            let (sa, ca) = angles[ch].sin_cos();
+            let lx = x * ca + y * sa;
+            let ly = -x * sa + y * ca;
+            let cx = (lx / cell).floor() * cell + cell * 0.5;
+            let cy = (ly / cell).floor() * cell + cell * 0.5;
+            let d = (lx - cx).hypot(ly - cy);
+            let ink_amt = 1.0 - s[ch] as f32 / 255.0;
+            let r_dot = cell * 0.48 * ink_amt.sqrt();
+            if d <= r_dot && ink_amt > 0.02 {
+                let soft = (1.0 - d / r_dot.max(0.01)).clamp(0.0, 1.0);
+                let cov = soft * soft * ink_amt;
+                for c in 0..3 {
+                    out[c] *= 1.0 - cov * (1.0 - ink[ch][c]);
+                }
+            }
+        }
+        px[0] = out[0].round().clamp(0.0, 255.0) as u8;
+        px[1] = out[1].round().clamp(0.0, 255.0) as u8;
+        px[2] = out[2].round().clamp(0.0, 255.0) as u8;
+        px[3] = s[3];
     });
 }
 
@@ -1253,15 +2009,35 @@ fn brightness_contrast_rgba(pixels: &mut [u8], brightness: f32, contrast: f32) {
 }
 
 fn hue_saturation_rgba(pixels: &mut [u8], hue_deg: f32, saturation: f32, lightness: f32) {
-    let hue_shift = hue_deg / 360.0;
-    let sat_add = saturation / 100.0;
+    hue_saturation_rgba_ex(pixels, hue_deg, saturation, lightness, false);
+}
+
+fn hue_saturation_rgba_ex(
+    pixels: &mut [u8],
+    hue_deg: f32,
+    saturation: f32,
+    lightness: f32,
+    colorize: bool,
+) {
     let lit_add = lightness / 100.0;
     for px in pixels.chunks_exact_mut(4) {
-        if px[3] == 0 { continue; }
-        let (mut h, mut s, mut l) = rgb_to_hsl(px[0], px[1], px[2]);
-        h = (h + hue_shift).rem_euclid(1.0);
-        s = (s + sat_add).clamp(0.0, 1.0);
-        l = (l + lit_add).clamp(0.0, 1.0);
+        if px[3] == 0 {
+            continue;
+        }
+        let (h0, s0, l0) = rgb_to_hsl(px[0], px[1], px[2]);
+        let (h, s, l) = if colorize {
+            (
+                (hue_deg / 360.0).rem_euclid(1.0),
+                (saturation / 100.0).clamp(0.0, 1.0),
+                (l0 + lit_add).clamp(0.0, 1.0),
+            )
+        } else {
+            (
+                (h0 + hue_deg / 360.0).rem_euclid(1.0),
+                (s0 + saturation / 100.0).clamp(0.0, 1.0),
+                (l0 + lit_add).clamp(0.0, 1.0),
+            )
+        };
         let rgb = hsl_to_rgb(h, s, l);
         px[..3].copy_from_slice(&rgb);
     }
@@ -1289,5 +2065,495 @@ fn invert_rgba(pixels: &mut [u8]) {
         px[0] = 255 - px[0];
         px[1] = 255 - px[1];
         px[2] = 255 - px[2];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Studio extras: Sepia · Film Grain · Dithering · Replace Color
+// ---------------------------------------------------------------------------
+
+pub fn sepia(layer: &mut Layer, amount: f32, warmth: f32) {
+    with_rgba_buffer(layer, |px, _, _| sepia_rgba(px, amount, warmth));
+}
+
+pub fn sepia_rgba(pixels: &mut [u8], amount: f32, warmth: f32) {
+    let amount = (amount / 100.0).clamp(0.0, 1.0);
+    let warmth = (warmth / 100.0).clamp(0.0, 1.0);
+    if amount < 0.001 {
+        return;
+    }
+    // Warmth: 0 = yellowish, 1 = reddish-brown.
+    let wr = 0.35 + warmth * 0.25;
+    let wg = 0.25 + (1.0 - warmth) * 0.15;
+    let wb = 0.10 + (1.0 - warmth) * 0.08;
+    for px in pixels.chunks_exact_mut(4) {
+        if px[3] == 0 {
+            continue;
+        }
+        let r = px[0] as f32;
+        let g = px[1] as f32;
+        let b = px[2] as f32;
+        let gray = 0.299 * r + 0.587 * g + 0.114 * b;
+        let sr = (gray + 255.0 * wr).min(255.0);
+        let sg = (gray + 255.0 * wg).min(255.0);
+        let sb = (gray + 255.0 * wb * 0.55).min(255.0);
+        px[0] = (r + (sr - r) * amount).round().clamp(0.0, 255.0) as u8;
+        px[1] = (g + (sg - g) * amount).round().clamp(0.0, 255.0) as u8;
+        px[2] = (b + (sb - b) * amount).round().clamp(0.0, 255.0) as u8;
+    }
+}
+
+pub fn film_grain(
+    layer: &mut Layer,
+    amount: f32,
+    size: f32,
+    roughness: f32,
+    monochrome: bool,
+    shadow_bias: f32,
+) {
+    with_rgba_buffer(layer, |px, w, h| {
+        film_grain_rgba(px, w, h, amount, size, roughness, monochrome, shadow_bias)
+    });
+}
+
+pub fn film_grain_rgba(
+    pixels: &mut [u8],
+    w: u32,
+    h: u32,
+    amount: f32,
+    size: f32,
+    roughness: f32,
+    monochrome: bool,
+    shadow_bias: f32,
+) {
+    let amount = (amount / 100.0).clamp(0.0, 1.0);
+    if amount < 0.001 || w == 0 || h == 0 {
+        return;
+    }
+    let size = size.clamp(0.5, 4.0);
+    let roughness = (roughness / 100.0).clamp(0.0, 1.0);
+    let shadow_bias = (shadow_bias / 100.0).clamp(0.0, 1.0);
+    let inv_size = 1.0 / size;
+    for (i, px) in pixels.chunks_exact_mut(4).enumerate() {
+        if px[3] == 0 {
+            continue;
+        }
+        let x = (i as u32 % w) as f32;
+        let y = (i as u32 / w) as f32;
+        let cell_x = (x * inv_size).floor() as u32;
+        let cell_y = (y * inv_size).floor() as u32;
+        let n0 = hash_u32(cell_x.wrapping_mul(73856093) ^ cell_y.wrapping_mul(19349663));
+        let n1 = hash_u32(n0 ^ 0xA5A5_5A5A);
+        let mut grain = (n0 as f32 / u32::MAX as f32) * 2.0 - 1.0;
+        grain *= 0.55 + roughness * 0.9;
+        let lum = (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32) / 255.0;
+        let shadow_w = 1.0 + shadow_bias * (1.0 - lum) * 1.5;
+        let strength = amount * 48.0 * shadow_w;
+        if monochrome {
+            let d = grain * strength;
+            for c in 0..3 {
+                px[c] = (px[c] as f32 + d).round().clamp(0.0, 255.0) as u8;
+            }
+        } else {
+            let gr = grain;
+            let gg = ((n1 as f32 / u32::MAX as f32) * 2.0 - 1.0) * (0.55 + roughness * 0.9);
+            let gb = (((n1 >> 8) as f32 / 255.0) * 2.0 - 1.0) * (0.55 + roughness * 0.9);
+            px[0] = (px[0] as f32 + gr * strength).round().clamp(0.0, 255.0) as u8;
+            px[1] = (px[1] as f32 + gg * strength).round().clamp(0.0, 255.0) as u8;
+            px[2] = (px[2] as f32 + gb * strength).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum DitherMethod {
+    Bayer2,
+    Bayer4,
+    Bayer8,
+    FloydSteinberg,
+}
+
+/// Classical fisheye projection models (Hill / camera mapping).
+/// Used as artistic remaps from a rectilinear plate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum FisheyeModel {
+    /// Simple barrel polynomial (legacy feel).
+    #[default]
+    Barrel,
+    /// f·θ — equal angle per pixel (most common “perfect” fisheye).
+    Equidistant,
+    /// 2f·sin(θ/2) — equal solid angle.
+    Equisolid,
+    /// 2f·tan(θ/2) — conformal, preserves local shapes.
+    Stereographic,
+    /// f·sin(θ) — limited ~180° FOV.
+    Orthographic,
+}
+
+/// Chromatic aberration / RGB fringe styles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum ChromaMode {
+    /// Lateral CA: channels split radially from center (lens-like).
+    #[default]
+    Radial,
+    /// Constant directional RGB shift (glitch / prism).
+    Linear,
+    /// Shift perpendicular to the radial direction.
+    Tangential,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum RippleMode {
+    #[default]
+    Circular,
+    Linear,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum PixelizeMethod {
+    #[default]
+    Mosaic,
+    /// Mosaic blended back toward the original by Soft amount.
+    Soft,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum NoiseMethod {
+    #[default]
+    Soft,
+    Uniform,
+    SaltPepper,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum GlitchMethod {
+    #[default]
+    SliceShift,
+    ChannelTear,
+    BlockDisplace,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum VignetteShape {
+    #[default]
+    Circle,
+    Ellipse,
+}
+
+/// Ordered / error-diffusion dither.
+/// `pattern_size` scales the Bayer cell (1 = 1px/cell, 8 = large blocks).
+/// `monochrome` quantizes luminance then tints RGB; else per-channel.
+pub fn dither(
+    layer: &mut Layer,
+    method: DitherMethod,
+    levels: u32,
+    amount: f32,
+    serpentine: bool,
+    pattern_size: f32,
+    monochrome: bool,
+) {
+    with_rgba_buffer(layer, |px, w, h| {
+        dither_rgba(
+            px,
+            w,
+            h,
+            method,
+            levels,
+            amount,
+            serpentine,
+            pattern_size,
+            monochrome,
+        )
+    });
+}
+
+pub fn dither_rgba(
+    pixels: &mut [u8],
+    w: u32,
+    h: u32,
+    method: DitherMethod,
+    levels: u32,
+    amount: f32,
+    serpentine: bool,
+    pattern_size: f32,
+    monochrome: bool,
+) {
+    let amount = (amount / 100.0).clamp(0.0, 1.0);
+    if amount < 0.001 || w == 0 || h == 0 {
+        return;
+    }
+    let levels = levels.clamp(2, 32);
+    let step = 255.0 / (levels - 1) as f32;
+    let cell = pattern_size.clamp(0.25, 16.0);
+    let src = pixels.to_vec();
+
+    let quantize = |v: f32, thr: f32| -> f32 {
+        let q = ((v + thr) / step).round() * step;
+        q.clamp(0.0, 255.0)
+    };
+    let write_rgb = |px: &mut [u8], i: usize, qr: f32, qg: f32, qb: f32| {
+        let blend = |o: u8, n: f32| (o as f32 + (n - o as f32) * amount).round().clamp(0.0, 255.0) as u8;
+        px[i] = blend(src[i], qr);
+        px[i + 1] = blend(src[i + 1], qg);
+        px[i + 2] = blend(src[i + 2], qb);
+        px[i + 3] = src[i + 3];
+    };
+    let luma = |i: usize| {
+        0.299 * src[i] as f32 + 0.587 * src[i + 1] as f32 + 0.114 * src[i + 2] as f32
+    };
+
+    match method {
+        DitherMethod::Bayer2 | DitherMethod::Bayer4 | DitherMethod::Bayer8 => {
+            let (matrix, n): (&[u8], usize) = match method {
+                DitherMethod::Bayer2 => (&[0, 2, 3, 1], 2),
+                DitherMethod::Bayer4 => (
+                    &[
+                        0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5,
+                    ],
+                    4,
+                ),
+                _ => (
+                    &[
+                        0, 32, 8, 40, 2, 34, 10, 42, 48, 16, 56, 24, 50, 18, 58, 26, 12, 44, 4,
+                        36, 14, 46, 6, 38, 60, 28, 52, 20, 62, 30, 54, 22, 3, 35, 11, 43, 1, 33,
+                        9, 41, 51, 19, 59, 27, 49, 17, 57, 25, 15, 47, 7, 39, 13, 45, 5, 37, 63,
+                        31, 55, 23, 61, 29, 53, 21,
+                    ],
+                    8,
+                ),
+            };
+            let denom = (n * n) as f32;
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let i = (y * w as usize + x) * 4;
+                    if src[i + 3] == 0 {
+                        continue;
+                    }
+                    let bx = ((x as f32 / cell).floor() as usize) % n;
+                    let by = ((y as f32 / cell).floor() as usize) % n;
+                    let thr = (matrix[by * n + bx] as f32 / denom - 0.5) * step;
+                    if monochrome {
+                        let q = quantize(luma(i), thr);
+                        write_rgb(pixels, i, q, q, q);
+                    } else {
+                        write_rgb(
+                            pixels,
+                            i,
+                            quantize(src[i] as f32, thr),
+                            quantize(src[i + 1] as f32, thr),
+                            quantize(src[i + 2] as f32, thr),
+                        );
+                    }
+                }
+            }
+        }
+        DitherMethod::FloydSteinberg => {
+            let ww = w as usize;
+            let hh = h as usize;
+            let channels = if monochrome { 1 } else { 3 };
+            let mut buf = vec![0.0f32; ww * hh * channels];
+            for (i, px) in src.chunks_exact(4).enumerate() {
+                if monochrome {
+                    buf[i] = 0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32;
+                } else {
+                    buf[i * 3] = px[0] as f32;
+                    buf[i * 3 + 1] = px[1] as f32;
+                    buf[i * 3 + 2] = px[2] as f32;
+                }
+            }
+            for y in 0..hh {
+                let left_to_right = !serpentine || y % 2 == 0;
+                let xs: Box<dyn Iterator<Item = usize>> = if left_to_right {
+                    Box::new(0..ww)
+                } else {
+                    Box::new((0..ww).rev())
+                };
+                for x in xs {
+                    let i = y * ww + x;
+                    if src[i * 4 + 3] == 0 {
+                        continue;
+                    }
+                    if monochrome {
+                        let old = buf[i];
+                        let new = (old / step).round() * step;
+                        let q = new.clamp(0.0, 255.0);
+                        let err = old - q;
+                        write_rgb(pixels, i * 4, q, q, q);
+                        let mut disperse = |bx: i32, by: i32, factor: f32| {
+                            if bx < 0 || by < 0 || bx >= ww as i32 || by >= hh as i32 {
+                                return;
+                            }
+                            let j = by as usize * ww + bx as usize;
+                            if src[j * 4 + 3] == 0 {
+                                return;
+                            }
+                            buf[j] += err * factor;
+                        };
+                        if left_to_right {
+                            disperse(x as i32 + 1, y as i32, 7.0 / 16.0);
+                            disperse(x as i32 - 1, y as i32 + 1, 3.0 / 16.0);
+                            disperse(x as i32, y as i32 + 1, 5.0 / 16.0);
+                            disperse(x as i32 + 1, y as i32 + 1, 1.0 / 16.0);
+                        } else {
+                            disperse(x as i32 - 1, y as i32, 7.0 / 16.0);
+                            disperse(x as i32 + 1, y as i32 + 1, 3.0 / 16.0);
+                            disperse(x as i32, y as i32 + 1, 5.0 / 16.0);
+                            disperse(x as i32 - 1, y as i32 + 1, 1.0 / 16.0);
+                        }
+                    } else {
+                        let mut q = [0.0f32; 3];
+                        let mut err = [0.0f32; 3];
+                        for c in 0..3 {
+                            let old = buf[i * 3 + c];
+                            let new = (old / step).round() * step;
+                            q[c] = new.clamp(0.0, 255.0);
+                            err[c] = old - q[c];
+                        }
+                        write_rgb(pixels, i * 4, q[0], q[1], q[2]);
+                        let mut disperse = |bx: i32, by: i32, factor: f32| {
+                            if bx < 0 || by < 0 || bx >= ww as i32 || by >= hh as i32 {
+                                return;
+                            }
+                            let j = by as usize * ww + bx as usize;
+                            if src[j * 4 + 3] == 0 {
+                                return;
+                            }
+                            for c in 0..3 {
+                                buf[j * 3 + c] += err[c] * factor;
+                            }
+                        };
+                        if left_to_right {
+                            disperse(x as i32 + 1, y as i32, 7.0 / 16.0);
+                            disperse(x as i32 - 1, y as i32 + 1, 3.0 / 16.0);
+                            disperse(x as i32, y as i32 + 1, 5.0 / 16.0);
+                            disperse(x as i32 + 1, y as i32 + 1, 1.0 / 16.0);
+                        } else {
+                            disperse(x as i32 - 1, y as i32, 7.0 / 16.0);
+                            disperse(x as i32 + 1, y as i32 + 1, 3.0 / 16.0);
+                            disperse(x as i32, y as i32 + 1, 5.0 / 16.0);
+                            disperse(x as i32 - 1, y as i32 + 1, 1.0 / 16.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ReplaceAffect {
+    HueSat,
+    HueOnly,
+    FullRgb,
+}
+
+pub fn replace_color(
+    layer: &mut Layer,
+    from: [u8; 3],
+    to: [u8; 3],
+    tolerance: f32,
+    softness: f32,
+    affect: ReplaceAffect,
+    amount: f32,
+) {
+    with_rgba_buffer(layer, |px, _, _| {
+        replace_color_rgba(px, from, to, tolerance, softness, affect, amount)
+    });
+}
+
+pub fn replace_color_rgba(
+    pixels: &mut [u8],
+    from: [u8; 3],
+    to: [u8; 3],
+    tolerance: f32,
+    softness: f32,
+    affect: ReplaceAffect,
+    amount: f32,
+) {
+    let amount = (amount / 100.0).clamp(0.0, 1.0);
+    if amount < 0.001 {
+        return;
+    }
+    let tol = (tolerance / 100.0).clamp(0.0, 1.0) * 1.732; // max RGB unit-cube diagonal
+    let soft = (softness / 100.0).clamp(0.0, 1.0) * tol.max(0.05);
+    let fr = from[0] as f32 / 255.0;
+    let fg = from[1] as f32 / 255.0;
+    let fb = from[2] as f32 / 255.0;
+    let (th, ts, _tl) = rgb_to_hsl(to[0], to[1], to[2]);
+    for px in pixels.chunks_exact_mut(4) {
+        if px[3] == 0 {
+            continue;
+        }
+        let r = px[0] as f32 / 255.0;
+        let g = px[1] as f32 / 255.0;
+        let b = px[2] as f32 / 255.0;
+        let dist = ((r - fr).powi(2) + (g - fg).powi(2) + (b - fb).powi(2)).sqrt();
+        let edge0 = (tol - soft).max(0.0);
+        let edge1 = tol + soft;
+        let mut mask = if dist <= edge0 {
+            1.0
+        } else if dist >= edge1 {
+            0.0
+        } else {
+            1.0 - (dist - edge0) / (edge1 - edge0).max(1e-5)
+        };
+        mask *= amount;
+        if mask < 0.001 {
+            continue;
+        }
+        let (_h, s, l) = rgb_to_hsl(px[0], px[1], px[2]);
+        let out = match affect {
+            ReplaceAffect::FullRgb => [
+                (px[0] as f32 + (to[0] as f32 - px[0] as f32) * mask)
+                    .round()
+                    .clamp(0.0, 255.0) as u8,
+                (px[1] as f32 + (to[1] as f32 - px[1] as f32) * mask)
+                    .round()
+                    .clamp(0.0, 255.0) as u8,
+                (px[2] as f32 + (to[2] as f32 - px[2] as f32) * mask)
+                    .round()
+                    .clamp(0.0, 255.0) as u8,
+            ],
+            ReplaceAffect::HueOnly => {
+                let rgb = hsl_to_rgb(th, s, l);
+                [
+                    (px[0] as f32 + (rgb[0] as f32 - px[0] as f32) * mask)
+                        .round()
+                        .clamp(0.0, 255.0) as u8,
+                    (px[1] as f32 + (rgb[1] as f32 - px[1] as f32) * mask)
+                        .round()
+                        .clamp(0.0, 255.0) as u8,
+                    (px[2] as f32 + (rgb[2] as f32 - px[2] as f32) * mask)
+                        .round()
+                        .clamp(0.0, 255.0) as u8,
+                ]
+            }
+            ReplaceAffect::HueSat => {
+                let rgb = hsl_to_rgb(th, ts, l);
+                [
+                    (px[0] as f32 + (rgb[0] as f32 - px[0] as f32) * mask)
+                        .round()
+                        .clamp(0.0, 255.0) as u8,
+                    (px[1] as f32 + (rgb[1] as f32 - px[1] as f32) * mask)
+                        .round()
+                        .clamp(0.0, 255.0) as u8,
+                    (px[2] as f32 + (rgb[2] as f32 - px[2] as f32) * mask)
+                        .round()
+                        .clamp(0.0, 255.0) as u8,
+                ]
+            }
+        };
+        px[0] = out[0];
+        px[1] = out[1];
+        px[2] = out[2];
     }
 }

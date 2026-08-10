@@ -1749,6 +1749,14 @@ impl CanvasState {
             return false;
         }
 
+        // Eye-off (or ancestor folder eye-off): block paint; toast on press.
+        if document.active_is_hidden() {
+            if pressed {
+                let _ = document.require_paintable("Рисование");
+            }
+            return false;
+        }
+
         let shift = raw.modifiers.shift;
         let doc_w = document.width as f32;
         let doc_h = document.height as f32;
@@ -1798,11 +1806,12 @@ impl CanvasState {
                         document.stabilizer.reset();
                         let mut traj = crate::stroke_input::TrajectoryBuilder::default();
                         let end = (x, y, pressure);
-                        let painted = crate::stroke_input::paint_samples_mode(
+                        let painted = crate::stroke_input::paint_samples_mode_ex(
                             document,
                             &[anchor, end],
                             &mut traj,
                             mode,
+                            true, // full path known — taper_out applies
                         );
                         if !selection_paint {
                             document.end_stroke_undo();
@@ -1988,24 +1997,25 @@ impl CanvasState {
 
     /// Discrete notch: feed raw delta, returns factor when a full notch fires.
     pub fn poll_zoom_notch(&mut self, raw_y: f32, step: f32) -> Option<f32> {
+        use coords::WHEEL_NOTCH_POINTS;
         if self.wheel_accum != 0.0 && self.wheel_accum.signum() != raw_y.signum() {
             self.wheel_accum = 0.0;
         }
         self.wheel_accum += raw_y;
-        if self.wheel_accum.abs() < 120.0 {
+        if self.wheel_accum.abs() < WHEEL_NOTCH_POINTS {
             return None;
         }
         let step = step.clamp(1.05, 1.5);
         if self.wheel_accum > 0.0 {
-            self.wheel_accum -= 120.0;
-            if self.wheel_accum > 120.0 {
-                self.wheel_accum = 119.0;
+            self.wheel_accum -= WHEEL_NOTCH_POINTS;
+            if self.wheel_accum > WHEEL_NOTCH_POINTS {
+                self.wheel_accum = WHEEL_NOTCH_POINTS - 1.0;
             }
             Some(step)
         } else {
-            self.wheel_accum += 120.0;
-            if self.wheel_accum < -120.0 {
-                self.wheel_accum = -119.0;
+            self.wheel_accum += WHEEL_NOTCH_POINTS;
+            if self.wheel_accum < -WHEEL_NOTCH_POINTS {
+                self.wheel_accum = -(WHEEL_NOTCH_POINTS - 1.0);
             }
             Some(1.0 / step)
         }
@@ -2652,6 +2662,8 @@ impl CanvasState {
         if layer.is_folder || layer.is_adjustment() {
             return None;
         }
+        // Always show content preview (including eye-off). Thumbs sample hot tiles;
+        // cold park is deferred so hidden layers usually stay readable here.
         let rev = document.content_revision;
         let pending = self.layer_thumb_pending == Some(layer_idx);
         if let Some((cached_rev, tex)) = self.layer_thumbs.get(&layer_idx) {
@@ -2853,7 +2865,7 @@ pub(crate) use transform_free::*;
 pub(crate) use kruler::*;
 pub(crate) use transform_warp::*;
 pub(crate) use types::*;
-pub use coords::ZOOM_STEP;
+pub use coords::{WHEEL_NOTCH_POINTS, ZOOM_STEP};
 pub use types::{CropAspect, GradientSession, TransformMode, TransformSession};
 pub use view::CanvasView;
 

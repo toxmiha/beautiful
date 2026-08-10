@@ -71,7 +71,7 @@ pub enum DockSide {
 pub struct DockColumn {
     pub panels: Vec<PanelKind>,
     pub width: f32,
-    /// Relative vertical sizes of panels in this column (Blender-style splits).
+    /// Relative vertical sizes of panels in this column (stacked splits).
     #[serde(default)]
     pub weights: Vec<f32>,
 }
@@ -742,7 +742,7 @@ fn layout_path() -> PathBuf {
     PathBuf::from("beautiful-layout.json")
 }
 
-/// Blender-style corner action zone (no title bar). Drag to float/redock; RMB for menu.
+/// Corner action zone (no title bar). Drag to float/redock; RMB for menu.
 pub fn panel_corner_zone(
     ui: &mut egui::Ui,
     kind: PanelKind,
@@ -765,7 +765,7 @@ pub fn panel_corner_zone(
         } else {
             Color32::from_rgb(120, 120, 128)
         };
-        // Compact 2×4 grip (Blender-like corner widget).
+        // Compact 2×4 grip (corner widget).
         for row in 0..4 {
             for col in 0..2 {
                 let p = Pos2::new(
@@ -863,7 +863,7 @@ pub fn panel_corner_zone(
                 egui::Align2::CENTER_CENTER,
                 kind.title(),
                 egui::FontId::proportional(12.0),
-                crate::theme::TEXT,
+                crate::theme::text(),
             );
         }
     }
@@ -878,7 +878,7 @@ pub fn floating_grip_strip(ui: &mut egui::Ui, kind: PanelKind, dock: &mut DockLa
     let fill = if dragging || response.hovered() {
         crate::theme::BG_HOVER
     } else {
-        crate::theme::BG_MENU_ITEM
+        crate::theme::bg_menu_item()
     };
     ui.painter().rect_filled(rect, 3.0, fill);
     let grip = Color32::from_rgb(150, 150, 158);
@@ -943,7 +943,7 @@ pub fn floating_grip_strip(ui: &mut egui::Ui, kind: PanelKind, dock: &mut DockLa
     dirty
 }
 
-/// Vertical resize handle between two stacked panels (Blender area edge).
+/// Vertical resize handle between two stacked panels.
 pub fn panel_splitter(
     ui: &mut egui::Ui,
     side: DockSide,
@@ -958,7 +958,7 @@ pub fn panel_splitter(
     let fill = if hovered {
         crate::theme::ACCENT
     } else {
-        crate::theme::STROKE
+        crate::theme::stroke()
     };
     ui.painter().rect_filled(
         Rect::from_center_size(rect.center(), Vec2::new(rect.width() * 0.55, 2.0)),

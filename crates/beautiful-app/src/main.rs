@@ -1,17 +1,23 @@
+// No attached console on Windows (double-click / Steam launch).
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod action_log;
 mod addons;
 mod app;
 mod autosave;
+mod brush_nodes;
 mod brush_stroke_preview;
 mod canvas;
 mod canvas_gpu;
 mod clipboard_image;
+mod curve_ui;
 mod debug_flags;
 mod discord_rpc;
 mod dock;
 mod file;
 mod file_browser;
 mod file_drop;
+mod filter_studio;
 mod gallery;
 mod icons;
 mod keymap;
@@ -19,6 +25,7 @@ mod mcp_bridge;
 mod navigator;
 mod new_canvas;
 mod open_canvas;
+mod os_win;
 mod palette;
 mod pen_input;
 mod perf;
@@ -26,12 +33,14 @@ mod perf_ui;
 mod prefs_ui;
 mod resources;
 mod settings;
+mod splash;
 mod stroke_input;
 mod theme;
 mod tool_session;
 mod ui;
 mod ui_fonts;
 mod ui_kit;
+mod update_check;
 mod workspace;
 
 use app::BeautifulApp;
@@ -47,11 +56,12 @@ fn main() -> eframe::Result {
         &format!("action_log={}", action_log::path_string()),
     );
     debug_flags::log_active_flags();
+    beautiful_core::warm_srgb_luts();
 
     let args: Vec<String> = std::env::args().collect();
     let mcp = mcp_bridge::McpBridge::maybe_start(&args);
 
-    let opaque = debug_flags::opaque_window();
+    let opaque = debug_flags::opaque_window() || !os_win::dwm_backdrop_supported();
 
     // Stack: winit event loop (via eframe) → egui → wgpu.
     // Brush stamps run in `App::raw_input_hook` at the start of each frame.
@@ -82,20 +92,42 @@ fn main() -> eframe::Result {
         );
     }
 
+    // Restore main window geometry (menus live in the custom title bar).
+    // Do NOT apply maximized here: with frameless + transparent/acrylic, boot-time
+    // maximize leaves a huge DWM backdrop while egui still paints the old inner size
+    // (UI card top-left, empty blur filling the rest of the screen).
+    let boot = settings::AppSettings::load();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Beautiful · Alpha 0.4.8")
+        .with_decorations(false)
+        .with_min_inner_size([960.0, 640.0])
+        .with_transparent(!opaque);
+    if let Some([w, h]) = boot.window_inner_size {
+        if w >= 960.0 && h >= 640.0 {
+            viewport = viewport.with_inner_size([w, h]);
+        } else {
+            viewport = viewport.with_inner_size([1280.0, 800.0]);
+        }
+    } else {
+        viewport = viewport.with_inner_size([1280.0, 800.0]);
+    }
+    if let Some([x, y]) = boot.window_outer_pos {
+        // Ignore wildly off-screen positions from a removed monitor.
+        if x.is_finite() && y.is_finite() && x > -8000.0 && y > -8000.0 {
+            viewport = viewport.with_position([x, y]);
+        }
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Beautiful · Alpha 0.4.7")
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([960.0, 640.0])
-            .with_transparent(!opaque),
+        viewport,
         // NativeOptions.vsync is glow-only; wgpu reads present_mode below.
         vsync: true,
         wgpu_options: WgpuConfiguration {
             // Fifo (vsync): caps present to display refresh. Mailbox kept the
             // GPU busy whenever request_repaint woke the loop (idle eye/chrome).
-            // Stroke path still feels fine — paint latency is CPU dab + upload.
+            // Latency 1 keeps brush ink closer to the OS cursor while stroking.
             present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: Some(2),
+            desired_maximum_frame_latency: Some(1),
             wgpu_setup: WgpuSetup::CreateNew(wgpu_setup),
             ..Default::default()
         },

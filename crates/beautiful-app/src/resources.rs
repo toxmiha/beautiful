@@ -60,14 +60,14 @@ impl ResourceStats {
             ui.label(
                 egui::RichText::new(format!("Drive {:.0}%", disk_frac * 100.0))
                     .small()
-                    .color(theme::TEXT_DIM),
+                    .color(theme::text_dim()),
             );
             paint_bar(ui, 88.0, disk_frac, theme::DISK_BAR);
             ui.add_space(8.0);
             ui.label(
                 egui::RichText::new(format!("Mem {:.0}%", ram_frac * 100.0))
                     .small()
-                    .color(theme::TEXT_DIM),
+                    .color(theme::text_dim()),
             );
             paint_bar(ui, 88.0, ram_frac, theme::MEM_BAR);
         });

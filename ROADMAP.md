@@ -73,7 +73,7 @@ _Статусы сверены с кодом: 2026-08-01._
 | ID | Задача | Status | Notes |
 |----|--------|--------|-------|
 | P4-1 | Multiplayer / общие холсты | Todo | После стабильного P0–P1 |
-| P4-2 | Array как модификатор Blender | Todo | |
+| P4-2 | Array как модификатор объектов | Todo | |
 | P4-3 | Вектор (опционально) | Todo | |
 | P4-4 | Режим анимации | Todo | Второй режим программы |
 | P4-5 | Порт на телефоны | Todo | **Только после** desktop polish |
@@ -85,11 +85,11 @@ _Статусы сверены с кодом: 2026-08-01._
 | Фича | Status |
 |------|--------|
 | Phase A ядро (кисть, стабилизатор, слои, UI) | Done |
-| Save/load TXMH, PNG/JPEG, PSD, peer2 import | Done |
+| Save/load TXMH, PNG/JPEG, PSD import | Done |
 | Undo/history | Done (края: mask/некоторые ops) |
 | Mesh / Distort / Free Transform | Done (polish crash/split) |
 | Correction layers + layer masks | Done |
-| Blend modes (Krita-ish) | Done |
+| Blend modes | Done |
 | Navigator, docks, gallery home | Done |
 | WinTab fallback | Todo (сейчас Windows Ink / egui pressure) |
 | Белый квадрат / acrylic workspace | Open bug (`WHITE_SQUARE_HANDOFF.md`) |

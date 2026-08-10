@@ -1,27 +1,25 @@
-//! Soft/hard circular brush tip — baked 2D dab mask (Krita/MyPaint-style).
+//! Soft/hard circular brush tip — radial coverage LUT (pro-app falloff).
 //!
 //! Soft falloff is a cosine profile that reaches **exactly 0 at the geometric
-//! radius** (Krita convention: brush diameter = visible support).
-//! A 1px AA fringe past `r` only anti-aliases an already-zero toe — it never
-//! truncates residual coverage (the old Gaussian toe was clipped at ~5% α).
+//! radius** (brush diameter = visible support). A 1px AA fringe past `r` only
+//! anti-aliases an already-zero toe — it never truncates residual coverage.
 //!
-//! Evaluating `cos`/`sqrt` per pixel on large soft brushes is expensive, so we
-//! bake a dense coverage mask once per quantized radius/hardness and sample it
-//! with bilinear filtering on the stamp hot path.
+//! Evaluating `cos`/`sqrt` per pixel is expensive, so we bake a 1D radial LUT
+//! once per quantized radius/hardness and sample it on the stamp hot path.
 
-/// Cached tip parameters with a radial LUT (bake aid) + 2D coverage mask.
+/// Cached tip parameters with a radial coverage LUT.
+///
+/// Stamp hot path samples this LUT (circular model). A dense 2D mask is no longer
+/// baked — bilinear of a baked disk was an approximation of the same radial falloff.
 #[derive(Debug, Clone, Default)]
 pub struct TipCache {
     radius: f32,
     hardness: f32,
     /// Half-extent of stamp bbox in pixels (includes 1px AA fringe).
     extent: i32,
-    /// Radial coverage samples: index ≈ `distance * lut_scale` (used while baking).
+    /// Radial coverage samples: index ≈ `distance * lut_scale`.
     lut: Vec<f32>,
     lut_scale: f32,
-    /// Row-major coverage, size `(2*extent+1)^2`, index `(iy+extent)*side+(ix+extent)`.
-    mask: Vec<f32>,
-    mask_side: i32,
 }
 
 /// Sub-pixel bins for the radial LUT (4 ⇒ 0.25px).
@@ -45,8 +43,7 @@ impl TipCache {
         if (self.radius - rq).abs() < 1e-6
             && (self.hardness - hq).abs() < 1e-6
             && self.extent > 0
-            && !self.mask.is_empty()
-            && self.mask_side == self.extent * 2 + 1
+            && self.lut.len() >= 2
         {
             return self.extent;
         }
@@ -72,21 +69,6 @@ impl TipCache {
         for (i, slot) in self.lut.iter_mut().enumerate() {
             let d = i as f32 / scale;
             *slot = Self::coverage_analytical(d, 0.0, rq, hq);
-        }
-
-        let side = self.extent * 2 + 1;
-        self.mask_side = side;
-        let side_u = side as usize;
-        self.mask.resize(side_u * side_u, 0.0);
-        let e = self.extent;
-        for iy in -e..=e {
-            let row = ((iy + e) as usize) * side_u;
-            let dy = iy as f32;
-            for ix in -e..=e {
-                let dx = ix as f32;
-                // Bake via radial LUT (sqrt once per mask texel, not per stamp pixel).
-                self.mask[row + (ix + e) as usize] = self.coverage_from_lut(dx, dy);
-            }
         }
         self.extent
     }
@@ -114,50 +96,54 @@ impl TipCache {
         r + 0.5
     }
 
-    /// Coverage 0..1 at offset from tip center to **pixel center** (bilinear mask).
+    /// Coverage 0..1 at offset from tip center to **pixel center**.
     #[inline]
     pub fn coverage_at(&self, dx: f32, dy: f32) -> f32 {
-        let d2 = dx * dx + dy * dy;
-        let outer = self.extent as f32;
-        if d2 >= outer * outer {
-            return 0.0;
-        }
-        if self.mask.is_empty() || self.mask_side <= 0 {
-            return self.coverage_from_lut(dx, dy);
-        }
-        let e = self.extent as f32;
-        let side = self.mask_side as usize;
-        // Bilinear sample in mask texel space (origin at mask center).
-        let fx = dx + e;
-        let fy = dy + e;
-        let x0 = fx.floor() as i32;
-        let y0 = fy.floor() as i32;
-        let tx = fx - x0 as f32;
-        let ty = fy - y0 as f32;
-        let sample = |x: i32, y: i32| -> f32 {
-            if x < 0 || y < 0 || x >= self.mask_side || y >= self.mask_side {
-                return 0.0;
-            }
-            self.mask[(y as usize) * side + x as usize]
-        };
-        let a = sample(x0, y0);
-        let b = sample(x0 + 1, y0);
-        let c = sample(x0, y0 + 1);
-        let d = sample(x0 + 1, y0 + 1);
-        let ab = a + (b - a) * tx;
-        let cd = c + (d - c) * tx;
-        ab + (cd - ab) * ty
+        self.coverage_from_lut(dx, dy)
+    }
+
+    /// Radial LUT / analytical coverage (circular tip model).
+    #[inline]
+    pub fn coverage_radial(&self, dx: f32, dy: f32) -> f32 {
+        self.coverage_from_lut(dx, dy)
+    }
+
+    /// Raw LUT + scale for stamp kernels that sample without TipMask indirection.
+    #[inline]
+    pub fn lut_params(&self) -> (&[f32], f32) {
+        (&self.lut, self.lut_scale)
     }
 
     #[inline]
     fn coverage_from_lut(&self, dx: f32, dy: f32) -> f32 {
         let d2 = dx * dx + dy * dy;
+        let r = self.radius.max(0.5);
+        let h = self.hardness;
+
+        // Hard disk: avoid LUT; core without sqrt.
+        if h >= 0.999 {
+            let r_aa = r + 0.5;
+            if d2 >= r_aa * r_aa {
+                return 0.0;
+            }
+            let r_in = (r - 0.5).max(0.0);
+            if d2 <= r_in * r_in {
+                return 1.0;
+            }
+            return (r_aa - d2.sqrt()).clamp(0.0, 1.0);
+        }
+
         let outer = self.extent as f32;
         if d2 >= outer * outer {
             return 0.0;
         }
         if self.lut.len() < 2 || self.lut_scale <= 0.0 {
             return Self::coverage_analytical(dx, dy, self.radius, self.hardness);
+        }
+        // Soft opaque core without sqrt when clearly inside.
+        let core = r * h;
+        if core > 0.5 && d2 <= (core - 0.25).max(0.0).powi(2) {
+            return 1.0;
         }
         let d = d2.sqrt();
         let f = d * self.lut_scale;
@@ -202,7 +188,7 @@ impl TipCache {
         }
 
         // Soft skirt: raised cosine from core → r (exactly 0 at r).
-        // Equivalent to Krita "soft round" diameter = brush size.
+        // Soft round: diameter equals brush size.
         if d >= r {
             return 0.0;
         }
@@ -275,11 +261,15 @@ mod tests {
     }
 
     #[test]
-    fn mask_side_matches_extent() {
+    fn lut_covers_extent() {
         let mut tip = TipCache::default();
         let e = tip.ensure(64.0, 0.0);
-        assert_eq!(tip.mask_side, e * 2 + 1);
-        assert_eq!(tip.mask.len(), (tip.mask_side as usize).pow(2));
+        assert!(e >= 64);
+        let (lut, scale) = tip.lut_params();
+        assert!(lut.len() >= 2);
+        assert!(scale > 0.0);
+        // Outer sample past geometric radius is ~0.
+        assert!(tip.coverage_radial(e as f32, 0.0) < 0.02);
     }
 
     #[test]
