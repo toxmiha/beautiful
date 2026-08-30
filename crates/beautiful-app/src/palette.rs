@@ -1442,8 +1442,12 @@ fn build_sv_square_mesh(hue: f32, half: f32) -> Mesh {
     mesh
 }
 
-fn triangle_verts(hue_deg: f32, r: f32) -> (Vec2, Vec2, Vec2) {
-    let tip_a = hue_deg.to_radians();
+fn triangle_verts(_hue_deg: f32, r: f32) -> (Vec2, Vec2, Vec2) {
+    // Fixed orientation: hue at the top, white/black at the base.
+    // Recolor by hue; do not spin the triangle with the ring marker.
+    // Fixed orientation (does not spin with hue): hue vertex at 3 o'clock,
+    // white/black edge on the left — typical HSV triangle inside a wheel.
+    let tip_a = 0.0;
     let hue = Vec2::angled(tip_a) * r;
     let white = Vec2::angled(tip_a + 2.0943951) * r;
     let black = Vec2::angled(tip_a - 2.0943951) * r;

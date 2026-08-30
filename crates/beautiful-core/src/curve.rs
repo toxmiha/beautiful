@@ -196,6 +196,32 @@ impl TransferCurve {
         CurveLut { samples }
     }
 
+    /// 8-bit LUT: input byte → output byte (for RGB tone curves).
+    pub fn bake_u8(&self) -> [u8; 256] {
+        if self.is_identity() {
+            let mut lut = [0u8; 256];
+            for (i, v) in lut.iter_mut().enumerate() {
+                *v = i as u8;
+            }
+            return lut;
+        }
+        let lutf = self.bake();
+        let mut lut = [0u8; 256];
+        for (i, v) in lut.iter_mut().enumerate() {
+            *v = (lutf.sample(i as f32 / 255.0) * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+        lut
+    }
+
+    pub fn hash_points<H: std::hash::Hasher>(&self, h: &mut H) {
+        use std::hash::Hash;
+        self.points.len().hash(h);
+        for p in &self.points {
+            p.x.to_bits().hash(h);
+            p.y.to_bits().hash(h);
+        }
+    }
+
     pub fn add_point(&mut self, x: f32, y: f32) -> usize {
         let x = x.clamp(0.015, 0.985);
         let y = y.clamp(0.0, 1.0);

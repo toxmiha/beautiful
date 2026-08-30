@@ -14,9 +14,69 @@ impl CanvasView {
         zoom_step: f32,
         zoom_smooth: bool,
         temp_hand_down: bool,
+        pan_speed: f32,
+        pan_speed_shift: f32,
+        gpu_tex_side: u32,
+        keymap: &crate::keymap::Keymap,
+        pad: &crate::gamepad::GamepadFrame,
     ) {
-        let doc_w = document.width as f32;
-        let doc_h = document.height as f32;
+        let cap = beautiful_core::clamp_gpu_tex_side(gpu_tex_side);
+        if state.gpu_tex_side != cap {
+            state.gpu_tex_side = cap;
+            state.gpu_invalidate = true;
+            state.dirty = true;
+        }
+        state.touch_cfg = keymap.touch.clone();
+        let crop_view = matches!(*tool_mut, WorkspaceTool::Crop);
+        let (canvas_w, canvas_h) = if crop_view {
+            (document.width, document.height)
+        } else {
+            document.canvas_size()
+        };
+        let (stage_ox, stage_oy) = if crop_view {
+            (0.0, 0.0)
+        } else {
+            document.canvas_origin()
+        };
+        let doc_w = canvas_w as f32;
+        let doc_h = canvas_h as f32;
+        if crop_view && !state.crop_session_active {
+            let stage = document.stage_bounds();
+            state.crop_rect = Some(SelectionRect {
+                x0: stage.x as f32,
+                y0: stage.y as f32,
+                x1: (stage.x + stage.w) as f32,
+                y1: (stage.y + stage.h) as f32,
+            });
+            state.crop_session_active = true;
+            // Cover grows to full buffer — gap-fill missing tiles; do not wipe.
+            state.request_cover_refresh();
+        } else if !crop_view && state.crop_session_active {
+            state.crop_session_active = false;
+            state.crop_drag = None;
+            state.request_cover_refresh();
+        } else if !crop_view {
+            state.crop_session_active = false;
+            state.crop_drag = None;
+        }
+        // Pasteboard buffer size change invalidates tile keys; stage-only moves do not.
+        let display_geom = (
+            document.width,
+            document.height,
+            document.stage.map(|s| (s.x, s.y, s.w, s.h)),
+        );
+        if state.last_display_geom != Some(display_geom) {
+            if let Some((ow, oh, _)) = state.last_display_geom {
+                if ow != document.width || oh != document.height {
+                    state.invalidate_display_tiles();
+                    // Epoch wipe needs an immediate cover refill (not crawl).
+                    state.request_cover_refresh();
+                } else {
+                    state.request_cover_refresh();
+                }
+            }
+            state.last_display_geom = Some(display_geom);
+        }
         // Entering Transform/Warp starts a session. Kruler only after rect select + Enter/panel.
         if matches!(*tool_mut, WorkspaceTool::Transform | WorkspaceTool::Warp)
             && document.selection.rect.is_some()
@@ -42,8 +102,7 @@ impl CanvasView {
         ui.horizontal(|ui| {
             ui.set_min_height(22.0);
             ui.label(
-                crate::theme::label_dim(format!("{}×{}", document.width, document.height))
-                    .monospace(),
+                crate::theme::label_dim(format!("{}×{}", canvas_w, canvas_h)).monospace(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if crate::theme::small_btn(ui, crate::theme::label("Fit")).clicked() {
@@ -98,8 +157,7 @@ impl CanvasView {
                 )
                 .clicked()
                 {
-                    document.view_flip_h = !document.view_flip_h;
-                    document.touch();
+                    state.toggle_view_flip_h(document);
                 }
 
                 // stabilizer dropdown on the canvas chrome.
@@ -121,6 +179,40 @@ impl CanvasView {
                             }
                         }
                     });
+
+                // RTL: allocated after Stab → sits to its left (Undo | Redo | Stab).
+                if crate::icons::icon_button(
+                    ui,
+                    crate::icons::ToolIcon::Redo,
+                    false,
+                    "Redo",
+                )
+                .clicked()
+                {
+                    document.redo();
+                    state.clear_drawing_gesture(document);
+                    state.mark_dirty();
+                    state.defer_nav_thumbs();
+                }
+                if crate::icons::icon_button(
+                    ui,
+                    crate::icons::ToolIcon::Undo,
+                    false,
+                    "Undo",
+                )
+                .clicked()
+                {
+                    if state.cancel_sel_pixel_move(document) {
+                        state.clear_drawing_gesture(document);
+                        state.mark_dirty();
+                        state.defer_nav_thumbs();
+                    } else {
+                        document.undo();
+                        state.clear_drawing_gesture(document);
+                        state.mark_dirty();
+                        state.defer_nav_thumbs();
+                    }
+                }
             });
         });
 
@@ -128,7 +220,7 @@ impl CanvasView {
         let available = ui.available_size();
         let fit = (available.x / doc_w)
             .min(available.y / doc_h)
-            .clamp(0.05, 64.0);
+            .clamp(0.05, crate::canvas::zoom_max_for_doc(doc_w, doc_h));
 
         if state.zoom <= 0.0 {
             state.zoom = fit;
@@ -137,59 +229,151 @@ impl CanvasView {
         let (viewport, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
         let view_center = viewport.center();
         state.last_viewport = viewport;
+        let dt = ctx.input(|i| i.stable_dt).clamp(1.0 / 240.0, 0.05);
+        super::gamepad_paint::tick_cursor(state, pad, keymap, viewport, dt);
 
         let mut zoom_applied = false;
+        let mut pinch_nav = false;
+        let now = ctx.input(|i| i.time);
+        let fallback_pan = if state.nav_locked(now) || !state.allow_touch_nav(now) {
+            let _ = state.take_pending_touch_pan();
+            Vec2::ZERO
+        } else {
+            state.take_pending_touch_pan()
+        };
+        if fallback_pan.length() > 0.01 {
+            pinch_nav = true;
+            state.pan += fallback_pan;
+            state.abort_paint_for_navigation(document);
+        }
+        if let Some(mt) = ctx.multi_touch() {
+            if mt.num_touches >= 2 && state.allow_touch_nav(now) {
+                pinch_nav = true;
+                // Prefer egui's multi-touch translation when present; fallback pan
+                // already applied above from raw Touch ids (Steam Deck).
+                if fallback_pan.length() <= 0.01 {
+                    state.pan += mt.translation_delta;
+                    state.touch_gesture_travel += mt.translation_delta.length();
+                }
+                state.touch_gesture_travel += (mt.zoom_delta - 1.0).abs() * 80.0;
+                state.touch_gesture_travel += mt.rotation_delta.abs() * 40.0;
+                if (mt.zoom_delta - 1.0).abs() > 1e-4 {
+                    state.zoom_toward(
+                        mt.zoom_delta,
+                        Some(mt.start_pos),
+                        view_center,
+                        doc_w,
+                        doc_h,
+                    );
+                    zoom_applied = true;
+                }
+                if mt.rotation_delta.abs() > 1e-5 {
+                    state.rotation_deg += mt.rotation_delta.to_degrees();
+                    state.mark_dirty();
+                }
+                state.abort_paint_for_navigation(document);
+            }
+        }
+        if !pinch_nav {
+            if let Some(cmd) = state.take_touch_tap_command(now) {
+                match cmd {
+                    super::TouchTapCmd::Undo => {
+                        if document.undo() {
+                            state.clear_drawing_gesture(document);
+                            state.mark_dirty();
+                        }
+                    }
+                    super::TouchTapCmd::Redo => {
+                        if document.redo() {
+                            state.clear_drawing_gesture(document);
+                            state.mark_dirty();
+                        }
+                    }
+                }
+            }
+        }
+
         let step = zoom_step.clamp(1.05, 1.5);
         if response.hovered() || state.is_drawing {
-            let raw_y = ctx.input(|i| i.raw_scroll_delta.y);
-            if raw_y.abs() > 0.01 {
-                // Always consume so desk/navigator don't fight the same wheel.
+            let (raw_scroll, line_zoom) = ctx.input(|i| {
+                let mut line = false;
+                for ev in &i.events {
+                    if let egui::Event::MouseWheel { unit, .. } = ev {
+                        line |= matches!(
+                            unit,
+                            egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page
+                        );
+                    }
+                }
+                (i.raw_scroll_delta, line || i.modifiers.ctrl)
+            });
+            if raw_scroll.x.abs() > 0.01 || raw_scroll.y.abs() > 0.01 {
                 ctx.input_mut(|i| {
                     i.raw_scroll_delta = Vec2::ZERO;
                     i.smooth_scroll_delta = Vec2::ZERO;
                 });
-                if state.accept_zoom_delta(raw_y) {
-                    // Live cursor each notch (cursor-follow). Prefer hover, then interact,
-                    // then last-good — never silently fall back to center mid-gesture.
-                    let sample = response
-                        .hover_pos()
-                        .or_else(|| response.interact_pointer_pos())
-                        .or_else(|| ctx.input(|i| i.pointer.latest_pos()))
-                        .filter(|p| viewport.contains(*p));
-                    let cursor = state.resolve_zoom_pivot(sample);
-                    if zoom_smooth {
-                        let factor = step.powf(raw_y / crate::canvas::WHEEL_NOTCH_POINTS);
-                        if (factor - 1.0).abs() > 1e-5 {
+                if pinch_nav {
+                    // Pinch already applied translation/zoom.
+                } else if line_zoom {
+                    let raw_y = raw_scroll.y;
+                    if state.accept_zoom_delta(raw_y) {
+                        let sample = response
+                            .hover_pos()
+                            .or_else(|| response.interact_pointer_pos())
+                            .or_else(|| ctx.input(|i| i.pointer.latest_pos()))
+                            .filter(|p| viewport.contains(*p));
+                        let cursor = state.resolve_zoom_pivot(sample);
+                        if zoom_smooth {
+                            let factor = step.powf(raw_y / crate::canvas::WHEEL_NOTCH_POINTS);
+                            if (factor - 1.0).abs() > 1e-5 {
+                                let old_z = state.zoom;
+                                state.zoom_toward(factor, cursor, view_center, doc_w, doc_h);
+                                zoom_applied = true;
+                                crate::action_log::log(
+                                    "zoom",
+                                    &format!(
+                                        "smooth factor={factor:.4} zoom {old_z:.4}->{:.4}",
+                                        state.zoom
+                                    ),
+                                );
+                            }
+                        } else if let Some(factor) = state.poll_zoom_notch(raw_y, step) {
                             let old_z = state.zoom;
                             state.zoom_toward(factor, cursor, view_center, doc_w, doc_h);
                             zoom_applied = true;
                             crate::action_log::log(
                                 "zoom",
                                 &format!(
-                                    "smooth factor={factor:.4} zoom {old_z:.4}->{:.4}",
+                                    "notch factor={factor:.3} zoom {old_z:.4}->{:.4}",
                                     state.zoom
                                 ),
                             );
                         }
-                    } else if let Some(factor) = state.poll_zoom_notch(raw_y, step) {
-                        let old_z = state.zoom;
-                        state.zoom_toward(factor, cursor, view_center, doc_w, doc_h);
-                        zoom_applied = true;
-                        crate::action_log::log(
-                            "zoom",
-                            &format!(
-                                "notch factor={factor:.3} zoom {old_z:.4}->{:.4}",
-                                state.zoom
-                            ),
-                        );
                     }
                 }
+                // Point-unit wheel / PanGesture must NOT pan. Stylus hover on
+                // Windows is that event; adding it to `state.pan` made the
+                // document follow the cursor with no button down.
             }
         }
 
-        let space = temp_hand_down || matches!(tool, crate::ui::WorkspaceTool::Hand);
-        let panning = response.dragged_by(PointerButton::Middle)
-            || (space && response.dragged_by(PointerButton::Primary));
+        let text_typing = document.text_editing.is_some();
+        let space = !text_typing
+            && (temp_hand_down || matches!(tool, crate::ui::WorkspaceTool::Hand));
+        let mods = ctx.input(|i| i.modifiers);
+        let pan_btn = keymap
+            .mouse_binding(crate::keymap::MouseAction::Pan)
+            .and_then(|b| crate::keymap::pointer_from_str(&b.button))
+            .unwrap_or(PointerButton::Middle);
+        let pan_drag = response.dragged_by(pan_btn)
+            && ctx.input(|i| i.pointer.button_down(pan_btn))
+            && keymap.mouse_matches(crate::keymap::MouseAction::Pan, pan_btn, mods);
+        let panning = !pinch_nav
+            && !state.nav_locked(now)
+            && (pan_drag
+                || (space
+                    && response.dragged_by(PointerButton::Primary)
+                    && ctx.input(|i| i.pointer.button_down(PointerButton::Primary))));
 
         // Zoom tool: click zooms in, Alt+click zooms out toward cursor.
         if matches!(tool, crate::ui::WorkspaceTool::Zoom) && response.clicked() {
@@ -220,6 +404,8 @@ impl CanvasView {
                 | WorkspaceTool::Mixer
                 | WorkspaceTool::Eraser
                 | WorkspaceTool::Smudge
+                | WorkspaceTool::Blur
+                | WorkspaceTool::CloneBrush
                 | WorkspaceTool::SelectionBrush
                 | WorkspaceTool::SelectionEraser
         );
@@ -238,20 +424,51 @@ impl CanvasView {
         if panning {
             state.pan += response.drag_delta();
             state.mark_dirty();
-            if state.is_drawing {
-                let smudge = matches!(tool, WorkspaceTool::Smudge);
-                let _ = state.trajectory.flush(document, smudge);
-                document.end_stroke_undo();
-                state.nav_pending = true;
-                state.layer_thumb_pending = Some(document.active_layer);
-                state.thumbs_deferred = true;
+            state.abort_paint_for_navigation(document);
+        }
+
+        // Edge auto-pan only while creating a selection or a shape — not when a
+        // selection already exists and is sitting still.
+        let mut edge_panning = false;
+        if !space && !panning {
+            let (primary_held, shift_held, dt) = ctx.input(|i| {
+                (
+                    i.pointer.button_down(PointerButton::Primary),
+                    i.modifiers.shift,
+                    i.stable_dt.clamp(1.0 / 240.0, 0.05),
+                )
+            });
+            let creating_selection = primary_held
+                && ((matches!(
+                    tool,
+                    WorkspaceTool::SelectRect
+                        | WorkspaceTool::SelectEllipse
+                        | WorkspaceTool::Lasso
+                        | WorkspaceTool::Wand
+                ) && state.drag_doc_start.is_some())
+                    || (state.is_drawing
+                        && matches!(
+                            tool,
+                            WorkspaceTool::SelectionBrush | WorkspaceTool::SelectionEraser
+                        )));
+            let creating_shape = state.shape_drag.is_some();
+            if creating_selection || creating_shape {
+                if let Some(pos) = ctx
+                    .pointer_latest_pos()
+                    .or_else(|| response.interact_pointer_pos())
+                {
+                    let base = if shift_held {
+                        pan_speed_shift
+                    } else {
+                        pan_speed
+                    };
+                    if let Some(delta) = selection_edge_pan_delta(viewport, pos, base, dt) {
+                        state.pan += delta;
+                        state.mark_dirty();
+                        edge_panning = true;
+                    }
+                }
             }
-            state.is_drawing = false;
-            state.last_point = None;
-            state.trajectory.reset();
-            state.motion.reset();
-            document.stabilizer.reset();
-            document.stroke.end();
         }
 
         let canvas_center = view_center + state.pan;
@@ -266,20 +483,21 @@ impl CanvasView {
         );
 
         // Ctrl+drag / Move tool: float until deselect seals (common — not on mouse-up).
+        // Shift+Ctrl: Shift wins for selection Add — do not start pixel-move.
         if !space && !panning && !state.transform_editing() && !kruler_editing(state) {
-            let ctrl = ctx.input(|i| i.modifiers.ctrl);
+            let (ctrl, shift) = ctx.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
             let primary_held = ctx.input(|i| i.pointer.button_down(PointerButton::Primary));
             let primary_released = ctx.input(|i| i.pointer.button_released(PointerButton::Primary));
             let move_tool = matches!(tool, WorkspaceTool::Move);
-            let want_pixel_move = ctrl || move_tool;
+            let want_pixel_move = move_tool || (ctrl && !shift);
 
             if want_pixel_move
                 && primary_held
                 && state.sel_pixel_move.is_none()
-                && document.selection.rect.is_some()
             {
                 if let Some(pos) = response.interact_pointer_pos() {
-                    if let Some((x, y)) = screen_to_canvas(
+                    // Unbounded: allow starting a move near the edge; hit-test is in buffer space.
+                    if let Some((vx, vy)) = screen_to_doc_space(
                         pos,
                         rect,
                         doc_w,
@@ -287,7 +505,11 @@ impl CanvasView {
                         state.rotation_deg,
                         document.view_flip_h,
                     ) {
-                        if document.selection_contains(x, y) {
+                        let (x, y) = (vx + stage_ox, vy + stage_oy);
+                        let on_sel = document.selection.rect.is_some()
+                            && document.selection_contains(x, y);
+                        let auto_content = document.selection.rect.is_none();
+                        if on_sel || auto_content {
                             let idx = document
                                 .selection
                                 .floating_layer
@@ -321,6 +543,7 @@ impl CanvasView {
                                     last: (sx, sy),
                                     lifted: true,
                                     moved: false,
+                                    whole_layer: false,
                                 });
                             } else {
                                 let (sx, sy) = beautiful_core::snap_doc_xy(x, y);
@@ -332,6 +555,7 @@ impl CanvasView {
                                     last: (sx, sy),
                                     lifted: false,
                                     moved: false,
+                                    whole_layer: auto_content,
                                 });
                             }
                         }
@@ -340,13 +564,15 @@ impl CanvasView {
             }
 
             let mut sel_move_dirty = false;
+            let mut layer_nudge_resized = false;
             if let Some(sess) = state.sel_pixel_move.as_mut() {
                 if primary_held {
                     if let Some(pos) = ctx
                         .input(|i| i.pointer.latest_pos())
                         .or_else(|| response.interact_pointer_pos())
                     {
-                        if let Some((x, y)) = screen_to_canvas(
+                        // Must track past the plate — screen_to_canvas returns None off-canvas.
+                        if let Some((vx, vy)) = screen_to_doc_space(
                             pos,
                             rect,
                             doc_w,
@@ -354,15 +580,37 @@ impl CanvasView {
                             state.rotation_deg,
                             document.view_flip_h,
                         ) {
+                            let (x, y) = (vx + stage_ox, vy + stage_oy);
                             let dist = (x - sess.start.0).hypot(y - sess.start.1);
                             if !sess.lifted && dist >= 3.0 {
-                                let idx = sess.layer_idx;
-                                if let Some(r) = document.selection.rect {
+                                if sess.whole_layer {
+                                    let (sx, sy) = sess.start;
+                                    if !document.active_has_pixel_at(sx, sy) {
+                                        let _ = document.pick_layer_at(sx, sy);
+                                        sess.layer_idx = document.active_layer;
+                                        sess.before_tiles = document.layers[sess.layer_idx]
+                                            .tiles
+                                            .clone_shared();
+                                    }
+                                    let idx = sess.layer_idx;
+                                    if document
+                                        .layers
+                                        .get(idx)
+                                        .is_some_and(|l| l.tiles.painted_tile_count() > 0)
+                                    {
+                                        sess.lifted = true;
+                                        sess.moved = false;
+                                        sess.last = sess.start;
+                                        sel_move_dirty = true;
+                                    }
+                                } else if let Some(r) = document.selection.rect {
+                                    let idx = sess.layer_idx;
                                     document
                                         .selection
                                         .lift_from_layer(&mut document.layers[idx], idx);
-                                    document.selection.rect = Some(r);
-                                    // Empty float: skip footprint dirty (nothing changed on canvas).
+                                    if document.selection.rect.is_none() {
+                                        document.selection.rect = Some(r);
+                                    }
                                     if document
                                         .selection
                                         .floating
@@ -373,12 +621,44 @@ impl CanvasView {
                                     }
                                     sess.lifted = true;
                                     sess.moved = false;
-                                    let (sx, sy) = beautiful_core::snap_doc_xy(x, y);
-                                    sess.last = (sx, sy);
+                                    sess.last = beautiful_core::snap_doc_xy(x, y);
                                     sel_move_dirty = true;
                                 }
                             }
-                            if sess.lifted {
+                            if sess.lifted && sess.whole_layer {
+                                let (cx, cy) = beautiful_core::snap_doc_xy(x, y);
+                                let dx = (cx - sess.start.0).round() as i32;
+                                let dy = (cy - sess.start.1).round() as i32;
+                                let last_dx =
+                                    (sess.last.0 - sess.start.0).round() as i32;
+                                let last_dy =
+                                    (sess.last.1 - sess.start.1).round() as i32;
+                                if dx != last_dx || dy != last_dy {
+                                    let geom_before =
+                                        (document.width, document.height);
+                                    let (_, pad_l, pad_t, _, _) = document
+                                        .preview_layer_nudge(
+                                            sess.layer_idx,
+                                            &mut sess.before_tiles,
+                                            dx,
+                                            dy,
+                                        );
+                                    if pad_l != 0 || pad_t != 0 {
+                                        sess.start.0 += pad_l as f32;
+                                        sess.start.1 += pad_t as f32;
+                                    }
+                                    sess.last = beautiful_core::snap_doc_xy(
+                                        cx + pad_l as f32,
+                                        cy + pad_t as f32,
+                                    );
+                                    sess.moved = dx != 0 || dy != 0;
+                                    sel_move_dirty = true;
+                                    if (document.width, document.height) != geom_before
+                                    {
+                                        layer_nudge_resized = true;
+                                    }
+                                }
+                            } else if sess.lifted {
                                 let (cx, cy) = beautiful_core::snap_doc_xy(x, y);
                                 let (lx, ly) = beautiful_core::snap_doc_xy(sess.last.0, sess.last.1);
                                 let dx = cx - lx;
@@ -391,9 +671,46 @@ impl CanvasView {
                                         .as_ref()
                                         .is_some_and(|f| !f.is_visually_empty());
                                     document.move_floating_selection(dx, dy);
+                                    // Grow pasteboard while dragging off-plate (peer off-canvas).
+                                    let (ok, pad_l, pad_t, pad_r, pad_b) =
+                                        document.ensure_pasteboard_for_floating();
+                                    if ok && (pad_l | pad_t | pad_r | pad_b) != 0 {
+                                        sess.before_tiles.pad_margins(
+                                            pad_l, pad_t, pad_r, pad_b,
+                                        );
+                                        let pl = pad_l as f32;
+                                        let pt = pad_t as f32;
+                                        sess.start.0 += pl;
+                                        sess.start.1 += pt;
+                                        sess.last.0 += pl;
+                                        sess.last.1 += pt;
+                                        if let Some(r) = sess.undo_sel.rect.as_mut() {
+                                            r.x0 += pl;
+                                            r.x1 += pl;
+                                            r.y0 += pt;
+                                            r.y1 += pt;
+                                        }
+                                        if let Some(m) = sess.undo_sel.mask.as_mut() {
+                                            m.x += pl;
+                                            m.y += pt;
+                                        }
+                                        for path in &mut sess.undo_sel.outline {
+                                            for p in path {
+                                                p.0 += pl;
+                                                p.1 += pt;
+                                            }
+                                        }
+                                    }
                                     park_floating_to_pixels(document);
                                     sess.moved = true;
-                                    sess.last = (cx, cy);
+                                    // Pointer was in pre-expand buffer space; left/top pad shifts it.
+                                    let (ncx, ncy) = if (pad_l | pad_t) != 0 {
+                                        (cx + pad_l as f32, cy + pad_t as f32)
+                                    } else {
+                                        (cx, cy)
+                                    };
+                                    sess.last = beautiful_core::snap_doc_xy(ncx, ncy);
+                                    // Compact only on park/release — mid-drag shrink races expand.
                                     // Empty float: ants move without composite/upload wake.
                                     if had_pixels {
                                         sel_move_dirty = true;
@@ -407,16 +724,64 @@ impl CanvasView {
             if sel_move_dirty {
                 state.mark_dirty();
             }
+            if layer_nudge_resized {
+                state.invalidate_display_tiles();
+                state.request_cover_refresh();
+            }
 
-            if primary_released || (state.sel_pixel_move.is_some() && !ctrl && !move_tool) {
+            if primary_released || (state.sel_pixel_move.is_some() && !want_pixel_move) {
                 if let Some(sess) = state.sel_pixel_move.take() {
-                    if sess.lifted && sess.moved {
+                    if sess.whole_layer {
+                        if sess.lifted && sess.moved {
+                            document.commit_layer_nudge(sess.layer_idx, sess.before_tiles);
+                            let geom_before = (document.width, document.height);
+                            let _ = document.compact_pasteboard();
+                            if (document.width, document.height) != geom_before {
+                                state.invalidate_display_tiles();
+                                state.request_cover_refresh();
+                            }
+                            state.nav_pending = true;
+                            state.mark_dirty();
+                        } else if sess.lifted {
+                            document.cancel_layer_nudge(sess.layer_idx, &sess.before_tiles);
+                            state.nav_pending = true;
+                            state.mark_dirty();
+                        } else if ctrl && primary_released {
+                            if let Some(pos) = response.interact_pointer_pos() {
+                                if let Some((vx, vy)) = screen_to_canvas(
+                                    pos,
+                                    rect,
+                                    doc_w,
+                                    doc_h,
+                                    state.rotation_deg,
+                                    document.view_flip_h,
+                                ) {
+                                    let (x, y) = (vx + stage_ox, vy + stage_oy);
+                                    if document.pick_layer_at(x, y) {
+                                        state.pending_layer_pick = Some(document.active_layer);
+                                        state.mark_dirty();
+                                    }
+                                }
+                            }
+                        }
+                    } else if sess.lifted && sess.moved {
                         // Park floating — seal only on deselect, not mouse-up.
                         document.park_selection_float(
                             sess.layer_idx,
                             sess.before_tiles,
                             sess.undo_sel,
                         );
+                        // Empty pasteboard margins can collapse even while float is parked
+                        // (float must sit fully on the stage).
+                        let geom_before = (document.width, document.height);
+                        let _ = document.compact_pasteboard();
+                        if (document.width, document.height) != geom_before {
+                            // Buffer resized — epoch wipe + immediate cover refill.
+                            state.invalidate_display_tiles();
+                            state.request_cover_refresh();
+                        }
+                        // Same size: park_selection_float already dirtied the ROI —
+                        // no full-cover reload.
                         state.nav_pending = true;
                         state.mark_dirty();
                     } else if sess.lifted {
@@ -430,7 +795,7 @@ impl CanvasView {
                     } else if ctrl && primary_released {
                         // Click without drag → layer pick.
                         if let Some(pos) = response.interact_pointer_pos() {
-                            if let Some((x, y)) = screen_to_canvas(
+                            if let Some((vx, vy)) = screen_to_canvas(
                                 pos,
                                 rect,
                                 doc_w,
@@ -438,6 +803,7 @@ impl CanvasView {
                                 state.rotation_deg,
                                 document.view_flip_h,
                             ) {
+                                let (x, y) = (vx + stage_ox, vy + stage_oy);
                                 if document.pick_layer_at(x, y) {
                                     state.pending_layer_pick = Some(document.active_layer);
                                     state.mark_dirty();
@@ -447,7 +813,7 @@ impl CanvasView {
                     }
                 } else if ctrl && response.clicked_by(PointerButton::Primary) {
                     if let Some(pos) = response.interact_pointer_pos() {
-                        if let Some((x, y)) = screen_to_canvas(
+                        if let Some((vx, vy)) = screen_to_canvas(
                             pos,
                             rect,
                             doc_w,
@@ -455,6 +821,7 @@ impl CanvasView {
                             state.rotation_deg,
                             document.view_flip_h,
                         ) {
+                            let (x, y) = (vx + stage_ox, vy + stage_oy);
                             if document.pick_layer_at(x, y) {
                                 state.pending_layer_pick = Some(document.active_layer);
                                 state.mark_dirty();
@@ -466,10 +833,16 @@ impl CanvasView {
         }
 
         // Fill / Wand click tools — only on the document quad.
+        // Fill also stamps while dragging so it works as a fill brush.
+        let fill_drag = matches!(tool, WorkspaceTool::Fill)
+            && !space
+            && !panning
+            && response.is_pointer_button_down_on()
+            && ctx.input(|i| i.pointer.button_down(PointerButton::Primary));
         if matches!(tool, WorkspaceTool::Fill | WorkspaceTool::Wand)
             && !space
             && !panning
-            && response.clicked()
+            && (response.clicked() || fill_drag)
             && !ctx.input(|i| i.modifiers.ctrl)
         {
             if let Some(pos) = response.interact_pointer_pos() {
@@ -485,21 +858,39 @@ impl CanvasView {
                 ) {
                     match tool {
                         WorkspaceTool::Fill => {
-                            if document.require_paintable("Заливка") {
+                            let cell = (x.floor() as i32, y.floor() as i32);
+                            if state.last_fill_cell != Some(cell) && document.require_paintable("Заливка")
+                            {
                                 document.fill_at(x, y);
+                                state.last_fill_cell = Some(cell);
                                 state.mark_dirty();
                             }
                         }
                         WorkspaceTool::Wand => {
-                            let (shift, alt) = ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
-                            let op = SelectionCombine::from_modifiers(shift, alt);
-                            document.wand_at(x, y, op);
-                            state.mark_dirty();
+                            if response.clicked() {
+                                let (shift, alt) = ctx.input(|i| (i.modifiers.shift, i.modifiers.alt));
+                                let op = SelectionCombine::resolve(
+                                    state.sel_mode,
+                                    shift,
+                                    alt,
+                                    document.selection.is_active(),
+                                );
+                                if !matches!(op, SelectionCombine::Replace)
+                                    && document.selection.floating.is_some()
+                                {
+                                    document.flatten_floating_keep_selection();
+                                }
+                                document.wand_at(x, y, op);
+                                state.mark_dirty();
+                            }
                         }
                         _ => {}
                     }
                 }
             }
+        }
+        if !fill_drag {
+            state.last_fill_cell = None;
         }
 
         if matches!(tool, WorkspaceTool::Eyedropper) && !space && !panning {
@@ -535,6 +926,7 @@ impl CanvasView {
                 | WorkspaceTool::Mixer
                 | WorkspaceTool::Eraser
                 | WorkspaceTool::Smudge
+                | WorkspaceTool::Blur
         ) && !space
             && !panning
         {
@@ -569,14 +961,9 @@ impl CanvasView {
                     }
                 }
             }
-        }
-
-        if matches!(tool, WorkspaceTool::Gradient) && !space && !panning {
-            let shift = ctx.input(|i| i.modifiers.shift);
-            // Hit-test existing handles when session is active (not defining).
-            if response.drag_started_by(PointerButton::Primary) {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    if let Some(doc) = screen_to_canvas(
+            if pad.action_held(keymap, crate::keymap::GamepadAction::Eyedropper) {
+                if let Some(pos) = state.gamepad_cursor {
+                    if let Some((x, y)) = screen_to_canvas(
                         pos,
                         rect,
                         doc_w,
@@ -584,41 +971,74 @@ impl CanvasView {
                         state.rotation_deg,
                         document.view_flip_h,
                     ) {
-                        if let Some(sess) = state.gradient_session.as_mut() {
-                            if !sess.defining {
-                                let hit_r = (12.0 / state.zoom.max(0.01)).max(6.0);
-                                let ds = (doc.0 - sess.start.0).hypot(doc.1 - sess.start.1);
-                                let de = (doc.0 - sess.end.0).hypot(doc.1 - sess.end.1);
-                                if ds <= hit_r && ds <= de {
-                                    sess.drag = Some(GradientHandle::Start);
-                                } else if de <= hit_r {
-                                    sess.drag = Some(GradientHandle::End);
+                        apply_canvas_eyedrop(document, x, y);
+                    }
+                }
+            }
+        }
+
+        if matches!(tool, WorkspaceTool::Gradient) && !space && !panning {
+            let shift = ctx.input(|i| i.modifiers.shift);
+            // Hit-test existing handles when session is active (not defining).
+            if response.drag_started_by(PointerButton::Primary) {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let on_viewport = !state.last_viewport.is_positive()
+                        || state.last_viewport.contains(pos);
+                    if on_viewport {
+                        if let Some(doc) = screen_to_doc_space(
+                            pos,
+                            rect,
+                            doc_w,
+                            doc_h,
+                            state.rotation_deg,
+                            document.view_flip_h,
+                        ) {
+                            if let Some(sess) = state.gradient_session.as_mut() {
+                                if !sess.defining {
+                                    let hit_r = (12.0 / state.zoom.max(0.01)).max(6.0);
+                                    let ds = (doc.0 - sess.start.0).hypot(doc.1 - sess.start.1);
+                                    let de = (doc.0 - sess.end.0).hypot(doc.1 - sess.end.1);
+                                    if ds <= hit_r && ds <= de {
+                                        sess.drag = Some(GradientHandle::Start);
+                                    } else if de <= hit_r {
+                                        sess.drag = Some(GradientHandle::End);
+                                    } else {
+                                        // Restart define — GPU preview only; layer stays pristine.
+                                        let idx = sess.layer_idx;
+                                        let before = sess.layer_before.clone_shared();
+                                        let clip = sess.clip.clone();
+                                        let cpu_preview = sess.cpu_preview;
+                                        *sess = GradientSession {
+                                            layer_idx: idx,
+                                            layer_before: before,
+                                            start: doc,
+                                            end: doc,
+                                            defining: true,
+                                            drag: None,
+                                            clip,
+                                            cpu_preview,
+                                        };
+                                    }
+                                }
+                            } else {
+                                if !document.require_paintable("Градиент") {
+                                    // Text / folder / lock / hidden — no session.
                                 } else {
-                                    // Restart define — GPU preview only; layer stays pristine.
-                                    let idx = sess.layer_idx;
-                                    let before = sess.layer_before.clone_shared();
-                                    *sess = GradientSession {
+                                    let idx = document.active_layer;
+                                    let before = document.layers[idx].tiles.clone_shared();
+                                    document.selection.ensure_mask();
+                                    let clip = gradient_clip_from_document(document);
+                                    state.gradient_session = Some(GradientSession {
                                         layer_idx: idx,
                                         layer_before: before,
                                         start: doc,
                                         end: doc,
                                         defining: true,
                                         drag: None,
-                                    };
+                                        clip,
+                                        cpu_preview: false,
+                                    });
                                 }
-                            }
-                        } else {
-                            let idx = document.active_layer;
-                            if !document.layers.get(idx).is_some_and(|l| l.is_folder) {
-                                let before = document.layers[idx].tiles.clone_shared();
-                                state.gradient_session = Some(GradientSession {
-                                    layer_idx: idx,
-                                    layer_before: before,
-                                    start: doc,
-                                    end: doc,
-                                    defining: true,
-                                    drag: None,
-                                });
                             }
                         }
                     }
@@ -631,7 +1051,7 @@ impl CanvasView {
                     .input(|i| i.pointer.latest_pos())
                     .or_else(|| response.interact_pointer_pos());
                 if let Some(pos) = pos {
-                    if let Some(mut docp) = screen_to_canvas_clamped(
+                    if let Some(mut docp) = screen_to_doc_space(
                         pos,
                         rect,
                         doc_w,
@@ -667,15 +1087,18 @@ impl CanvasView {
                                     }
                                 }
                             }
-                            if document.selection.mask.is_some()
-                                || document.selection.rect.is_some()
+                            // Selection needs CPU clip only when there is no GPU overlay.
+                            if wgpu_rs.is_none()
+                                && (document.selection.mask.is_some()
+                                    || document.selection.rect.is_some())
                             {
                                 sel_preview = Some((sess.start, sess.end));
                             }
                         }
-                        // Selection clips only on the CPU path; refresh live preview.
                         if let Some((start, end)) = sel_preview {
                             if let Some(sess) = state.gradient_session.as_ref() {
+                                let start = document.view_to_buffer(start.0, start.1);
+                                let end = document.view_to_buffer(end.0, end.1);
                                 document.gradient_live_from(
                                     &sess.layer_before,
                                     start,
@@ -683,7 +1106,13 @@ impl CanvasView {
                                     false,
                                 );
                             }
+                            if let Some(sess) = state.gradient_session.as_mut() {
+                                sess.cpu_preview = true;
+                            }
                             state.mark_dirty();
+                        } else {
+                            // GPU overlay reads session ends — keep frames flowing while dragged.
+                            ctx.request_repaint();
                         }
                     }
                 }
@@ -708,15 +1137,21 @@ impl CanvasView {
             let shift = ctx.input(|i| i.modifiers.shift);
             if response.drag_started_by(PointerButton::Primary) {
                 if let Some(pos) = response.interact_pointer_pos() {
-                    if let Some(start) = screen_to_canvas(
-                        pos,
-                        rect,
-                        doc_w,
-                        doc_h,
-                        state.rotation_deg,
-                        document.view_flip_h,
-                    ) {
-                        state.shape_drag = Some(ShapeDragSession { start, end: start });
+                    let on_viewport = !state.last_viewport.is_positive()
+                        || state.last_viewport.contains(pos);
+                    if on_viewport {
+                        if let Some(start) = screen_to_doc_space(
+                            pos,
+                            rect,
+                            doc_w,
+                            doc_h,
+                            state.rotation_deg,
+                            document.view_flip_h,
+                        ) {
+                            if document.require_paintable("Shape") {
+                                state.shape_drag = Some(ShapeDragSession { start, end: start });
+                            }
+                        }
                     }
                 }
             }
@@ -726,7 +1161,7 @@ impl CanvasView {
                         .input(|i| i.pointer.latest_pos())
                         .or_else(|| response.interact_pointer_pos())
                     {
-                        if let Some(mut end) = screen_to_canvas_clamped(
+                        if let Some(mut end) = screen_to_doc_space(
                             pos,
                             rect,
                             doc_w,
@@ -758,8 +1193,10 @@ impl CanvasView {
             }
             if response.drag_stopped_by(PointerButton::Primary) {
                 if let Some(session) = state.shape_drag.take() {
-                    if (session.end.0 - session.start.0).hypot(session.end.1 - session.start.1) >= 1.0
-                        && document.draw_shape(session.start, session.end)
+                    let start = document.view_to_buffer(session.start.0, session.start.1);
+                    let end = document.view_to_buffer(session.end.0, session.end.1);
+                    if (end.0 - start.0).hypot(end.1 - start.1) >= 1.0
+                        && document.draw_shape(start, end)
                     {
                         state.mark_dirty();
                         state.nav_pending = true;
@@ -772,8 +1209,50 @@ impl CanvasView {
             state.shape_drag = None;
         }
 
-        if matches!(tool, WorkspaceTool::CloneStamp) && !space && !panning {
-            if response.clicked_by(PointerButton::Primary) && ctx.input(|i| i.modifiers.alt) {
+        if matches!(tool, WorkspaceTool::Text) && !space && !panning {
+            let (text_dirty, text_pixels) = crate::text_edit::handle_text_tool(
+                ctx,
+                &response,
+                document,
+                state,
+                rect,
+                doc_w,
+                doc_h,
+                space,
+                panning,
+            );
+            if text_dirty {
+                if state.text_underlay_frozen {
+                    if text_pixels {
+                        state.text_float_stale = true;
+                    }
+                    ctx.request_repaint();
+                } else {
+                    state.mark_dirty();
+                }
+            }
+            if document.text_editing.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
+        } else if document.text_editing.is_some() {
+            document.end_text_edit();
+            state.text_edit.clear_drag();
+            state.clear_text_overlay();
+            state.mark_dirty();
+        }
+        if state.text_underlay_frozen
+            && state.text_overlay_frozen_idx != document.text_overlay_idx
+        {
+            state.clear_text_overlay();
+            state.mark_dirty();
+        }
+
+        if matches!(tool, WorkspaceTool::CloneBrush) && !space && !panning {
+            let alt = ctx.input(|i| i.modifiers.alt);
+            let press = response.clicked_by(PointerButton::Primary)
+                || response.drag_started_by(PointerButton::Primary);
+
+            if press && alt {
                 state.clone_source = response.interact_pointer_pos().and_then(|pos| {
                     screen_to_canvas(
                         pos,
@@ -784,65 +1263,31 @@ impl CanvasView {
                         document.view_flip_h,
                     )
                 });
-            } else if response.drag_started_by(PointerButton::Primary)
-                && state.clone_source.is_some()
-            {
-                state.clone_anchor = response.interact_pointer_pos().and_then(|pos| {
-                    screen_to_canvas(
-                        pos,
-                        rect,
-                        doc_w,
-                        doc_h,
-                        state.rotation_deg,
-                        document.view_flip_h,
-                    )
-                });
-                document.begin_stroke_undo();
-                document.prepare_stroke_stack_view(state.view_dirty_rect(document));
-            }
-            if state.clone_anchor.is_some() && ctx.input(|i| i.pointer.primary_down()) {
-                if let (Some(source), Some(anchor), Some(pos)) = (
-                    state.clone_source,
-                    state.clone_anchor,
-                    response.interact_pointer_pos(),
-                ) {
-                    if let Some(target) = screen_to_canvas(
-                        pos,
-                        rect,
-                        doc_w,
-                        doc_h,
-                        state.rotation_deg,
-                        document.view_flip_h,
-                    ) {
-                        document.clone_stamp_dab(
-                            (
-                                source.0 + target.0 - anchor.0,
-                                source.1 + target.1 - anchor.1,
-                            ),
-                            target,
-                        );
-                        state.mark_dirty();
-                    }
+                state.clone_offset = None;
+                state.clone_preview_key = None;
+                if state.clone_source.is_some() {
+                    document.ui_notice =
+                        Some(("Clone source set — paint to stamp".into(), false));
                 }
-            }
-            if response.drag_stopped_by(PointerButton::Primary)
-                && state.clone_anchor.take().is_some()
-            {
-                document.end_stroke_undo();
-                state.nav_pending = true;
-                state.layer_thumb_pending = Some(document.active_layer);
-                state.thumbs_deferred = true;
+            } else if press && !alt && state.clone_source.is_none() {
+                document.ui_notice =
+                    Some(("Alt+click to set clone source first".into(), true));
             }
         }
 
-        let painter = ui.painter_at(paint_aabb.intersect(viewport));
+        // Overlays (selection, tools, gizmos) use the viewport clip so they stay
+        // visible on the pasteboard; paint/stamp paths still clip ink to stage.
+        let painter = ui.painter_at(viewport.intersect(ui.clip_rect()));
 
         let button_held =
             ctx.input(|i| i.pointer.button_down(PointerButton::Primary)) || state.lmb_down;
-        let eyedrop_hold = ctx.input(|i| {
-            i.modifiers.alt || i.pointer.button_down(PointerButton::Secondary)
-        });
-        let ctrl_sel_block = ctx.input(|i| i.modifiers.ctrl)
+        let eyedrop_hold = {
+            let alt_eyedrop = !matches!(tool, WorkspaceTool::CloneBrush)
+                && ctx.input(|i| i.modifiers.alt);
+            let rmb = ctx.input(|i| i.pointer.button_down(PointerButton::Secondary));
+            alt_eyedrop || rmb
+        };
+        let ctrl_sel_block = ctx.input(|i| i.modifiers.ctrl && !i.modifiers.shift)
             && document.selection.rect.is_some()
             && !matches!(
                 tool,
@@ -850,19 +1295,61 @@ impl CanvasView {
             );
         // Keep painting while LMB held even if pointer leaves the widget.
         // Alt / RMB = quick eyedrop — do not start or continue a stroke.
+        let clone_block = matches!(tool, WorkspaceTool::CloneBrush)
+            && (ctx.input(|i| i.modifiers.alt) || state.clone_source.is_none());
+        let paint_blocked = (!state.editing_mask && document.active_is_non_paintable())
+            || document.active_is_locked()
+            || document.active_is_hidden();
         let primary_down = can_paint
             && !space
             && !panning
             && button_held
             && !eyedrop_hold
+            && !clone_block
             && !ctrl_sel_block
+            && !paint_blocked
             && state.sel_pixel_move.is_none()
             && (state.is_drawing || response.is_pointer_button_down_on() || state.lmb_down);
         let primary_released = ctx.input(|i| i.pointer.button_released(PointerButton::Primary));
 
+        let (gp_pressure, gp_erase) = super::gamepad_paint::ink(pad, keymap);
+        let gp_eyedrop = pad.action_held(keymap, crate::keymap::GamepadAction::Eyedropper);
+        let gp_want = can_paint
+            && pad.connected
+            && !space
+            && !panning
+            && !paint_blocked
+            && !gp_eyedrop
+            && !clone_block
+            && state.sel_pixel_move.is_none()
+            && gp_pressure > 0.0
+            && document.text_editing.is_none();
+        let gp_released = state.gamepad_paint_down && !gp_want;
+        if gp_want {
+            if let Some(pos) = state.gamepad_cursor {
+                if super::gamepad_paint::stamp_at_screen(
+                    state,
+                    document,
+                    tool,
+                    pos,
+                    gp_pressure,
+                    gp_erase,
+                    rect,
+                    doc_w,
+                    doc_h,
+                ) {
+                    state.mark_dirty();
+                }
+            }
+            state.gamepad_paint_down = true;
+            ctx.request_repaint();
+        } else if gp_released && state.is_drawing {
+            super::gamepad_paint::end_stroke(state, document, tool);
+        }
+
         // ——— Input → brush FIRST (before texture upload / draw) ———
         // Prefer samples already stamped in `raw_input_hook` (before panel layout).
-        if primary_down && !state.stroke_input_done {
+        if primary_down && !state.stroke_input_done && !gp_want {
             let pressure = pen.sample_pressure(ctx);
             let samples = crate::stroke_input::collect_pointer_samples(
                 ctx,
@@ -878,17 +1365,40 @@ impl CanvasView {
 
             if !samples.is_empty() {
                 if !state.is_drawing {
+                    // Parked Ctrl+Move float: bake first so paint sticks and next move lifts it.
+                    if document.selection.floating.is_some()
+                        && !matches!(
+                            tool,
+                            WorkspaceTool::SelectionBrush | WorkspaceTool::SelectionEraser
+                        )
+                    {
+                        document.flatten_floating_keep_selection();
+                        state.mark_dirty();
+                    }
                     if !matches!(
                         tool,
                         WorkspaceTool::SelectionBrush | WorkspaceTool::SelectionEraser
                     ) {
-                        document.begin_stroke_undo();
+                        document.begin_stroke_undo_kind(super::demo_stroke_kind(
+                            tool,
+                            state.editing_mask,
+                        ));
                         document.prepare_stroke_stack_view(state.view_dirty_rect(document));
                     }
                     document.stabilizer.reset();
                     state.trajectory.reset();
                 }
-                let smudge = matches!(tool, WorkspaceTool::Smudge);
+                if matches!(tool, WorkspaceTool::CloneBrush) {
+                    if let Some(&(x, y, _)) = samples.first() {
+                        let _ = state.prepare_clone_stroke(document, (x, y));
+                    }
+                }
+                let stroke_kind = match tool {
+                    WorkspaceTool::Smudge => crate::stroke_input::LayerStrokeKind::Smudge,
+                    WorkspaceTool::Blur => crate::stroke_input::LayerStrokeKind::Blur,
+                    WorkspaceTool::CloneBrush => crate::stroke_input::LayerStrokeKind::Clone,
+                    _ => crate::stroke_input::LayerStrokeKind::Paint,
+                };
                 let mode = if state.editing_mask
                     && !matches!(
                         tool,
@@ -907,7 +1417,7 @@ impl CanvasView {
                         WorkspaceTool::SelectionEraser => {
                             crate::stroke_input::PaintMode::Selection { erase: true }
                         }
-                        _ => crate::stroke_input::PaintMode::Layer { smudge },
+                        _ => crate::stroke_input::PaintMode::Layer { kind: stroke_kind },
                     }
                 };
                 if crate::stroke_input::paint_samples_mode(
@@ -943,7 +1453,11 @@ impl CanvasView {
                         * 2.0)
                         .max(1.0);
                     let stub = (b.0 + stub_len, b.1, b.2 * 0.15);
-                    document.paint_polyline_ex(&[b, stub], true);
+                    if matches!(tool, WorkspaceTool::CloneBrush) {
+                        document.clone_brush_polyline(&[b, stub], true);
+                    } else {
+                        document.paint_polyline_ex(&[b, stub], true);
+                    }
                     state.mark_dirty();
                 }
             }
@@ -953,6 +1467,9 @@ impl CanvasView {
             state.is_drawing = false;
             state.last_point = None;
             state.shift_constrain_origin = None;
+            if matches!(tool, WorkspaceTool::CloneBrush) {
+                state.clone_anchor = None;
+            }
             state.lmb_down = false;
             state.motion.reset();
             state.trajectory.reset();
@@ -984,28 +1501,28 @@ impl CanvasView {
                     crate::canvas_gpu::invalidate(rs);
                     state.gpu_invalidate = false;
                 }
-                // Live gradient / Free Transform: freeze underlay, paint overlay —
+                // Live gradient / Transform: freeze underlay, paint overlay —
                 // skip composite/upload so FPS matches Gradient tool.
                 let xform_live = state.xform_live_overlay_active(document);
                 // Kruler exception: same skip as Transform overlay, own freeze flag.
                 let kruler_live = state.kruler_live_overlay_active(document);
+                let text_live = state.text_live_overlay_active(document);
                 // Never skip when LOD must change — otherwise mip tiles stay on the
                 // pre-lift plate while the underlay is frozen (zoom-dependent seams).
-                let want_lod = beautiful_core::lod_factor_for_document(
-                    state.zoom,
-                    state.display_lod,
-                    document.width,
-                    document.height,
-                );
+                let view_long = state.view_screen_long_px();
+                let want_lod = 1u32;
                 let lod_pending = want_lod != state.display_lod;
-                let skip_sync = (state.gradient_editing() || xform_live || kruler_live)
+                let skip_sync = (state.gradient_editing()
+                    || xform_live
+                    || kruler_live
+                    || text_live)
                     && !state.dirty
                     && !state.gpu_invalidate
                     && !lod_pending;
                 // Stage 2: hit-test/state still run above; no sync / GPU paint / present path.
                 let no_present = crate::debug_flags::no_canvas_present();
                 if !skip_sync && !no_present {
-                    let view = state.view_dirty_rect(document);
+                    let view = state.view_dirty_rect_ex(document, crop_view);
                     let live_paint = state.is_drawing;
                     // Coarsen only after zoom gesture idle; sharpen always steps.
                     let allow_coarsen = !state.coarsen_held() && !zoom_applied;
@@ -1019,7 +1536,15 @@ impl CanvasView {
                     let want_omit = state.should_omit_blend_above_for_underlay(document);
                     state.prepare_underlay_omit_transition(document, want_omit);
                     document.transform_omit_blend_above = want_omit;
-                    let synced = crate::canvas_gpu::sync_from_document(
+                    let sync_cover = view.padded(
+                        beautiful_core::DISPLAY_VIEW_PAD,
+                        document.width,
+                        document.height,
+                    );
+                    state.queue_newly_visible_stale(sync_cover);
+                    let tile_inv = std::mem::take(&mut state.gpu_tile_invalidate);
+                    let force_cover = std::mem::take(&mut state.gpu_force_cover_refresh);
+                    let present = crate::canvas_gpu::sync_from_document(
                         rs,
                         document,
                         state.zoom,
@@ -1028,28 +1553,62 @@ impl CanvasView {
                         live_paint,
                         view,
                         allow_coarsen,
+                        state.gpu_tex_side,
+                        view_long,
+                        state.dirty,
+                        state.display_tile_epoch,
+                        tile_inv,
+                        force_cover,
                     );
                     document.transform_omit_blend_above = false;
-                    let want = beautiful_core::lod_factor_for_document(
-                        state.zoom,
-                        state.display_lod,
-                        document.width,
-                        document.height,
-                    );
-                    if want != state.display_lod {
-                        // Still converging (one-octave steps, or coarsen hold).
-                        if want < state.display_lod {
-                            // Sharpen catch-up even during gesture hold.
+                    if !present.stale_outside_cover.is_empty() {
+                        state.gpu_tile_invalidate.union(present.stale_outside_cover);
+                    }
+                    if present.uploaded {
+                        state.dirty = false;
+                        // Live pending only — offscreen Dense backfill is paced in app.rs.
+                        // Treating offscreen as dirty here spun CPU/GPU tile upload at idle.
+                        if document.eye_fill_pending() {
                             state.dirty = true;
                             ui.ctx().request_repaint();
-                        } else if !allow_coarsen {
-                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
-                        } else {
+                        } else if document.eye_repaint_needed() {
+                            state.dirty = true;
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(
+                                beautiful_core::Document::EYE_WARM_REPAINT_MS,
+                            ));
+                        } else if document.composite.has_live_pending_work() {
                             state.dirty = true;
                             ui.ctx().request_repaint();
                         }
-                    } else if synced {
-                        state.dirty = false;
+                        state.tile_plate_lod = 1;
+                    }
+                    // Zoom-out hole fill: wake hard while cover incomplete (paced idle only).
+                    if let Some(rs) = wgpu_rs {
+                        let cover = beautiful_core::plan_display_frame(
+                            state.zoom,
+                            state.display_lod,
+                            document.width,
+                            document.height,
+                            allow_coarsen,
+                            view,
+                            &state.display_mip,
+                            state.gpu_tex_side,
+                            view_long,
+                            live_paint,
+                        )
+                        .cover;
+                        if !crate::canvas_gpu::display_tiles_ready(
+                            rs,
+                            cover,
+                            document.width,
+                            document.height,
+                        ) {
+                            // Forbidden: latch dirty from display_tiles_ready (idle + zoom thrash).
+                            ui.ctx()
+                                .request_repaint_after(std::time::Duration::from_millis(16));
+                        }
+                    }
+                    if present.uploaded {
                         // Upload above plate BEFORE freeze — otherwise we freeze with
                         // float-on-top and no z-order plate (looks like "поверх слоёв").
                         if document.selection.floating_overlay_only {
@@ -1075,13 +1634,34 @@ impl CanvasView {
                                 ui.ctx().request_repaint();
                             }
                         }
+                        if document.text_live_overlay_active() {
+                            let view = state.view_dirty_rect(document);
+                            document.ensure_text_overlay_plates(view);
+                            state.ensure_xform_above_tex(ctx, document);
+                            state.note_text_underlay_synced(document);
+                            if !state.text_underlay_frozen {
+                                document.composite.mark_full();
+                                state.dirty = true;
+                                ui.ctx().request_repaint();
+                            }
+                        }
                     } else if state.dirty {
                         // Underlay sync consumed force_full but GPU upload did not
                         // commit — re-arm so the next frame rebuilds the hole.
-                        if document.selection.floating_overlay_only {
+                        if document.selection.floating_overlay_only
+                            || document.text_live_overlay_active()
+                        {
                             document.composite.mark_full();
+                            ui.ctx().request_repaint();
+                        } else if document.composite.has_live_pending_work()
+                            || document.eye_fill_pending()
+                        {
+                            ui.ctx().request_repaint();
+                        } else {
+                            // Chrome-only dirty (marquee/lasso) — do not spin
+                            // request_repaint forever (~13% idle GPU/CPU).
+                            state.dirty = false;
                         }
-                        ui.ctx().request_repaint();
                     }
                 }
                 let canvas_aabb = paint_aabb;
@@ -1091,6 +1671,25 @@ impl CanvasView {
                     .intersect(viewport)
                     .intersect(ui.clip_rect());
                 if paint_rect.is_positive() && !no_present {
+                    let cover = state
+                        .view_dirty_rect_ex(document, crop_view)
+                        .padded(
+                            beautiful_core::DISPLAY_VIEW_PAD,
+                            document.width,
+                            document.height,
+                        );
+                    let display_tiles = true;
+                    let (expect_tex_w, expect_tex_h) = (1u32, 1u32);
+                    if !crate::canvas_gpu::display_tiles_ready(
+                        rs,
+                        cover,
+                        document.width,
+                        document.height,
+                    ) {
+                        // Pace tile fill — do not latch dirty forever (idle GPU thrash).
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(16));
+                    }
                     let canvas_params = crate::canvas_gpu::CanvasDrawParams {
                         viewport: paint_rect,
                         canvas_center,
@@ -1098,25 +1697,18 @@ impl CanvasView {
                         display_h,
                         rotation_deg: state.rotation_deg,
                         flip_h: document.view_flip_h,
-                        expect_tex_w: if state.display_lod > 1 {
-                            state.display_mip.width.max(1)
-                        } else {
-                            document.width
-                        },
-                        expect_tex_h: if state.display_lod > 1 {
-                            state.display_mip.height.max(1)
-                        } else {
-                            document.height
-                        },
+                        doc_w: document.width as f32,
+                        doc_h: document.height as f32,
+                        stage_ox,
+                        stage_oy,
+                        stage_w: doc_w,
+                        stage_h: doc_h,
+                        expect_tex_w,
+                        expect_tex_h,
+                        display_tiles,
+                        cover,
                     };
-                    let has_sel = document.selection.mask.is_some()
-                        || document.selection.rect.is_some();
-                    // GPU overlay paints full canvas — with a selection use the CPU
-                    // live path (already written into the layer) instead.
-                    let gradient = if has_sel {
-                        None
-                    } else {
-                        state.gradient_session.as_ref().and_then(|sess| {
+                    let gradient = state.gradient_session.as_ref().and_then(|sess| {
                             let len = (sess.end.0 - sess.start.0).hypot(sess.end.1 - sess.start.1);
                             if len < 1.0 {
                                 return None;
@@ -1147,9 +1739,9 @@ impl CanvasView {
                                 shape,
                                 interp,
                                 dither: document.gradient.dither,
+                                clip: sess.clip.clone(),
                             })
-                        })
-                    };
+                        });
                     // Free + Soft Light + lod1: Soft Light GPU pass (float + Soft Light).
                     let softlight = state.softlight_gpu_prepare(rs, document);
                     crate::canvas_gpu::paint_canvas(
@@ -1162,25 +1754,32 @@ impl CanvasView {
                 }
             } else {
                 state.ensure_texture(ctx, document);
-                if let Some(tex) = state.display_texture_id() {
-                    // Checker under transparent canvas (CPU path; GPU does this in shader).
-                    if document.background.a < 255 {
-                        paint_rotated_checker(
-                            &painter,
-                            canvas_center,
-                            egui::vec2(display_w, display_h),
-                            state.rotation_deg,
-                        );
-                    }
-                    paint_rotated_image(
+                if document.background.a < 255 {
+                    paint_rotated_checker(
                         &painter,
-                        tex,
                         canvas_center,
                         egui::vec2(display_w, display_h),
                         state.rotation_deg,
-                        document.view_flip_h,
                     );
                 }
+                let cover = state
+                    .view_dirty_rect_ex(document, crop_view)
+                    .padded(
+                        beautiful_core::DISPLAY_VIEW_PAD,
+                        document.width,
+                        document.height,
+                    );
+                state.paint_cpu_display_tiles_ex(
+                    &painter,
+                    canvas_center,
+                    display_w,
+                    display_h,
+                    state.rotation_deg,
+                    document.view_flip_h,
+                    document,
+                    cover,
+                    crop_view,
+                );
             }
         } else if let Some(rs) = wgpu_rs {
             // Still drop stale GPU resources so nothing leftover can paint.
@@ -1204,11 +1803,13 @@ impl CanvasView {
         }
         if crate::debug_flags::show_lod_debug() {
             let view = state.view_dirty_rect(document);
-            let want_lod = beautiful_core::lod_factor_for_document(
+            let want_lod = beautiful_core::lod_factor_for_document_with_view(
                 state.zoom,
                 state.display_lod,
                 document.width,
                 document.height,
+                state.gpu_tex_side,
+                state.view_screen_long_px(),
             );
             paint_lod_debug_overlay(
                 &painter,
@@ -1245,11 +1846,11 @@ impl CanvasView {
         if let Some(sel) = document.selection.rect {
             let time = 0.0; // static dashes — avoid continuous idle repaint
             let transform_edit = state.transform_editing();
-            let show_quick_mask = matches!(
+            let show_sel_tint = matches!(
                 tool,
                 WorkspaceTool::SelectionBrush | WorkspaceTool::SelectionEraser
             );
-            if show_quick_mask {
+            if show_sel_tint {
                 if let Some((texture, x, y, width, height)) =
                     state.selection_mask_texture_id(ctx, document)
                 {
@@ -1261,10 +1862,13 @@ impl CanvasView {
                         doc_w,
                         doc_h,
                         state.rotation_deg,
+                        document.view_flip_h,
                         x,
                         y,
                         width,
                         height,
+                        stage_ox,
+                        stage_oy,
                     );
                 }
             }
@@ -1281,22 +1885,23 @@ impl CanvasView {
                 state.ensure_xform_live_tex(ctx, document);
                 state.ensure_xform_above_tex(ctx, document);
             }
-            let free_transform = transform_edit
+            let scale_rotate_edit = transform_edit
                 && matches!(state.transform_mode, TransformMode::Free)
                 && matches!(tool, WorkspaceTool::Transform);
-            if free_transform {
+            if scale_rotate_edit {
                 if let (Some(fx), Some((_, bw, bh, _, _))) =
-                    (state.free_xform.as_ref(), state.transform_baseline.as_ref())
+                    (state.transform_pose.as_ref(), state.transform_baseline.as_ref())
                 {
                     if document.selection.floating_overlay_only {
                         // Soft Light GPU: float + Soft Light in wgpu pass.
                         // Else: egui float (+ Normal above plate). Soft cube removed.
                         if !state.softlight_gpu_drew {
-                            // Baked Nearest float drawn 1:1 in doc pixels (not stretched baseline).
-                            if let (Some(tex), Some(f)) = (
+                            // Viewport dest pixels (same inverse as Confirm), 1:1 blit.
+                            if let (Some(tex), Some((x, y, w, h, lod))) = (
                                 state.xform_live_tex.as_ref(),
-                                document.selection.floating.as_ref(),
+                                state.xform_pixel_meta,
                             ) {
+                                let lod = lod.max(1);
                                 paint_selection_mask_overlay_opacity(
                                     &painter,
                                     tex.id(),
@@ -1305,12 +1910,15 @@ impl CanvasView {
                                     doc_w,
                                     doc_h,
                                     state.rotation_deg,
-                                    f.x,
-                                    f.y,
-                                    f.width,
-                                    f.height,
+                                    document.view_flip_h,
+                                    x,
+                                    y,
+                                    w.saturating_mul(lod),
+                                    h.saturating_mul(lod),
                                     document.floating_transform_opacity(),
-                                );
+                        stage_ox,
+                        stage_oy,
+                    );
                             }
                             if !document.transform_above_needs_backdrop() {
                                 if let Some((tex, ox, oy, aw, ah, _)) =
@@ -1324,26 +1932,32 @@ impl CanvasView {
                                         doc_w,
                                         doc_h,
                                         state.rotation_deg,
+                                        document.view_flip_h,
                                         *ox as f32,
                                         *oy as f32,
                                         *aw,
                                         *ah,
-                                    );
+                        stage_ox,
+                        stage_oy,
+                    );
                                 }
                             }
                         }
                     }
-                    paint_free_transform_overlay(
+                    paint_transform_overlay(
                         &painter,
                         canvas_center,
                         egui::vec2(display_w, display_h),
                         doc_w,
                         doc_h,
                         state.rotation_deg,
+                        document.view_flip_h,
                         fx,
                         *bw,
                         *bh,
                         time,
+                        stage_ox,
+                        stage_oy,
                     );
                 } else if let Some(f) = &document.selection.floating {
                     paint_selection_overlay(
@@ -1353,6 +1967,7 @@ impl CanvasView {
                         doc_w,
                         doc_h,
                         state.rotation_deg,
+                        document.view_flip_h,
                         SelectionRect {
                             x0: f.x,
                             y0: f.y,
@@ -1362,6 +1977,8 @@ impl CanvasView {
                         tool,
                         time,
                         false,
+                        stage_ox,
+                        stage_oy,
                     );
                 }
             } else if kruler_editing(state) {
@@ -1385,12 +2002,15 @@ impl CanvasView {
                             doc_w,
                             doc_h,
                             state.rotation_deg,
+                            document.view_flip_h,
                             f.x,
                             f.y,
                             f.width,
                             f.height,
                             document.floating_transform_opacity(),
-                        );
+                        stage_ox,
+                        stage_oy,
+                    );
                     }
                     if !document.transform_above_needs_backdrop() {
                         if let Some((tex, ox, oy, aw, ah, _)) = state.xform_above_tex.as_ref() {
@@ -1402,48 +2022,60 @@ impl CanvasView {
                                 doc_w,
                                 doc_h,
                                 state.rotation_deg,
+                                document.view_flip_h,
                                 *ox as f32,
                                 *oy as f32,
                                 *aw,
                                 *ah,
-                            );
+                        stage_ox,
+                        stage_oy,
+                    );
                         }
                     }
                 }
                 if let Some((fx, bw, bh)) = kruler_handle_xform(state) {
-                    paint_free_transform_overlay(
+                    paint_transform_overlay(
                         &painter,
                         canvas_center,
                         egui::vec2(display_w, display_h),
                         doc_w,
                         doc_h,
                         state.rotation_deg,
+                        document.view_flip_h,
                         &fx,
                         bw,
                         bh,
                         time,
+                        stage_ox,
+                        stage_oy,
                     );
                 }
             } else if overlay_live {
-                // Distort / Mesh: Nearest-baked floating drawn 1:1 (no GPU mesh stretch).
-                if let (Some(tex), Some(f)) = (
-                    state.xform_live_tex.as_ref(),
-                    document.selection.floating.as_ref(),
-                ) {
-                    paint_selection_mask_overlay_opacity(
-                        &painter,
-                        tex.id(),
-                        canvas_center,
-                        egui::vec2(display_w, display_h),
-                        doc_w,
-                        doc_h,
-                        state.rotation_deg,
-                        f.x,
-                        f.y,
-                        f.width,
-                        f.height,
-                        document.floating_transform_opacity(),
+                // Distort / Mesh: viewport dest pixels (same inverse as Confirm).
+                if !state.softlight_gpu_drew {
+                    if let (Some(tex), Some((x, y, w, h, lod))) = (
+                        state.xform_live_tex.as_ref(),
+                        state.xform_pixel_meta,
+                    ) {
+                        let lod = lod.max(1);
+                        paint_selection_mask_overlay_opacity(
+                            &painter,
+                            tex.id(),
+                            canvas_center,
+                            egui::vec2(display_w, display_h),
+                            doc_w,
+                            doc_h,
+                            state.rotation_deg,
+                            document.view_flip_h,
+                            x,
+                            y,
+                            w.saturating_mul(lod),
+                            h.saturating_mul(lod),
+                            document.floating_transform_opacity(),
+                        stage_ox,
+                        stage_oy,
                     );
+                    }
                 }
                 if !document.transform_above_needs_backdrop() {
                     if let Some((tex, ox, oy, aw, ah, _)) = state.xform_above_tex.as_ref() {
@@ -1455,27 +2087,32 @@ impl CanvasView {
                             doc_w,
                             doc_h,
                             state.rotation_deg,
+                            document.view_flip_h,
                             *ox as f32,
                             *oy as f32,
                             *aw,
                             *ah,
-                        );
+                        stage_ox,
+                        stage_oy,
+                    );
                     }
                 }
-            } else if !document.selection.outline.is_empty() {
-                paint_lasso_overlay(
+            } else if beautiful_core::outline_is_ready(&document.selection.outline) {
+                paint_selection_rings(
                     &painter,
                     canvas_center,
                     egui::vec2(display_w, display_h),
                     doc_w,
                     doc_h,
                     state.rotation_deg,
+                    document.view_flip_h,
                     &document.selection.outline,
                     time,
-                    true,
+                    stage_ox,
+                    stage_oy,
                 );
             } else if let Some(f) = &document.selection.floating {
-                // Mesh/Distort owns the UI (blue grid). Skip Free Transform orange AABB corners.
+                // Mesh/Distort owns the UI (blue grid). Skip Transform orange AABB corners.
                 let mesh_ui = transform_edit
                     && matches!(
                         state.transform_mode,
@@ -1489,6 +2126,7 @@ impl CanvasView {
                         doc_w,
                         doc_h,
                         state.rotation_deg,
+                        document.view_flip_h,
                         SelectionRect {
                             x0: f.x,
                             y0: f.y,
@@ -1498,6 +2136,8 @@ impl CanvasView {
                         tool,
                         time,
                         false,
+                        stage_ox,
+                        stage_oy,
                     );
                 }
             } else if document.selection.lasso_points.len() >= 2 {
@@ -1508,10 +2148,13 @@ impl CanvasView {
                     doc_w,
                     doc_h,
                     state.rotation_deg,
+                    document.view_flip_h,
                     &document.selection.lasso_points,
                     time,
                     false,
-                );
+                        stage_ox,
+                        stage_oy,
+                    );
             } else {
                 let mesh_ui = transform_edit
                     && matches!(
@@ -1526,10 +2169,13 @@ impl CanvasView {
                         doc_w,
                         doc_h,
                         state.rotation_deg,
+                        document.view_flip_h,
                         sel,
                         tool,
                         time,
                         false,
+                        stage_ox,
+                        stage_oy,
                     );
                 }
             }
@@ -1542,24 +2188,30 @@ impl CanvasView {
                 doc_w,
                 doc_h,
                 state.rotation_deg,
+                document.view_flip_h,
                 &document.selection.lasso_points,
                 0.0,
                 false,
-            );
+                        stage_ox,
+                        stage_oy,
+                    );
             // Static lasso outline while idle.
         }
 
-        // Crop frame overlay
+        // Crop frame overlay (viewport clip — handles past canvas must stay visible).
+        // Crop plate is the full buffer; crop_rect is already buffer-space.
         if matches!(tool, WorkspaceTool::Crop) {
             if let Some(crop) = state.crop_rect {
                 let time = ctx.input(|i| i.time);
+                let crop_painter = ui.painter_at(viewport.intersect(ui.clip_rect()));
                 paint_crop_overlay(
-                    &painter,
+                    &crop_painter,
                     canvas_center,
                     egui::vec2(display_w, display_h),
                     doc_w,
                     doc_h,
                     state.rotation_deg,
+                    document.view_flip_h,
                     crop,
                     time,
                 );
@@ -1941,13 +2593,14 @@ impl CanvasView {
         }
 
         // Selection / transform tools
-        // Ctrl normally reserved for layer-pick; Mesh Warp uses Ctrl = Split Crosswise.
-        let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
+        // Ctrl alone = pixel move (blocks marquee). Shift+Ctrl = Add selection (Shift wins).
+        let (ctrl_held, shift_held) = ctx.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
         let mesh_ctrl_split = ctrl_held
             && (matches!(tool, WorkspaceTool::Warp)
                 || (matches!(tool, WorkspaceTool::Transform)
                     && state.transform_mode == TransformMode::Mesh));
-        if selection_tool && !space && !panning && (!ctrl_held || mesh_ctrl_split) {
+        let block_marquee_for_move = ctrl_held && !shift_held && !mesh_ctrl_split;
+        if selection_tool && !space && !panning && !pinch_nav && !block_marquee_for_move {
             handle_selection_input(
                 ctx,
                 &response,
@@ -1962,6 +2615,37 @@ impl CanvasView {
         }
 
         if !DEBUG_DISABLE_CANVAS_DRAW {
+            if matches!(tool, WorkspaceTool::CloneBrush) && state.clone_source.is_some() {
+                if let Some(pos) = ctx
+                    .pointer_latest_pos()
+                    .or_else(|| response.hover_pos())
+                    .or_else(|| response.interact_pointer_pos())
+                {
+                    if let Some(cursor_doc) = screen_to_canvas(
+                        pos,
+                        rect,
+                        doc_w,
+                        doc_h,
+                        state.rotation_deg,
+                        document.view_flip_h,
+                    ) {
+                        state.ensure_clone_preview_at(ctx, document, cursor_doc);
+                    }
+                }
+                paint_clone_brush_preview(
+                    ctx,
+                    &response,
+                    canvas_center,
+                    display_size,
+                    doc_w,
+                    doc_h,
+                    state.zoom,
+                    state.rotation_deg,
+                    document.view_flip_h,
+                    document,
+                    state,
+                );
+            }
             paint_brush_cursor(
                 ctx,
                 &painter,
@@ -1971,13 +2655,125 @@ impl CanvasView {
                 doc_h,
                 state.zoom,
                 state.rotation_deg,
+                document.view_flip_h,
                 document,
                 tool,
+                {
+                    let gp_overlay = if pad.connected {
+                        let (press, _) = super::gamepad_paint::ink(pad, keymap);
+                        let cursor_id = keymap
+                            .gamepad_binding(crate::keymap::GamepadAction::Cursor)
+                            .map(|b| b.button.as_str())
+                            .unwrap_or("StickR");
+                        let sticks_aim = matches!(
+                            keymap.gamepad_feel.draw_mode,
+                            crate::keymap::GamepadDrawMode::Sticks
+                        ) && pad.analog(cursor_id, keymap.gamepad_feel.deadzone)
+                            > 0.02;
+                        let eyedrop =
+                            pad.action_held(keymap, crate::keymap::GamepadAction::Eyedropper);
+                        let mouse_busy =
+                            response.hovered() || response.is_pointer_button_down_on();
+                        let center_rest = matches!(
+                            keymap.gamepad_feel.draw_mode,
+                            crate::keymap::GamepadDrawMode::Center
+                        ) && !mouse_busy;
+                        if press > 0.0
+                            || state.gamepad_paint_down
+                            || eyedrop
+                            || sticks_aim
+                            || center_rest
+                        {
+                            state.gamepad_cursor
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    gp_overlay
+                },
             );
         }
 
-        // Repaint while drawing / panning / zooming, or while LOD factor still lags zoom.
+        if document.text_editing.is_some()
+            && matches!(tool, WorkspaceTool::Text)
+        {
+            // Draw letters whenever the hole is armed — do not wait on freeze
+            // (a missed freeze left an empty punched stack).
+            if document.text_live_overlay_active() {
+                let view = state.view_dirty_rect(document);
+                document.ensure_text_overlay_plates(view);
+                state.ensure_xform_above_tex(ctx, document);
+                if let Some(idx) = document.text_overlay_idx {
+                    if let Some(payload) =
+                        document.layers.get(idx).and_then(|l| l.text.as_ref())
+                    {
+                        let opacity = (document.layers[idx].opacity.clamp(0.0, 1.0)
+                            * beautiful_core::ancestor_folder_opacity(
+                                &document.layers,
+                                idx,
+                            ))
+                        .clamp(0.0, 1.0);
+                        let doc_view = {
+                            let r = state.visible_doc_rect(doc_w, doc_h, document.view_flip_h);
+                            (r.min.x, r.min.y, r.max.x, r.max.y)
+                        };
+                        crate::text_live::paint_live_text(
+                            ctx,
+                            &painter,
+                            &mut state.text_live_atlas,
+                            payload,
+                            canvas_center,
+                            egui::vec2(display_w, display_h),
+                            state.rotation_deg,
+                            document.view_flip_h,
+                            doc_w,
+                            doc_h,
+                            doc_view,
+                            opacity,
+                        );
+                    }
+                }
+                if let Some((tex, ox, oy, aw, ah, _)) = state.xform_above_tex.as_ref() {
+                    paint_selection_mask_overlay(
+                        &painter,
+                        tex.id(),
+                        canvas_center,
+                        egui::vec2(display_w, display_h),
+                        doc_w,
+                        doc_h,
+                        state.rotation_deg,
+                        document.view_flip_h,
+                        *ox as f32,
+                        *oy as f32,
+                        *aw,
+                        *ah,
+                        stage_ox,
+                        stage_oy,
+                    );
+                }
+            }
+            let time = ctx.input(|i| i.time);
+            crate::text_edit::paint_text_overlay(
+                &painter,
+                document,
+                &state.text_edit,
+                canvas_center,
+                egui::vec2(display_w, display_h),
+                doc_w,
+                doc_h,
+                state.rotation_deg,
+                document.view_flip_h,
+                time,
+            );
+        }
+
+        // Live input only. Hover-while-brush used to request_repaint every frame
+        // (stationary cursor → ~60 Hz present → ~12% idle GPU). PointerMoved
+        // already wakes a frame; brush aim wakes only when the tip actually turns.
         if panning
+            || edge_panning
             || primary_down
             || zoom_applied
             || state.is_drawing
@@ -1988,18 +2784,51 @@ impl CanvasView {
             ctx.request_repaint();
         } else if state.coarsen_held() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
-        } else {
-            let want = beautiful_core::lod_factor_for_document(
-                state.zoom,
-                state.display_lod,
-                document.width,
-                document.height,
-            );
-            if want != state.display_lod {
-                state.dirty = true;
-                ctx.request_repaint();
-            }
         }
+    }
+}
+
+/// Viewport edge scroll while creating a selection or shape. Past left/top → pan like arrow Left/Up
+/// (`pan.x/y` +); past right/bottom → like arrow Right/Down (`pan.x/y` −).
+/// Strength scales with overshoot past the edge (48px ≈ 1× `speed_px_s`).
+fn selection_edge_pan_delta(
+    viewport: egui::Rect,
+    pointer: egui::Pos2,
+    speed_px_s: f32,
+    dt: f32,
+) -> Option<egui::Vec2> {
+    let speed = speed_px_s.max(1.0);
+    let dt = dt.max(0.0);
+    let mut over = egui::Vec2::ZERO;
+    if pointer.x < viewport.min.x {
+        over.x = viewport.min.x - pointer.x;
+    } else if pointer.x > viewport.max.x {
+        over.x = -(pointer.x - viewport.max.x);
+    }
+    if pointer.y < viewport.min.y {
+        over.y = viewport.min.y - pointer.y;
+    } else if pointer.y > viewport.max.y {
+        over.y = -(pointer.y - viewport.max.y);
+    }
+    if over == egui::Vec2::ZERO {
+        return None;
+    }
+    const REF_PX: f32 = 48.0;
+    const MIN_MULT: f32 = 0.2;
+    const MAX_MULT: f32 = 3.0;
+    let mut delta = egui::Vec2::ZERO;
+    if over.x != 0.0 {
+        let m = (over.x.abs() / REF_PX).clamp(MIN_MULT, MAX_MULT);
+        delta.x = over.x.signum() * speed * m * dt;
+    }
+    if over.y != 0.0 {
+        let m = (over.y.abs() / REF_PX).clamp(MIN_MULT, MAX_MULT);
+        delta.y = over.y.signum() * speed * m * dt;
+    }
+    if delta == egui::Vec2::ZERO {
+        None
+    } else {
+        Some(delta)
     }
 }
 

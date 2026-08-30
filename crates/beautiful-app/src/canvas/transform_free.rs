@@ -14,8 +14,8 @@ pub(crate) fn park_floating_to_pixels(document: &mut Document) {
     }
 }
 
-/// Force free-transform scales onto integer output pixel sizes (Nearest / pixel-art).
-pub(crate) fn quantize_free_scale(fx: &mut FreeXform, bw: u32, bh: u32) {
+/// Force transform scales onto integer output pixel sizes (Nearest / pixel-art).
+pub(crate) fn quantize_xform_scale(fx: &mut TransformPose, bw: u32, bh: u32) {
     let bw = (bw as f32).max(1.0);
     let bh = (bh as f32).max(1.0);
     let out_w = (fx.scale_x.abs() * bw).round().max(1.0);
@@ -27,7 +27,7 @@ pub(crate) fn quantize_free_scale(fx: &mut FreeXform, bw: u32, bh: u32) {
 /// Rotation snap: free by default; Shift → 15° steps.
 pub(crate) fn snap_free_rotation_deg(deg: f32, fine: bool) -> f32 {
     if !fine {
-        // Continuous Free Transform — no forced 90° grid.
+        // Continuous Transform — no forced 90° grid.
         let mut d = deg.rem_euclid(360.0);
         if d > 180.0 {
             d -= 360.0;
@@ -43,7 +43,7 @@ pub(crate) fn snap_free_rotation_deg(deg: f32, fine: bool) -> f32 {
     d
 }
 
-fn free_scaled_wh(fx: &FreeXform, bw: u32, bh: u32, pixel_art: bool) -> (f32, f32) {
+fn xform_scaled_wh(fx: &TransformPose, bw: u32, bh: u32, pixel_art: bool) -> (f32, f32) {
     let ow = if pixel_art {
         (bw as f32 * fx.scale_x.abs()).round().max(1.0)
     } else {
@@ -63,17 +63,17 @@ fn rotation_swaps_axes(rot_deg: f32) -> bool {
     near(90.0) || near(270.0)
 }
 
-/// Park Free Transform pose. With Nearest (`pixel_art`): integer AABB + quantize scale.
-pub(crate) fn park_free_xform_pose_ex(
-    fx: &mut FreeXform,
+/// Park Transform pose. With Nearest (`pixel_art`): integer AABB + quantize scale.
+pub(crate) fn park_xform_pose_ex(
+    fx: &mut TransformPose,
     bw: u32,
     bh: u32,
     pixel_art: bool,
 ) {
     if pixel_art {
-        quantize_free_scale(fx, bw, bh);
+        quantize_xform_scale(fx, bw, bh);
     }
-    let (ow, oh) = free_scaled_wh(fx, bw, bh, pixel_art);
+    let (ow, oh) = xform_scaled_wh(fx, bw, bh, pixel_art);
     // Cardinal 90°: AABB is just the swapped box. Non-cardinal: park by OBB AABB.
     let (aw, ah, min_x, min_y) = if {
         let r = fx.rotation_deg.abs();
@@ -125,14 +125,14 @@ pub(crate) fn begin_free_drag(state: &mut CanvasState, document: &Document, x: f
     let Some((_, bw, bh, ox, oy)) = state.transform_baseline.as_ref() else {
         return;
     };
-    if state.free_xform.is_none() {
-        state.free_xform = Some(FreeXform::from_baseline(*bw, *bh, *ox, *oy));
+    if state.transform_pose.is_none() {
+        state.transform_pose = Some(TransformPose::from_baseline(*bw, *bh, *ox, *oy));
     }
     let pixel_art = state.resample_drag == beautiful_core::ResampleFilter::Nearest;
-    let Some(fx) = state.free_xform.as_mut() else {
+    let Some(fx) = state.transform_pose.as_mut() else {
         return;
     };
-    park_free_xform_pose_ex(fx, *bw, *bh, pixel_art);
+    park_xform_pose_ex(fx, *bw, *bh, pixel_art);
     let (hw, hh) = fx.half_size(*bw, *bh);
     let kind = hit_free_drag(fx, hw, hh, x, y);
     match kind {
@@ -155,7 +155,7 @@ pub(crate) fn begin_free_drag(state: &mut CanvasState, document: &Document, x: f
     let _ = document;
 }
 
-pub(crate) fn opposite_corner(fx: &FreeXform, hw: f32, hh: f32, handle: FreeHandle) -> (f32, f32) {
+pub(crate) fn opposite_corner(fx: &TransformPose, hw: f32, hh: f32, handle: FreeHandle) -> (f32, f32) {
     let (lx, ly) = match handle {
         FreeHandle::Nw => (hw, hh),
         FreeHandle::N => (0.0, hh),
@@ -169,13 +169,13 @@ pub(crate) fn opposite_corner(fx: &FreeXform, hw: f32, hh: f32, handle: FreeHand
     local_to_doc(fx, lx, ly)
 }
 
-pub(crate) fn local_to_doc(fx: &FreeXform, lx: f32, ly: f32) -> (f32, f32) {
+pub(crate) fn local_to_doc(fx: &TransformPose, lx: f32, ly: f32) -> (f32, f32) {
     let r = fx.rotation_deg.to_radians();
     let (s, c) = r.sin_cos();
     (fx.center_x + c * lx - s * ly, fx.center_y + s * lx + c * ly)
 }
 
-pub(crate) fn doc_to_local(fx: &FreeXform, x: f32, y: f32) -> (f32, f32) {
+pub(crate) fn doc_to_local(fx: &TransformPose, x: f32, y: f32) -> (f32, f32) {
     let r = (-fx.rotation_deg).to_radians();
     let (s, c) = r.sin_cos();
     let dx = x - fx.center_x;
@@ -183,7 +183,7 @@ pub(crate) fn doc_to_local(fx: &FreeXform, x: f32, y: f32) -> (f32, f32) {
     (c * dx - s * dy, s * dx + c * dy)
 }
 
-pub(crate) fn hit_free_drag(fx: &FreeXform, hw: f32, hh: f32, x: f32, y: f32) -> FreeDragKind {
+pub(crate) fn hit_free_drag(fx: &TransformPose, hw: f32, hh: f32, x: f32, y: f32) -> FreeDragKind {
     let (lx, ly) = doc_to_local(fx, x, y);
     let ahw = hw.abs();
     let ahh = hh.abs();
@@ -243,7 +243,7 @@ pub(crate) fn hit_free_drag(fx: &FreeXform, hw: f32, hh: f32, x: f32, y: f32) ->
 
 /// Keep the opposite side fixed in document space while scaling (no free translate).
 pub(crate) fn place_scale_keeping_anchor(
-    fx: &mut FreeXform,
+    fx: &mut TransformPose,
     bw: u32,
     bh: u32,
     handle: FreeHandle,
@@ -317,7 +317,7 @@ pub(crate) fn scales_from_anchor_delta(
 }
 
 pub(crate) fn free_obb_dirty_rect(
-    fx: &FreeXform,
+    fx: &TransformPose,
     bw: u32,
     bh: u32,
     doc_w: u32,
@@ -339,16 +339,16 @@ pub(crate) fn free_obb_dirty_rect(
     DirtyRect::from_egui_doc_rect(min_x, min_y, max_x, max_y, doc_w, doc_h).padded(12, doc_w, doc_h)
 }
 
-pub(crate) fn drag_free_transform(
+pub(crate) fn drag_transform(
     state: &mut CanvasState,
     document: &mut Document,
     x: f32,
     y: f32,
     ctx: &Context,
 ) {
-    if state.free_xform.is_none() {
+    if state.transform_pose.is_none() {
         if let Some((_, w, h, ox, oy)) = state.transform_baseline.as_ref() {
-            state.free_xform = Some(FreeXform::from_baseline(*w, *h, *ox, *oy));
+            state.transform_pose = Some(TransformPose::from_baseline(*w, *h, *ox, *oy));
         } else {
             return;
         }
@@ -357,24 +357,24 @@ pub(crate) fn drag_free_transform(
         Some((_, w, h, _, _)) => (*w, *h),
         None => return,
     };
-    if state.free_xform.as_ref().is_some_and(|f| f.drag.is_none()) {
+    if state.transform_pose.as_ref().is_some_and(|f| f.drag.is_none()) {
         begin_free_drag(state, document, x, y);
     }
     let shift = ctx.input(|i| i.modifiers.shift);
     let alt = ctx.input(|i| i.modifiers.alt);
-    // Nearest = pixel-art Free Transform (integer scale / pixel translate / park).
+    // Nearest = pixel-art Transform (integer scale / pixel translate / park).
     let pixel_art = matches!(
         state.resample_drag,
         beautiful_core::ResampleFilter::Nearest
     );
     let old_obb = state
-        .free_xform
+        .transform_pose
         .as_ref()
         .map(|fx| free_obb_dirty_rect(fx, bw, bh, document.width, document.height));
     let mut need_pixels = false;
     let mut move_delta: Option<(f32, f32)> = None;
     {
-        let Some(fx) = state.free_xform.as_mut() else {
+        let Some(fx) = state.transform_pose.as_mut() else {
             return;
         };
         match fx.drag {
@@ -402,7 +402,7 @@ pub(crate) fn drag_free_transform(
                 let snapped = snap_free_rotation_deg(deg, shift);
                 if (snapped - fx.rotation_deg).abs() > 1e-4 {
                     fx.rotation_deg = snapped;
-                    park_free_xform_pose_ex(fx, bw, bh, pixel_art);
+                    park_xform_pose_ex(fx, bw, bh, pixel_art);
                     need_pixels = true;
                 }
             }
@@ -437,7 +437,7 @@ pub(crate) fn drag_free_transform(
                     if !alt {
                         place_scale_keeping_anchor(fx, bw, bh, handle, (ax, ay));
                     }
-                    park_free_xform_pose_ex(fx, bw, bh, pixel_art);
+                    park_xform_pose_ex(fx, bw, bh, pixel_art);
                     need_pixels = true;
                 }
             }
@@ -446,18 +446,10 @@ pub(crate) fn drag_free_transform(
     }
 
     if let Some((dx, dy)) = move_delta {
-        // Pose-only while overlay frozen (gradient model): no composite / dirty.
+        // Pose is source of truth while overlay: floating stays baseline-sized.
+        // Re-centering pose on floating.w/h after scale teleports the grab point.
         if document.selection.floating_overlay_only {
-            document.selection.move_floating(dx, dy);
-            if pixel_art {
-                park_floating_to_pixels(document);
-            }
-            if let Some(f) = document.selection.floating.as_ref() {
-                if let Some(fx) = state.free_xform.as_mut() {
-                    fx.center_x = f.x + f.width as f32 * 0.5;
-                    fx.center_y = f.y + f.height as f32 * 0.5;
-                }
-            }
+            sync_free_floating_pose(state, document);
             ctx.request_repaint();
             return;
         }
@@ -466,7 +458,7 @@ pub(crate) fn drag_free_transform(
             park_floating_to_pixels(document);
         }
         if let Some(f) = document.selection.floating.as_ref() {
-            if let Some(fx) = state.free_xform.as_mut() {
+            if let Some(fx) = state.transform_pose.as_mut() {
                 fx.center_x = f.x + f.width as f32 * 0.5;
                 fx.center_y = f.y + f.height as f32 * 0.5;
             }
@@ -477,13 +469,16 @@ pub(crate) fn drag_free_transform(
     }
 
     if need_pixels {
-        // Bake with Dragging / Preview / Final filter, then 1:1 blit.
-        let keep_overlay = document.selection.floating_overlay_only;
-        let filter = state.resample_drag;
-        refresh_free_transform_preview(state, document, filter);
-        if keep_overlay {
-            document.selection.floating_overlay_only = true;
+        // Overlay: pose-only. Viewport dest pixels raster once per frame.
+        if document.selection.floating_overlay_only {
+            // Overlay: pose-only here. Viewport dest pixels are rastered once per
+            // frame in rebuild_xform_pixel_live (same inverse as Confirm).
+            let _ = old_obb;
+            ctx.request_repaint();
+            return;
         }
+        let filter = state.resample_drag;
+        refresh_transform_preview(state, document, filter);
         state.xform_live_stale = true;
         if let Some(old) = old_obb {
             if document.transform_sandwich_active() {
@@ -492,7 +487,7 @@ pub(crate) fn drag_free_transform(
                 document.touch_region(old);
             }
         }
-        if let Some(fx) = state.free_xform.as_ref() {
+        if let Some(fx) = state.transform_pose.as_ref() {
             let obb = free_obb_dirty_rect(fx, bw, bh, document.width, document.height);
             if document.transform_sandwich_active() {
                 document.touch_transform_display(Some(obb));
@@ -500,9 +495,7 @@ pub(crate) fn drag_free_transform(
                 document.touch_region(obb);
             }
         }
-        if !keep_overlay {
-            state.mark_dirty();
-        }
+        state.mark_dirty();
         ctx.request_repaint();
     }
 }
@@ -516,10 +509,10 @@ pub(crate) fn sync_free_floating_pose(state: &mut CanvasState, document: &mut Do
         state.resample_drag,
         beautiful_core::ResampleFilter::Nearest
     );
-    let Some(fx) = state.free_xform.as_mut() else {
+    let Some(fx) = state.transform_pose.as_mut() else {
         return;
     };
-    park_free_xform_pose_ex(fx, bw, bh, pixel_art);
+    park_xform_pose_ex(fx, bw, bh, pixel_art);
     let Some(f) = document.selection.floating.as_mut() else {
         return;
     };
@@ -539,7 +532,7 @@ pub(crate) fn sync_free_floating_pose(state: &mut CanvasState, document: &mut Do
     });
 }
 
-pub(crate) fn refresh_free_transform_preview(
+pub(crate) fn refresh_transform_preview(
     state: &mut CanvasState,
     document: &mut Document,
     filter: beautiful_core::ResampleFilter,
@@ -550,11 +543,11 @@ pub(crate) fn refresh_free_transform_preview(
         None => return,
     };
     let (sx, sy, rot, cx, cy) = {
-        let Some(fx) = state.free_xform.as_mut() else {
+        let Some(fx) = state.transform_pose.as_mut() else {
             return;
         };
         let pixel_art = matches!(filter, beautiful_core::ResampleFilter::Nearest);
-        park_free_xform_pose_ex(fx, w, h, pixel_art);
+        park_xform_pose_ex(fx, w, h, pixel_art);
         (
             fx.scale_x,
             fx.scale_y,
@@ -565,7 +558,7 @@ pub(crate) fn refresh_free_transform_preview(
     };
     let old_footprint = document.floating_selection_dirty_rect();
     let old_obb = {
-        let fx = state.free_xform.as_ref().unwrap();
+        let fx = state.transform_pose.as_ref().unwrap();
         free_obb_dirty_rect(fx, w, h, document.width, document.height)
     };
 
@@ -574,7 +567,7 @@ pub(crate) fn refresh_free_transform_preview(
         let Some((pix, _, _, _, _)) = state.transform_baseline.as_ref() else {
             return;
         };
-        beautiful_core::apply_free_transform_rgba(pix, w, h, sx, sy, rot, filter)
+        beautiful_core::apply_transform_rgba(pix, w, h, sx, sy, rot, filter)
     };
 
     if let Some(f) = document.selection.floating.as_mut() {
@@ -591,7 +584,7 @@ pub(crate) fn refresh_free_transform_preview(
             x1: f.x + f.width as f32,
             y1: f.y + f.height as f32,
         });
-        if let Some(fx) = state.free_xform.as_mut() {
+        if let Some(fx) = state.transform_pose.as_mut() {
             fx.center_x = f.x + nw as f32 * 0.5;
             fx.center_y = f.y + nh as f32 * 0.5;
         }
@@ -599,7 +592,7 @@ pub(crate) fn refresh_free_transform_preview(
     state.note_xform_bake();
     document.selection.floating_overlay_only = false;
     let new_obb = state
-        .free_xform
+        .transform_pose
         .as_ref()
         .map(|fx| free_obb_dirty_rect(fx, w, h, document.width, document.height));
     if document.transform_sandwich_active() {

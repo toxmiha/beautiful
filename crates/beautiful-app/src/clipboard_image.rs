@@ -5,6 +5,25 @@
 
 use arboard::Clipboard;
 
+/// Windows clipboard generation. Increments on every OS copy (this app or another).
+/// `None` when the platform cannot observe it.
+pub fn sequence_number() -> Option<u32> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
+        let n = unsafe { GetClipboardSequenceNumber() };
+        if n == 0 {
+            None
+        } else {
+            Some(n)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 /// Returns (width, height, RGBA8 bytes) if an image can be read from the clipboard.
 pub fn read_clipboard_rgba() -> Result<(u32, u32, Vec<u8>), String> {
     #[cfg(windows)]

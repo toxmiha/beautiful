@@ -2,8 +2,33 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::layer::{ancestor_folder_mask_cov, ancestor_folder_opacity, effective_blend_mode, Layer};
+use crate::layer::{
+    ancestor_folder_clip_cov, ancestor_folder_mask_cov, ancestor_folder_mask_cov_span,
+    ancestor_folder_opacity, ancestor_has_folder_clip, ancestor_has_folder_mask, clip_base_index,
+    effective_blend_mode, layer_effectively_visible, Layer,
+};
 use crate::Rgba;
+use std::cell::RefCell;
+
+fn with_mask_rows<R>(n: usize, f: impl FnOnce(&mut [u8], &mut [u8]) -> R) -> R {
+    thread_local! {
+        static OWN: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+        static FOLDER: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    }
+    OWN.with(|own| {
+        FOLDER.with(|folder| {
+            let mut own = own.borrow_mut();
+            let mut folder = folder.borrow_mut();
+            if own.len() < n {
+                own.resize(n, 255);
+            }
+            if folder.len() < n {
+                folder.resize(n, 255);
+            }
+            f(&mut own[..n], &mut folder[..n])
+        })
+    })
+}
 
 /// Floating pixels composited **inside** a layer stack slot (not on top of the doc).
 #[derive(Clone, Copy)]
@@ -18,7 +43,7 @@ pub struct FloatingBlit<'a> {
 }
 
 /// Inclusive-exclusive document-space rectangle of pixels that need recomposite/GPU upload.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirtyRect {
     pub x0: u32,
     pub y0: u32,
@@ -429,20 +454,13 @@ impl CompositeCache {
             if !self.gpu_dirty.is_empty() {
                 let rect = self.gpu_dirty;
                 self.gpu_dirty = DirtyRect::empty();
-                let was_full =
-                    rect.x0 == 0 && rect.y0 == 0 && rect.x1 == self.width && rect.y1 == self.height;
-                return if was_full {
-                    SyncResult {
-                        full_upload: true,
-                        partial: None,
-                        partials: Vec::new(),
-                    }
-                } else {
-                    SyncResult {
-                        full_upload: false,
-                        partial: Some(rect),
-                        partials: Vec::new(),
-                    }
+                // Whole-buffer gpu_dirty is still a region overwrite — not a GPU
+                // key drop. `full_upload` blanks display tiles under the stroke
+                // budget until mouse-up (LMB "heal").
+                return SyncResult {
+                    full_upload: false,
+                    partial: if rect.is_empty() { None } else { Some(rect) },
+                    partials: Vec::new(),
                 };
             }
             return SyncResult {
@@ -552,19 +570,10 @@ impl CompositeCache {
             self.gpu_dirty.union(*rect);
         }
 
-        let was_full = do_now.len() == 1
-            && do_now[0].x0 == 0
-            && do_now[0].y0 == 0
-            && do_now[0].x1 == self.width
-            && do_now[0].y1 == self.height;
-
-        if was_full {
-            SyncResult {
-                full_upload: true,
-                partial: None,
-                partials: Vec::new(),
-            }
-        } else if do_now.len() > 1 {
+        // Compositing the whole buffer is still a region overwrite. `full_upload`
+        // means drop GPU display-tile keys — that punched holes under the live
+        // stroke upload budget until mouse-up.
+        if do_now.len() > 1 {
             self.gpu_dirty_parts.extend(do_now.iter().copied());
             SyncResult {
                 full_upload: false,
@@ -601,6 +610,17 @@ impl CompositeCache {
             || !self.dirty.is_empty()
             || !self.dirty_parts.is_empty()
             || !self.offscreen_dirty.is_empty()
+            || !self.gpu_dirty.is_empty()
+            || !self.gpu_dirty_parts.is_empty()
+    }
+
+    /// Live work that must wake the canvas sync path every frame.
+    /// Excludes `offscreen_dirty` (idle Dense backfill) — that is paced by the app.
+    /// Counting offscreen here caused sticky idle CPU/GPU tile thrash after display-tiles.
+    pub fn has_live_pending_work(&self) -> bool {
+        self.force_full
+            || !self.dirty.is_empty()
+            || !self.dirty_parts.is_empty()
             || !self.gpu_dirty.is_empty()
             || !self.gpu_dirty_parts.is_empty()
     }
@@ -678,6 +698,8 @@ impl CompositeCache {
 }
 
 pub struct SyncResult {
+    /// Drop GPU display-tile keys and refill cover. Not "composited the whole
+    /// buffer" — that is a region overwrite (`partial` / `partials`).
     pub full_upload: bool,
     pub partial: Option<DirtyRect>,
     /// Sparse tile/region uploads (preferred over a single AABB when non-empty).
@@ -763,6 +785,10 @@ pub fn composite_region_into(
     }
 
     let row_w = (x1 - x0) * 4;
+    // Build the layer plan on this thread so OmitAboveGuard TLS is visible.
+    // Rebuilding the plan inside rayon workers ignored omit → text/transform ghosts.
+    let plan = build_layer_row_plan(layers, rect, floating, None);
+    let omit = crate::omit_above::snapshot();
     // Parallelize large dirty regions (layer toggles / full rebuilds).
     if area >= 64 * 64 {
         use rayon::prelude::*;
@@ -770,36 +796,39 @@ pub fn composite_region_into(
         out[row_base..y1 * stride]
             .par_chunks_mut(stride)
             .enumerate()
-            .for_each(|(i, row)| {
-                let mut scratch = vec![0u8; row_w];
-                composite_row_into(
-                    row,
-                    x0,
-                    x1,
-                    y0 + i,
-                    w,
-                    0,
-                    background,
-                    layers,
-                    &mut scratch,
-                    floating,
-                );
-            });
+            .for_each_init(
+                || crate::omit_above::WorkerTlsGuard::install(&omit),
+                |_g, (i, row)| {
+                    let mut scratch = vec![0u8; row_w];
+                    composite_row_into_planned(
+                        row,
+                        x0,
+                        x1,
+                        y0 + i,
+                        0,
+                        background,
+                        layers,
+                        &plan,
+                        &mut scratch,
+                        floating,
+                    );
+                },
+            );
         return;
     }
 
     let mut scratch = vec![0u8; row_w];
     for y in y0..y1 {
         let row = &mut out[y * stride..(y + 1) * stride];
-        composite_row_into(
+        composite_row_into_planned(
             row,
             x0,
             x1,
             y,
-            w,
             0,
             background,
             layers,
+            &plan,
             &mut scratch,
             floating,
         );
@@ -815,7 +844,7 @@ pub fn has_visible_adjustment(layers: &[Layer]) -> bool {
 pub fn has_visible_spatial_adjustment(layers: &[Layer]) -> bool {
     layers
         .iter()
-        .any(|l| l.visible && l.adjustment.is_some_and(|k| k.is_spatial()))
+        .any(|l| l.visible && l.adjustment.as_ref().is_some_and(|k| k.is_spatial()))
 }
 
 fn composite_region_with_adjustments(
@@ -847,43 +876,38 @@ fn composite_region_with_adjustments(
 
     let mut scratch = vec![0u8; rw * 4];
     for (li, layer) in layers.iter().enumerate() {
-        if !layer.visible || crate::omit_above::is_omitted(li) {
+        if !layer_effectively_visible(layers, li) || crate::omit_above::is_omitted(li) {
             continue;
         }
-        if let Some(kind) = layer.adjustment {
+        if let Some(kind) = layer.adjustment.clone() {
             let opacity = (layer.opacity.clamp(0.0, 1.0) * ancestor_folder_opacity(layers, li)).clamp(0.0, 1.0);
-            let use_mask = layer.mask_enabled && layer.mask.is_some();
+            let use_mask = layer.mask_modulates();
             if opacity <= 0.0 {
                 continue;
             }
             // Always filter the whole dirty patch at full res. Half-res proxy +
             // per-tile dirty (layer opt) produced visible seams on corrections.
-            let mut filtered = buf.clone();
-            crate::filters::apply_adjustment_rgba(&mut filtered, rw as u32, rh as u32, kind);
-            for row_i in 0..rh {
-                let y = y0 + row_i;
-                for col in 0..rw {
-                    let x = x0 + col;
-                    let i = (row_i * rw + col) * 4;
-                    let mut m = opacity;
-                    if use_mask {
-                        m *= layer.mask_sample(x, y) as f32 / 255.0;
-                    }
-                    m *= ancestor_folder_mask_cov(layers, li, x, y);
-                    if m <= 1e-4 {
-                        continue;
-                    }
-                    if m >= 0.999 {
-                        buf[i..i + 4].copy_from_slice(&filtered[i..i + 4]);
-                        continue;
-                    }
-                    for c in 0..4 {
-                        let a = buf[i + c] as f32;
-                        let b = filtered[i + c] as f32;
-                        buf[i + c] = (a + (b - a) * m).round().clamp(0.0, 255.0) as u8;
-                    }
-                }
-            }
+            apply_adjustment_onto_plate(
+                &mut buf,
+                rw,
+                rh,
+                x0,
+                y0,
+                layer,
+                li,
+                layers,
+                kind,
+                opacity,
+                use_mask,
+            );
+            overlay_pattern_on_plate(
+                &mut buf,
+                rw,
+                rh,
+                &layer.color_pattern,
+                layer.color_pattern_scale,
+                |col, row| (x0 as f32 + col as f32 + 0.5, y0 as f32 + row as f32 + 0.5),
+            );
             continue;
         }
         if layer.is_folder {
@@ -899,18 +923,32 @@ fn composite_region_with_adjustments(
         for row_i in 0..rh {
             let y = y0 + row_i;
             let row = &mut buf[row_i * rw * 4..(row_i + 1) * rw * 4];
-            blend_one_layer_span(
-                row,
-                x0,
-                x1,
-                y,
-                layer,
-                li,
-                layer_opacity,
-                layers,
-                floating,
-                &mut scratch,
-            );
+            if layer.is_text() {
+                blend_text_layer_span(
+                    row,
+                    x0,
+                    x1,
+                    y,
+                    layer,
+                    li,
+                    layer_opacity,
+                    layers,
+                    &mut scratch,
+                );
+            } else {
+                blend_one_layer_span(
+                    row,
+                    x0,
+                    x1,
+                    y,
+                    layer,
+                    li,
+                    layer_opacity,
+                    layers,
+                    floating,
+                    &mut scratch,
+                );
+            }
         }
     }
 
@@ -919,6 +957,104 @@ fn composite_region_with_adjustments(
         let src = row * rw * 4;
         let dst = (y0 + row) * stride + x0 * 4;
         out[dst..dst + rw * 4].copy_from_slice(&buf[src..src + rw * 4]);
+    }
+}
+
+fn overlay_pattern_on_plate(
+    buf: &mut [u8],
+    rw: usize,
+    rh: usize,
+    path: &str,
+    scale: f32,
+    doc_xy: impl Fn(usize, usize) -> (f32, f32),
+) {
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
+    let Some(map) = crate::brush_assets::load_rgb(path) else {
+        return;
+    };
+    let scale = scale.max(0.05);
+    for row in 0..rh {
+        for col in 0..rw {
+            let i = (row * rw + col) * 4;
+            if i + 3 >= buf.len() || buf[i + 3] < 8 {
+                continue;
+            }
+            let (x, y) = doc_xy(col, row);
+            let rgb = map.sample_doc(x, y, scale);
+            buf[i] = rgb[0];
+            buf[i + 1] = rgb[1];
+            buf[i + 2] = rgb[2];
+        }
+    }
+}
+
+/// Apply an adjustment onto the plate below. Pointwise + full opacity + no mask
+/// runs in-place (avoids clone). Spatial / masked / partial opacity clones once.
+fn apply_adjustment_onto_plate(
+    buf: &mut [u8],
+    rw: usize,
+    rh: usize,
+    x0: usize,
+    y0: usize,
+    layer: &Layer,
+    li: usize,
+    layers: &[Layer],
+    kind: crate::filters::AdjustmentKind,
+    opacity: f32,
+    use_mask: bool,
+) {
+    let can_inplace = kind.is_pointwise() && opacity >= 0.999 && !use_mask;
+    if can_inplace {
+        // Fast path: folder masks are rare; still honor them without a full clone
+        // by scanning once — if any pixel has folder mask < 1, fall through.
+        let mut folder_mask = false;
+        'scan: for row_i in 0..rh {
+            let y = y0 + row_i;
+            for col in 0..rw {
+                let x = x0 + col;
+                if ancestor_folder_mask_cov(layers, li, x, y) < 0.999
+                    || ancestor_folder_clip_cov(layers, li, x as i32, y as i32) < 0.999
+                {
+                    folder_mask = true;
+                    break 'scan;
+                }
+            }
+        }
+        if !folder_mask {
+            crate::filters::apply_adjustment_rgba(buf, rw as u32, rh as u32, kind);
+            return;
+        }
+    }
+
+    let mut filtered = buf.to_vec();
+    crate::filters::apply_adjustment_rgba(&mut filtered, rw as u32, rh as u32, kind);
+    for row_i in 0..rh {
+        let y = y0 + row_i;
+        for col in 0..rw {
+            let x = x0 + col;
+            let i = (row_i * rw + col) * 4;
+            let mut m = opacity;
+            if use_mask {
+                m *= layer.mask_sample(x, y) as f32 / 255.0;
+            }
+            m *= ancestor_folder_mask_cov(layers, li, x, y);
+            m *= ancestor_folder_clip_cov(layers, li, x as i32, y as i32);
+            if m <= 1e-4 {
+                continue;
+            }
+            if m >= 0.999 {
+                buf[i..i + 4].copy_from_slice(&filtered[i..i + 4]);
+                continue;
+            }
+            for c in 0..4 {
+                let a = buf[i + c] as f32;
+                let b = filtered[i + c] as f32;
+                buf[i + c] = (a + (b - a) * m).round().clamp(0.0, 255.0) as u8;
+            }
+        }
     }
 }
 
@@ -947,33 +1083,95 @@ fn blend_one_layer_span(
             blit_floating_into_span(layer_row, x0, x1, y, f);
         }
     }
-    let clip_below = layer.clip_to_below && li > 0;
-    for x in x0..x1 {
-        let i = (x - x0) * 4;
-        let src = &layer_row[i..i + 4];
-        let mut src_a = src[3] as f32 / 255.0 * layer_opacity;
-        if layer.mask.is_some() {
-            src_a *= layer.mask_sample(x, y) as f32 / 255.0;
-        }
-        if clip_below {
-            if let Some(below_a) =
-                nearest_paintable_alpha(layers, li, x as u32, y as u32, floating)
-            {
-                src_a *= below_a;
-            }
-        }
-        src_a *= ancestor_folder_mask_cov(layers, li, x, y);
-        if src_a <= 0.0 {
-            continue;
-        }
-        let dst = &mut row[i..i + 4];
-        let dst_a = dst[3] as f32 / 255.0;
-        let out_a = src_a + dst_a * (1.0 - src_a);
-        if out_a <= 0.0 {
-            continue;
-        }
-        crate::layer::blend_over(dst, src, src_a, effective_blend_mode(layers, li));
+    blend_prepared_layer_row(row, layer_row, x0, x1, y, layer, li, layer_opacity, layers);
+}
+
+fn blend_text_layer_span(
+    row: &mut [u8],
+    x0: usize,
+    x1: usize,
+    y: usize,
+    layer: &Layer,
+    li: usize,
+    layer_opacity: f32,
+    layers: &[Layer],
+    scratch: &mut [u8],
+) {
+    let need = (x1 - x0) * 4;
+    if scratch.len() < need {
+        return;
     }
+    let Some(payload) = layer.text.as_ref() else {
+        return;
+    };
+    let cache = &payload.cache;
+    if cache.is_empty() {
+        return;
+    }
+    // Quick reject: row outside cache AABB.
+    if (y as i32) < cache.origin_y || (y as i32) >= cache.origin_y + cache.height as i32 {
+        return;
+    }
+    let layer_row = &mut scratch[..need];
+    cache.copy_span(y as i32, x0 as i32, x1 as i32, layer_row);
+    blend_prepared_layer_row(row, layer_row, x0, x1, y, layer, li, layer_opacity, layers);
+}
+
+fn blend_prepared_layer_row(
+    row: &mut [u8],
+    layer_row: &[u8],
+    x0: usize,
+    x1: usize,
+    y: usize,
+    layer: &Layer,
+    li: usize,
+    layer_opacity: f32,
+    layers: &[Layer],
+) {
+    let clip_below = layer.clip_to_below && li > 0;
+    let has_mask = layer.mask_modulates();
+    let folder_mask = ancestor_has_folder_mask(layers, li);
+    let n = x1 - x0;
+    with_mask_rows(n, |own_m, folder_m| {
+        if has_mask {
+            layer.copy_mask_span(y as u32, x0 as u32, x1 as u32, own_m);
+        } else {
+            own_m.fill(255);
+        }
+        if folder_mask {
+            ancestor_folder_mask_cov_span(layers, li, y, x0, x1, folder_m);
+        } else {
+            folder_m.fill(255);
+        }
+        for x in x0..x1 {
+            let i = (x - x0) * 4;
+            let src = &layer_row[i..i + 4];
+            let mut src_a = src[3] as f32 / 255.0 * layer_opacity;
+            if has_mask {
+                src_a *= own_m[x - x0] as f32 / 255.0;
+            }
+            if clip_below {
+                src_a *= nearest_paintable_alpha(layers, li, x as u32, y as u32, None)
+                    .unwrap_or(0.0);
+            }
+            if ancestor_has_folder_clip(layers, li) {
+                src_a *= ancestor_folder_clip_cov(layers, li, x as i32, y as i32);
+            }
+            if folder_mask {
+                src_a *= folder_m[x - x0] as f32 / 255.0;
+            }
+            if src_a <= 0.0 {
+                continue;
+            }
+            let dst = &mut row[i..i + 4];
+            let dst_a = dst[3] as f32 / 255.0;
+            let out_a = src_a + dst_a * (1.0 - src_a);
+            if out_a <= 0.0 {
+                continue;
+            }
+            crate::layer::blend_over(dst, src, src_a, effective_blend_mode(layers, li));
+        }
+    });
 }
 
 pub fn composite_region_packed_into(
@@ -1000,6 +1198,36 @@ pub fn composite_region_packed_into(
         rect,
         floating,
         None,
+        true,
+    )
+}
+
+/// Row-serial variant for outer tile parallelism (eye fill: one cell / Rayon worker).
+pub fn composite_region_packed_into_serial(
+    out: &mut [u8],
+    out_width: u32,
+    origin_x: u32,
+    origin_y: u32,
+    doc_width: u32,
+    doc_height: u32,
+    background: Rgba,
+    layers: &[Layer],
+    rect: DirtyRect,
+    floating: Option<FloatingBlit<'_>>,
+) {
+    composite_region_packed_into_skip(
+        out,
+        out_width,
+        origin_x,
+        origin_y,
+        doc_width,
+        doc_height,
+        background,
+        layers,
+        rect,
+        floating,
+        None,
+        false,
     )
 }
 
@@ -1016,6 +1244,7 @@ pub fn composite_region_packed_into_skip(
     rect: DirtyRect,
     floating: Option<FloatingBlit<'_>>,
     skip_layer: Option<usize>,
+    parallel_rows: bool,
 ) {
     let _probe = crate::perf_probe::Probe::compose();
     let bounds = DirtyRect {
@@ -1066,11 +1295,14 @@ pub fn composite_region_packed_into_skip(
     // Hoist layer participation once per region (was O(rows×L) content_bounds walks).
     let layer_plan = build_layer_row_plan(layers, rect, floating, skip_layer);
 
-    if area >= 64 * 64 {
+    if parallel_rows && area >= 64 * 64 {
         use rayon::prelude::*;
+        let omit = crate::omit_above::snapshot();
         out.par_chunks_mut(stride)
             .enumerate()
-            .for_each(|(local_y, row)| {
+            .for_each_init(
+                || crate::omit_above::WorkerTlsGuard::install(&omit),
+                |_g, (local_y, row)| {
                 let y = origin_y + local_y;
                 if y < y0 || y >= y1 {
                     return;
@@ -1088,7 +1320,8 @@ pub fn composite_region_packed_into_skip(
                     &mut scratch,
                     floating,
                 );
-            });
+                },
+            );
         return;
     }
 
@@ -1142,41 +1375,36 @@ fn composite_adjustment_rect_packed(
     }
     let mut scratch = vec![0u8; rw * 4];
     for (li, layer) in layers.iter().enumerate() {
-        if !layer.visible || crate::omit_above::is_omitted(li) {
+        if !layer_effectively_visible(layers, li) || crate::omit_above::is_omitted(li) {
             continue;
         }
-        if let Some(kind) = layer.adjustment {
+        if let Some(kind) = layer.adjustment.clone() {
             let opacity = (layer.opacity.clamp(0.0, 1.0) * ancestor_folder_opacity(layers, li)).clamp(0.0, 1.0);
-            let use_mask = layer.mask_enabled && layer.mask.is_some();
+            let use_mask = layer.mask_modulates();
             if opacity <= 0.0 {
                 continue;
             }
-            let mut filtered = buf.clone();
-            crate::filters::apply_adjustment_rgba(&mut filtered, rw as u32, rh as u32, kind);
-            for row_i in 0..rh {
-                let y = y0 + row_i;
-                for col in 0..rw {
-                    let x = x0 + col;
-                    let i = (row_i * rw + col) * 4;
-                    let mut m = opacity;
-                    if use_mask {
-                        m *= layer.mask_sample(x, y) as f32 / 255.0;
-                    }
-                    m *= ancestor_folder_mask_cov(layers, li, x, y);
-                    if m <= 1e-4 {
-                        continue;
-                    }
-                    if m >= 0.999 {
-                        buf[i..i + 4].copy_from_slice(&filtered[i..i + 4]);
-                        continue;
-                    }
-                    for c in 0..4 {
-                        let a = buf[i + c] as f32;
-                        let b = filtered[i + c] as f32;
-                        buf[i + c] = (a + (b - a) * m).round().clamp(0.0, 255.0) as u8;
-                    }
-                }
-            }
+            apply_adjustment_onto_plate(
+                &mut buf,
+                rw,
+                rh,
+                x0,
+                y0,
+                layer,
+                li,
+                layers,
+                kind,
+                opacity,
+                use_mask,
+            );
+            overlay_pattern_on_plate(
+                &mut buf,
+                rw,
+                rh,
+                &layer.color_pattern,
+                layer.color_pattern_scale,
+                |col, row| (x0 as f32 + col as f32 + 0.5, y0 as f32 + row as f32 + 0.5),
+            );
             continue;
         }
         if layer.is_folder || layer.is_adjustment() {
@@ -1189,18 +1417,32 @@ fn composite_adjustment_rect_packed(
         for row_i in 0..rh {
             let y = y0 + row_i;
             let row = &mut buf[row_i * rw * 4..(row_i + 1) * rw * 4];
-            blend_one_layer_span(
-                row,
-                x0,
-                x1,
-                y,
-                layer,
-                li,
-                layer_opacity,
-                layers,
-                floating,
-                &mut scratch,
-            );
+            if layer.is_text() {
+                blend_text_layer_span(
+                    row,
+                    x0,
+                    x1,
+                    y,
+                    layer,
+                    li,
+                    layer_opacity,
+                    layers,
+                    &mut scratch,
+                );
+            } else {
+                blend_one_layer_span(
+                    row,
+                    x0,
+                    x1,
+                    y,
+                    layer,
+                    li,
+                    layer_opacity,
+                    layers,
+                    floating,
+                    &mut scratch,
+                );
+            }
         }
     }
 
@@ -1222,6 +1464,7 @@ fn composite_adjustment_rect_packed(
     }
 }
 
+#[allow(dead_code)]
 fn composite_row_into(
     row: &mut [u8],
     x0: usize,
@@ -1239,6 +1482,7 @@ fn composite_row_into(
     )
 }
 
+#[allow(dead_code)]
 fn composite_row_into_skip(
     row: &mut [u8],
     x0: usize,
@@ -1292,7 +1536,7 @@ fn build_layer_row_plan(
         if skip_layer == Some(li) {
             continue;
         }
-        if !layer.visible || crate::omit_above::is_omitted(li) {
+        if !layer_effectively_visible(layers, li) || crate::omit_above::is_omitted(li) {
             continue;
         }
         if layer.is_folder || layer.is_adjustment() {
@@ -1305,7 +1549,24 @@ fn build_layer_row_plan(
         }
         let clip_below = layer.clip_to_below && li > 0;
         let has_floating_here = floating.is_some_and(|f| f.layer_idx == li);
-        let bounds = if clip_below || has_floating_here {
+        let bounds = if layer.is_text() {
+            let Some(payload) = layer.text.as_ref() else {
+                continue;
+            };
+            if payload.cache.is_empty() {
+                continue;
+            }
+            let b = DirtyRect {
+                x0: payload.cache.origin_x.max(0) as u32,
+                y0: payload.cache.origin_y.max(0) as u32,
+                x1: (payload.cache.origin_x + payload.cache.width as i32).max(0) as u32,
+                y1: (payload.cache.origin_y + payload.cache.height as i32).max(0) as u32,
+            };
+            if !b.intersects(rect) {
+                continue;
+            }
+            Some(b)
+        } else if clip_below || has_floating_here {
             None
         } else {
             // Prefer tile-key hit (sparse) over full AABB when layer is large/sparse.
@@ -1350,6 +1611,23 @@ fn composite_row_into_planned(
         row[i + 3] = background.a;
     }
 
+    blend_plan_into_row(
+        row, x0, x1, y, dst_doc_x0, layers, plan, scratch, floating,
+    );
+}
+
+/// Blend planned layers onto an existing packed row (does not fill background).
+fn blend_plan_into_row(
+    row: &mut [u8],
+    x0: usize,
+    x1: usize,
+    y: usize,
+    dst_doc_x0: usize,
+    layers: &[Layer],
+    plan: &[LayerRowSlot],
+    scratch: &mut [u8],
+    floating: Option<FloatingBlit<'_>>,
+) {
     let need = (x1 - x0) * 4;
     if scratch.len() < need {
         return;
@@ -1377,43 +1655,145 @@ fn composite_row_into_planned(
         }
 
         let layer_row = &mut scratch[..need];
-        layer
-            .tiles
-            .copy_span_fast(y as u32, x0 as u32, x1 as u32, layer_row);
-        if let Some(f) = floating {
-            if f.layer_idx == li {
-                blit_floating_into_span(layer_row, x0, x1, y, f);
+        if layer.is_text() {
+            layer_row.fill(0);
+            if let Some(payload) = layer.text.as_ref() {
+                payload
+                    .cache
+                    .copy_span(y as i32, x0 as i32, x1 as i32, layer_row);
             }
-        }
-        for x in x0..x1 {
-            let i = (x - dst_doc_x0) * 4;
-            let si = (x - x0) * 4;
-            let src = &layer_row[si..si + 4];
-            let mut src_a = src[3] as f32 / 255.0 * layer_opacity;
-            if layer.mask.is_some() {
-                src_a *= layer.mask_sample(x, y) as f32 / 255.0;
-            }
-            if slot.clip_below {
-                if let Some(below_a) =
-                    nearest_paintable_alpha(layers, li, x as u32, y as u32, floating)
-                {
-                    src_a *= below_a;
+        } else {
+            layer
+                .tiles
+                .copy_span_fast(y as u32, x0 as u32, x1 as u32, layer_row);
+            if let Some(f) = floating {
+                if f.layer_idx == li {
+                    blit_floating_into_span(layer_row, x0, x1, y, f);
                 }
             }
-            src_a *= ancestor_folder_mask_cov(layers, li, x, y);
-            if src_a <= 0.0 {
-                continue;
-            }
-
-            let dst = &mut row[i..i + 4];
-            let dst_a = dst[3] as f32 / 255.0;
-            let out_a = src_a + dst_a * (1.0 - src_a);
-            if out_a <= 0.0 {
-                continue;
-            }
-
-            crate::layer::blend_over(dst, src, src_a, effective_blend_mode(layers, li));
         }
+        let has_mask = layer.mask_modulates();
+        let folder_mask = ancestor_has_folder_mask(layers, li);
+        let n = x1 - x0;
+        with_mask_rows(n, |own_m, folder_m| {
+            if has_mask {
+                layer.copy_mask_span(y as u32, x0 as u32, x1 as u32, own_m);
+            } else {
+                own_m.fill(255);
+            }
+            if folder_mask {
+                ancestor_folder_mask_cov_span(layers, li, y, x0, x1, folder_m);
+            } else {
+                folder_m.fill(255);
+            }
+            for x in x0..x1 {
+                let i = (x - dst_doc_x0) * 4;
+                let si = (x - x0) * 4;
+                let src = &layer_row[si..si + 4];
+                let mut src_a = src[3] as f32 / 255.0 * layer_opacity;
+                if has_mask {
+                    src_a *= own_m[x - x0] as f32 / 255.0;
+                }
+                if slot.clip_below {
+                    src_a *= nearest_paintable_alpha(layers, li, x as u32, y as u32, floating)
+                        .unwrap_or(0.0);
+                }
+                if folder_mask {
+                    src_a *= folder_m[x - x0] as f32 / 255.0;
+                }
+                if src_a <= 0.0 {
+                    continue;
+                }
+
+                let dst = &mut row[i..i + 4];
+                let dst_a = dst[3] as f32 / 255.0;
+                let out_a = src_a + dst_a * (1.0 - src_a);
+                if out_a <= 0.0 {
+                    continue;
+                }
+                crate::layer::blend_over(dst, src, src_a, effective_blend_mode(layers, li));
+            }
+        });
+    }
+}
+
+/// Blend a single layer onto an already-filled packed plate (node projection).
+pub fn blend_one_layer_packed(
+    out: &mut [u8],
+    out_width: u32,
+    origin_x: u32,
+    origin_y: u32,
+    layers: &[Layer],
+    li: usize,
+    rect: DirtyRect,
+) {
+    blend_layers_range_packed(
+        out,
+        out_width,
+        origin_x,
+        origin_y,
+        layers,
+        li,
+        li.saturating_add(1),
+        rect,
+    );
+}
+
+/// Blend `layers[from_li..to_li]` onto an already-filled packed plate.
+/// One row-plan for the range (not one plan per layer).
+pub fn blend_layers_range_packed(
+    out: &mut [u8],
+    out_width: u32,
+    origin_x: u32,
+    origin_y: u32,
+    layers: &[Layer],
+    from_li: usize,
+    to_li: usize,
+    rect: DirtyRect,
+) {
+    if from_li >= layers.len() || from_li >= to_li || out_width == 0 {
+        return;
+    }
+    let to_li = to_li.min(layers.len());
+    let plan = build_layer_row_plan(layers, rect, None, None);
+    let plan: Vec<LayerRowSlot> = plan
+        .into_iter()
+        .filter(|s| s.li >= from_li && s.li < to_li)
+        .collect();
+    if plan.is_empty() {
+        return;
+    }
+    let x0 = rect.x0 as usize;
+    let x1 = rect.x1 as usize;
+    let y0 = rect.y0 as usize;
+    let y1 = rect.y1 as usize;
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let stride = out_width as usize * 4;
+    let origin_y = origin_y as usize;
+    let origin_x = origin_x as usize;
+    let row_w = (x1 - x0) * 4;
+    let mut scratch = vec![0u8; row_w];
+    for y in y0..y1 {
+        let local_y = y.saturating_sub(origin_y);
+        let start = local_y * stride;
+        let end = start.saturating_add(stride);
+        if end > out.len() {
+            break;
+        }
+        let row = &mut out[start..end];
+        blend_plan_into_row(
+            row,
+            x0,
+            x1,
+            y,
+            origin_x,
+            layers,
+            &plan,
+            &mut scratch,
+            None,
+        );
     }
 }
 
@@ -1468,7 +1848,8 @@ pub(crate) fn blit_floating_into_span(span: &mut [u8], x0: usize, x1: usize, y: 
     }
 }
 
-/// Alpha of nearest non-folder layer below `li` (includes floating on that layer).
+/// Alpha of the clipping-group base below `li` (includes floating on that base).
+/// Consecutive clipped layers all read this same base — not the neighbor above it.
 fn nearest_paintable_alpha(
     layers: &[Layer],
     li: usize,
@@ -1476,32 +1857,29 @@ fn nearest_paintable_alpha(
     y: u32,
     floating: Option<FloatingBlit<'_>>,
 ) -> Option<f32> {
-    let mut j = li;
-    while j > 0 {
-        j -= 1;
-        if layers[j].is_folder {
-            continue;
-        }
-        // Clip base must honor the base layer's mask (reveal/hide), not raw tile A.
-        let mut a = layers[j].effective_alpha(x as i32, y as i32);
-        if let Some(f) = floating {
-            if f.layer_idx == j {
-                let lx = x as f32 - f.x;
-                let ly = y as f32 - f.y;
-                if lx >= 0.0 && ly >= 0.0 && lx < f.width as f32 && ly < f.height as f32 {
-                    let fx = lx.floor() as u32;
-                    let fy = ly.floor() as u32;
-                    let i = ((fy * f.width + fx) * 4) as usize;
-                    if i + 3 < f.pixels.len() {
-                        let fa = f.pixels[i + 3] as f32 / 255.0;
-                        a = fa + a * (1.0 - fa);
-                    }
+    let Some(j) = clip_base_index(layers, li) else {
+        return Some(0.0);
+    };
+    if !layers[j].visible {
+        return Some(0.0);
+    }
+    let mut a = layers[j].effective_alpha(x as i32, y as i32);
+    if let Some(f) = floating {
+        if f.layer_idx == j {
+            let lx = x as f32 - f.x;
+            let ly = y as f32 - f.y;
+            if lx >= 0.0 && ly >= 0.0 && lx < f.width as f32 && ly < f.height as f32 {
+                let fx = lx.floor() as u32;
+                let fy = ly.floor() as u32;
+                let i = ((fy * f.width + fx) * 4) as usize;
+                if i + 3 < f.pixels.len() {
+                    let fa = f.pixels[i + 3] as f32 / 255.0;
+                    a = fa + a * (1.0 - fa);
                 }
             }
         }
-        return Some(a);
     }
-    None
+    Some(a)
 }
 
 /// Build a zoomed-out display mip by compositing only center samples of each
@@ -1580,10 +1958,13 @@ pub fn composite_display_mip_region(
     }
 
     use rayon::prelude::*;
+    let omit = crate::omit_above::snapshot();
     out[..need]
         .par_chunks_mut(mip_w * 4)
         .enumerate()
-        .for_each(|(my, dst_row)| {
+        .for_each_init(
+            || crate::omit_above::WorkerTlsGuard::install(&omit),
+            |_g, (my, dst_row)| {
             if my < my0 || my >= my1 {
                 return;
             }
@@ -1606,7 +1987,8 @@ pub fn composite_display_mip_region(
                     floating,
                 );
             }
-        });
+            },
+        );
 }
 
 fn composite_display_mip_region_with_adjustments(
@@ -1638,16 +2020,43 @@ fn composite_display_mip_region_with_adjustments(
     }
 
     for (li, layer) in layers.iter().enumerate() {
-        if !layer.visible || crate::omit_above::is_omitted(li) || layer.is_folder {
+        if !layer_effectively_visible(layers, li) || crate::omit_above::is_omitted(li) || layer.is_folder {
             continue;
         }
-        if let Some(kind) = layer.adjustment {
+        if let Some(kind) = layer.adjustment.clone() {
             let opacity = (layer.opacity.clamp(0.0, 1.0) * ancestor_folder_opacity(layers, li)).clamp(0.0, 1.0);
             if opacity <= 0.0 {
                 continue;
             }
             let kind = kind.for_display_lod(factor);
-            let use_mask = layer.mask_enabled && layer.mask.is_some();
+            let use_mask = layer.mask_modulates();
+            // LOD plate: same inplace fast-path for pointwise full-opacity corrections.
+            if kind.is_pointwise() && opacity >= 0.999 && !use_mask {
+                crate::filters::apply_adjustment_rgba(&mut buf, rw as u32, rh as u32, kind);
+                overlay_pattern_on_plate(
+                    &mut buf,
+                    rw,
+                    rh,
+                    &layer.color_pattern,
+                    layer.color_pattern_scale,
+                    |col, row| {
+                        let mx = mx0 + col;
+                        let my = my0 + row;
+                        let x = (mx as u32)
+                            .saturating_mul(factor)
+                            .saturating_add(factor / 2)
+                            .min(doc_w.saturating_sub(1)) as f32
+                            + 0.5;
+                        let y = (my as u32)
+                            .saturating_mul(factor)
+                            .saturating_add(factor / 2)
+                            .min(doc_h.saturating_sub(1)) as f32
+                            + 0.5;
+                        (x, y)
+                    },
+                );
+                continue;
+            }
             let mut filtered = buf.clone();
             crate::filters::apply_adjustment_rgba(&mut filtered, rw as u32, rh as u32, kind);
             for row_i in 0..rh {
@@ -1668,6 +2077,7 @@ fn composite_display_mip_region_with_adjustments(
                         m *= layer.mask_sample(x, y) as f32 / 255.0;
                     }
                     m *= ancestor_folder_mask_cov(layers, li, x, y);
+                    m *= ancestor_folder_clip_cov(layers, li, x as i32, y as i32);
                     if m <= 1e-4 {
                         continue;
                     }
@@ -1682,6 +2092,28 @@ fn composite_display_mip_region_with_adjustments(
                     }
                 }
             }
+            overlay_pattern_on_plate(
+                &mut buf,
+                rw,
+                rh,
+                &layer.color_pattern,
+                layer.color_pattern_scale,
+                |col, row| {
+                    let mx = mx0 + col;
+                    let my = my0 + row;
+                    let x = (mx as u32)
+                        .saturating_mul(factor)
+                        .saturating_add(factor / 2)
+                        .min(doc_w.saturating_sub(1)) as f32
+                        + 0.5;
+                    let y = (my as u32)
+                        .saturating_mul(factor)
+                        .saturating_add(factor / 2)
+                        .min(doc_h.saturating_sub(1)) as f32
+                        + 0.5;
+                    (x, y)
+                },
+            );
             continue;
         }
         if layer.is_adjustment() {
@@ -1762,7 +2194,11 @@ fn composite_point_paint_layer(
     if out.len() < 4 {
         return;
     }
-    let mut src = layer.tiles.get_rgba(x, y);
+    let mut src = if let Some(payload) = layer.text.as_ref() {
+        payload.cache.sample(x, y)
+    } else {
+        layer.tiles.get_rgba(x, y)
+    };
     if let Some(f) = floating.filter(|f| f.layer_idx == li) {
         let lx = x as f32 - f.x;
         let ly = y as f32 - f.y;
@@ -1787,10 +2223,9 @@ fn composite_point_paint_layer(
         src_a *= layer.mask_sample(x as usize, y as usize) as f32 / 255.0;
     }
     if layer.clip_to_below && li > 0 {
-        if let Some(below_a) = nearest_paintable_alpha(layers, li, x as u32, y as u32, floating) {
-            src_a *= below_a;
-        }
+        src_a *= nearest_paintable_alpha(layers, li, x as u32, y as u32, floating).unwrap_or(0.0);
     }
+    src_a *= ancestor_folder_clip_cov(layers, li, x, y);
     src_a *= ancestor_folder_mask_cov(layers, li, x as usize, y as usize);
     if src_a <= 0.0 {
         return;
@@ -1800,7 +2235,7 @@ fn composite_point_paint_layer(
 
 /// Single-pixel composite (LOD mip / point sample). Avoids per-pixel
 /// `composite_row_into` + content-bounds HashMap work.
-fn composite_point_rgba(
+pub(crate) fn composite_point_rgba(
     out: &mut [u8],
     x: i32,
     y: i32,
@@ -1817,7 +2252,7 @@ fn composite_point_rgba(
     out[3] = background.a;
 
     for (li, layer) in layers.iter().enumerate() {
-        if !layer.visible || crate::omit_above::is_omitted(li) || layer.is_folder {
+        if !layer_effectively_visible(layers, li) || crate::omit_above::is_omitted(li) || layer.is_folder {
             continue;
         }
         let opacity = (layer.opacity.clamp(0.0, 1.0) * ancestor_folder_opacity(layers, li)).clamp(0.0, 1.0);
@@ -1825,7 +2260,11 @@ fn composite_point_rgba(
             continue;
         }
 
-        let mut src = layer.tiles.get_rgba(x, y);
+        let mut src = if let Some(payload) = layer.text.as_ref() {
+            payload.cache.sample(x, y)
+        } else {
+            layer.tiles.get_rgba(x, y)
+        };
         if let Some(f) = floating.filter(|f| f.layer_idx == li) {
             let lx = x as f32 - f.x;
             let ly = y as f32 - f.y;
@@ -1850,12 +2289,10 @@ fn composite_point_rgba(
             src_a *= layer.mask_sample(x as usize, y as usize) as f32 / 255.0;
         }
         if layer.clip_to_below && li > 0 {
-            if let Some(below_a) =
-                nearest_paintable_alpha(layers, li, x as u32, y as u32, floating)
-            {
-                src_a *= below_a;
-            }
+            src_a *=
+                nearest_paintable_alpha(layers, li, x as u32, y as u32, floating).unwrap_or(0.0);
         }
+        src_a *= ancestor_folder_clip_cov(layers, li, x, y);
         src_a *= ancestor_folder_mask_cov(layers, li, x as usize, y as usize);
         if src_a <= 0.0 {
             continue;
@@ -1959,5 +2396,90 @@ mod tests {
             !cache.dirty.is_empty() || cache.has_pending_work(),
             "expected leftover dirty after budgeted sync"
         );
+    }
+
+    #[test]
+    fn clip_chain_does_not_clip_to_neighbor() {
+        use crate::{Document, Layer};
+        let mut doc = Document::new(8, 8);
+        for y in 0..8 {
+            for x in 0..4 {
+                doc.layers[0].tiles.set_rgba(x, y, [255, 255, 255, 255]);
+            }
+        }
+        let mut shadow = Layer::new("shadow", 8, 8);
+        shadow.clip_to_below = true;
+        for y in 0..4 {
+            for x in 0..8 {
+                shadow.tiles.set_rgba(x, y, [255, 0, 0, 255]);
+            }
+        }
+        doc.layers.push(shadow);
+        let mut highlight = Layer::new("highlight", 8, 8);
+        highlight.clip_to_below = true;
+        for y in 4..8 {
+            for x in 0..8 {
+                highlight.tiles.set_rgba(x, y, [0, 255, 0, 255]);
+            }
+        }
+        doc.layers.push(highlight);
+
+        let px = doc.composite_rgba_copy();
+        let at = |x: usize, y: usize| {
+            let i = (y * 8 + x) * 4;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+        // Bottom-left sits on the base but not on the shadow. Must still show highlight.
+        assert_eq!(at(1, 5), [0, 255, 0, 255]);
+        // Bottom-right is outside the base contour — both clips hidden.
+        assert_eq!(at(6, 5), [255, 255, 255, 255]);
+        // Top-left: shadow over base.
+        assert_eq!(at(1, 1), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn hidden_folder_hides_children_but_keeps_their_eyes() {
+        use crate::{Document, Layer};
+        let mut doc = Document::new(8, 8);
+        doc.layers[0].name = "On".into();
+        doc.layers[0].group_id = Some(1);
+        doc.layers[0].tiles.set_rgba(0, 0, [255, 0, 0, 255]);
+        let mut off = Layer::new("Off", 8, 8);
+        off.group_id = Some(1);
+        off.visible = false;
+        off.tiles.set_rgba(1, 0, [0, 255, 0, 255]);
+        doc.layers.push(off);
+        let mut folder = Layer::new_folder("G", 8, 8);
+        folder.group_id = Some(1);
+        doc.layers.push(folder);
+
+        doc.set_layer_visible(2, false);
+        assert!(doc.layers[0].visible);
+        assert!(!doc.layers[1].visible);
+        let px = doc.composite_rgba_copy();
+        assert_eq!(&px[0..4], &[255, 255, 255, 255]);
+
+        doc.set_layer_visible(2, true);
+        assert!(doc.layers[0].visible);
+        assert!(!doc.layers[1].visible);
+        let px = doc.composite_rgba_copy();
+        assert_eq!(&px[0..4], &[255, 0, 0, 255]);
+        let i = 4;
+        assert_eq!(&px[i..i + 4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn full_doc_gpu_dirty_is_region_not_key_drop() {
+        let mut cache = CompositeCache::new(64, 64);
+        cache.force_full = false;
+        cache.gpu_dirty = DirtyRect::full(64, 64);
+        let layers = vec![Layer::new("L", 64, 64)];
+        let r = cache.sync_view(Rgba::WHITE, &layers, None, DirtyRect::full(64, 64), 0);
+        assert!(
+            !r.full_upload,
+            "full-doc gpu_dirty must not drop GPU display tiles"
+        );
+        assert_eq!(r.partial, Some(DirtyRect::full(64, 64)));
+        assert!(r.partials.is_empty());
     }
 }

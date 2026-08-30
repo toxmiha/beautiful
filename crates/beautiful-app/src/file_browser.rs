@@ -8,10 +8,32 @@ use std::thread;
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 use serde::{Deserialize, Serialize};
 
+use crate::demo_export::VideoFormat;
 use crate::file::FileState;
 use crate::gallery;
 use crate::settings::FormatFlags;
 use crate::theme;
+
+/// What the browser should do with the confirmed path(s).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BrowserJob {
+    #[default]
+    OpenDocument,
+    SaveDocument,
+    PickImage,
+    PickAudio,
+    SaveVideo,
+}
+
+impl BrowserJob {
+    fn allows_gallery(self) -> bool {
+        matches!(self, Self::OpenDocument)
+    }
+
+    fn persist_filters(self) -> bool {
+        matches!(self, Self::OpenDocument | Self::SaveDocument)
+    }
+}
 
 /// Multi-toggle file type filter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +43,10 @@ struct TypeFilters {
     txmh: bool,
     psd: bool,
     images: bool,
+    #[serde(default)]
+    audio: bool,
+    #[serde(default)]
+    video: bool,
     show_hidden: bool,
 }
 
@@ -31,6 +57,8 @@ impl Default for TypeFilters {
             txmh: true,
             psd: true,
             images: true,
+            audio: false,
+            video: false,
             show_hidden: false,
         }
     }
@@ -42,7 +70,17 @@ impl TypeFilters {
             folders: true,
             txmh: flags.txmh,
             psd: flags.psd,
-            images: flags.png || flags.jpeg || flags.bmp || flags.webp,
+            images: flags.png
+                || flags.jpeg
+                || flags.bmp
+                || flags.webp
+                || flags.gif
+                || flags.tga
+                || flags.tiff
+                || flags.ico
+                || flags.svg,
+            audio: false,
+            video: false,
             show_hidden: false,
         }
     }
@@ -55,7 +93,16 @@ impl TypeFilters {
         if !flags.psd {
             self.psd = false;
         }
-        if !(flags.png || flags.jpeg || flags.bmp || flags.webp) {
+        if !(flags.png
+            || flags.jpeg
+            || flags.bmp
+            || flags.webp
+            || flags.gif
+            || flags.tga
+            || flags.tiff
+            || flags.ico
+            || flags.svg)
+        {
             self.images = false;
         }
         self
@@ -74,6 +121,12 @@ impl TypeFilters {
         }
         if self.images {
             parts.push("Images");
+        }
+        if self.audio {
+            parts.push("Audio");
+        }
+        if self.video {
+            parts.push("Video");
         }
         if parts.is_empty() {
             "Nothing".into()
@@ -94,7 +147,33 @@ impl TypeFilters {
         if self.psd && ext == "psd" {
             return true;
         }
-        if self.images && matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "bmp" | "webp") {
+        if self.images
+            && matches!(
+                ext.as_str(),
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "bmp"
+                    | "webp"
+                    | "gif"
+                    | "tga"
+                    | "tif"
+                    | "tiff"
+                    | "ico"
+                    | "svg"
+            )
+        {
+            return true;
+        }
+        if self.audio
+            && matches!(
+                ext.as_str(),
+                "mp3" | "wav" | "flac" | "ogg" | "oga" | "m4a" | "aac" | "wma" | "opus"
+            )
+        {
+            return true;
+        }
+        if self.video && matches!(ext.as_str(), "mp4" | "webm" | "mkv" | "mov") {
             return true;
         }
         false
@@ -215,6 +294,8 @@ struct BrowserPrefs {
     #[serde(default)]
     last_cwd: Option<PathBuf>,
     #[serde(default)]
+    last_save_dir: Option<PathBuf>,
+    #[serde(default)]
     last_gallery: bool,
     #[serde(default)]
     type_filters: Option<TypeFilters>,
@@ -237,6 +318,8 @@ pub struct FileBrowser {
     /// Save As / Export destination picker (single path + format).
     pub save_mode: bool,
     pub save_format: crate::file::ExportFormat,
+    job: BrowserJob,
+    video_format: VideoFormat,
     title: String,
     cwd: PathBuf,
     /// Virtual "Gallery" location (library canvases in the grid).
@@ -255,6 +338,7 @@ pub struct FileBrowser {
     path_edit: String,
     path_edit_focused: bool,
     error: Option<String>,
+    overwrite_prompt: Option<PathBuf>,
     loading: bool,
     list_gen: u64,
     list_rx: Option<Receiver<ListResult>>,
@@ -306,6 +390,8 @@ impl Default for FileBrowser {
             open_as_sheet: false,
             save_mode: false,
             save_format: crate::file::ExportFormat::Txmh,
+            job: BrowserJob::OpenDocument,
+            video_format: VideoFormat::Mp4,
             title: "Open".into(),
             cwd: start,
             in_gallery,
@@ -321,6 +407,7 @@ impl Default for FileBrowser {
             path_edit: String::new(),
             path_edit_focused: false,
             error: None,
+            overwrite_prompt: None,
             loading: false,
             list_gen: 0,
             list_rx: None,
@@ -482,6 +569,8 @@ fn save_prefs(browser: &FileBrowser) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    let old = load_prefs();
+    let persist = browser.job.persist_filters();
     let prefs = BrowserPrefs {
         bookmarks: browser
             .bookmarks
@@ -492,8 +581,26 @@ fn save_prefs(browser: &FileBrowser) {
             })
             .collect(),
         last_cwd: Some(browser.cwd.clone()),
-        last_gallery: browser.in_gallery,
-        type_filters: Some(browser.type_filters),
+        last_save_dir: if !browser.open && browser.save_mode && !browser.picked.is_empty() {
+            browser
+                .picked
+                .first()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+                .or_else(|| Some(browser.cwd.clone()))
+        } else {
+            old.last_save_dir
+        },
+        last_gallery: if persist {
+            browser.in_gallery
+        } else {
+            old.last_gallery
+        },
+        type_filters: if persist {
+            Some(browser.type_filters)
+        } else {
+            old.type_filters
+        },
         recent_dirs: browser.recent_dirs.clone(),
         section_order: browser.section_order.clone(),
     };
@@ -563,6 +670,7 @@ fn scan_dir(cwd: &Path, filters: TypeFilters) -> Result<Vec<ListingItem>, String
 
 impl FileBrowser {
     pub fn open_for_canvas(&mut self, formats: &FormatFlags, start: Option<&Path>) {
+        self.job = BrowserJob::OpenDocument;
         self.open_as_sheet = false;
         self.save_mode = false;
         self.title = "Open canvas".into();
@@ -571,6 +679,7 @@ impl FileBrowser {
 
     /// Open files as sheets inside the current holst.
     pub fn open_for_sheet(&mut self, formats: &FormatFlags, start: Option<&Path>) {
+        self.job = BrowserJob::OpenDocument;
         self.open_as_sheet = true;
         self.save_mode = false;
         self.title = "Открыть как подвкладку".into();
@@ -586,16 +695,24 @@ impl FileBrowser {
         format: crate::file::ExportFormat,
         preferred_dir: Option<&Path>,
     ) {
+        self.job = BrowserJob::SaveDocument;
         self.open_as_sheet = false;
         self.save_mode = true;
         self.save_format = format;
         self.title = "Сохранить как".into();
         self.begin_open(formats, start);
-        // Prefer the configured save root (or collection subfolder) over last_cwd.
-        if let Some(dir) = preferred_dir {
-            let _ = std::fs::create_dir_all(dir);
-            if dir.is_dir() {
-                self.apply_loc(BrowserLoc::Dir(dir.to_path_buf()), false);
+        // Prefer last save folder; only then the configured collection root.
+        if load_prefs()
+            .last_save_dir
+            .as_ref()
+            .filter(|p| p.is_dir())
+            .is_none()
+        {
+            if let Some(dir) = preferred_dir {
+                let _ = std::fs::create_dir_all(dir);
+                if dir.is_dir() {
+                    self.apply_loc(BrowserLoc::Dir(dir.to_path_buf()), false);
+                }
             }
         }
         // Force a real folder (gallery is open-only).
@@ -623,6 +740,134 @@ impl FileBrowser {
         self.save_format
     }
 
+    pub fn job(&self) -> BrowserJob {
+        self.job
+    }
+
+    pub fn clear_job(&mut self) {
+        self.job = BrowserJob::OpenDocument;
+        self.save_mode = false;
+        self.open_as_sheet = false;
+    }
+
+    /// Pick a PNG/JPEG/WebP/BMP for a watermark (does not open a canvas).
+    pub fn open_for_pick_image(&mut self, start: Option<&Path>) {
+        self.job = BrowserJob::PickImage;
+        self.open_as_sheet = false;
+        self.save_mode = false;
+        self.title = crate::i18n::t("Выбрать ватермарку").into();
+        let flags = FormatFlags {
+            txmh: false,
+            psd: false,
+            png: true,
+            jpeg: true,
+            bmp: true,
+            webp: true,
+            gif: true,
+            tga: true,
+            tiff: true,
+            ico: true,
+            svg: true,
+        };
+        self.begin_open(&flags, start);
+        self.type_filters = TypeFilters {
+            folders: true,
+            txmh: false,
+            psd: false,
+            images: true,
+            audio: false,
+            video: false,
+            show_hidden: false,
+        };
+        self.leave_gallery();
+    }
+
+    /// Pick an audio file to mux into a demo export.
+    pub fn open_for_pick_audio(&mut self, start: Option<&Path>) {
+        self.job = BrowserJob::PickAudio;
+        self.open_as_sheet = false;
+        self.save_mode = false;
+        self.title = crate::i18n::t("Выбрать музыку").into();
+        let flags = FormatFlags {
+            txmh: false,
+            psd: false,
+            png: false,
+            jpeg: false,
+            bmp: false,
+            webp: false,
+            gif: false,
+            tga: false,
+            tiff: false,
+            ico: false,
+            svg: false,
+        };
+        self.begin_open(&flags, start);
+        self.type_filters = TypeFilters {
+            folders: true,
+            txmh: false,
+            psd: false,
+            images: false,
+            audio: true,
+            video: false,
+            show_hidden: false,
+        };
+        self.leave_gallery();
+    }
+
+    /// Save As for demo video (MP4 / WebM / GIF).
+    pub fn open_for_save_video(
+        &mut self,
+        start: Option<&Path>,
+        suggested_name: &str,
+        format: VideoFormat,
+    ) {
+        self.job = BrowserJob::SaveVideo;
+        self.open_as_sheet = false;
+        self.save_mode = true;
+        self.video_format = format;
+        self.title = crate::i18n::t("Сохранить видео").into();
+        let flags = FormatFlags {
+            txmh: false,
+            psd: false,
+            png: false,
+            jpeg: false,
+            bmp: false,
+            webp: false,
+            gif: false,
+            tga: false,
+            tiff: false,
+            ico: false,
+            svg: false,
+        };
+        self.begin_open(&flags, start);
+        self.type_filters = TypeFilters {
+            folders: true,
+            txmh: false,
+            psd: false,
+            images: false,
+            audio: false,
+            video: true,
+            show_hidden: false,
+        };
+        self.leave_gallery();
+        let mut name = suggested_name.trim().to_string();
+        if name.is_empty() {
+            name = format!("demo.{}", format.ext());
+        } else if Path::new(&name).extension().is_none() {
+            name = format!("{name}.{}", format.ext());
+        }
+        self.file_name = name;
+        self.selected.clear();
+        self.select_anchor = None;
+    }
+
+    fn leave_gallery(&mut self) {
+        if self.in_gallery {
+            let folder = self.cwd.clone();
+            self.apply_loc(BrowserLoc::Dir(folder), false);
+        }
+    }
+
     fn begin_open(&mut self, formats: &FormatFlags, start: Option<&Path>) {
         self.enabled_formats = *formats;
         let prefs = load_prefs();
@@ -642,6 +887,7 @@ impl FileBrowser {
             .clamp_to_enabled(formats);
         self.search.clear();
         self.file_name.clear();
+        self.overwrite_prompt = None;
         self.picked.clear();
         self.selected.clear();
         self.select_anchor = None;
@@ -658,24 +904,44 @@ impl FileBrowser {
         self.system_places = build_system_places();
         self.volumes = build_volumes();
         self.open = true;
-        let folder = prefs
-            .last_cwd
-            .clone()
-            .filter(|p| p.is_dir())
-            .or_else(|| {
-                start.and_then(|p| {
-                    if p.is_dir() {
-                        Some(p.to_path_buf())
-                    } else {
-                        p.parent().map(|p| p.to_path_buf())
-                    }
+        let save_job = matches!(self.job, BrowserJob::SaveDocument | BrowserJob::SaveVideo);
+        let folder = if save_job {
+            prefs
+                .last_save_dir
+                .clone()
+                .filter(|p| p.is_dir())
+                .or_else(|| {
+                    start.and_then(|p| {
+                        if p.is_dir() {
+                            Some(p.to_path_buf())
+                        } else {
+                            p.parent().map(|p| p.to_path_buf())
+                        }
+                    })
                 })
-            })
-            .filter(|p| p.is_dir())
-            .unwrap_or_else(default_start_dir);
+                .or_else(|| prefs.last_cwd.clone().filter(|p| p.is_dir()))
+                .filter(|p| p.is_dir())
+                .unwrap_or_else(default_start_dir)
+        } else {
+            prefs
+                .last_cwd
+                .clone()
+                .filter(|p| p.is_dir())
+                .or_else(|| {
+                    start.and_then(|p| {
+                        if p.is_dir() {
+                            Some(p.to_path_buf())
+                        } else {
+                            p.parent().map(|p| p.to_path_buf())
+                        }
+                    })
+                })
+                .filter(|p| p.is_dir())
+                .unwrap_or_else(default_start_dir)
+        };
         self.cwd = folder.clone();
         self.path_edit_focused = false;
-        if prefs.last_gallery {
+        if prefs.last_gallery && self.job.allows_gallery() {
             self.in_gallery = true;
             self.path_edit = "Gallery".into();
             self.history = vec![BrowserLoc::Gallery];
@@ -709,7 +975,9 @@ impl FileBrowser {
                 self.in_gallery = true;
                 self.selected.clear();
                 self.select_anchor = None;
-                self.file_name.clear();
+                if !self.save_mode {
+                    self.file_name.clear();
+                }
                 self.detail_path = None;
                 self.detail_tex = None;
                 self.detail_rx = None;
@@ -860,7 +1128,9 @@ impl FileBrowser {
         self.in_gallery = false;
         self.selected.clear();
         self.select_anchor = None;
-        self.file_name.clear();
+        if !self.save_mode {
+            self.file_name.clear();
+        }
         self.detail_path = None;
         self.detail_tex = None;
         self.detail_rx = None;
@@ -1109,7 +1379,9 @@ impl FileBrowser {
                 .unwrap_or_default();
             self.kick_detail_preview(path);
         } else if self.selected.len() == 1 && self.selected[0].is_dir() {
-            self.file_name.clear();
+            if !self.save_mode {
+                self.file_name.clear();
+            }
             self.detail_path = None;
             self.detail_tex = None;
             self.detail_rx = None;
@@ -1119,7 +1391,7 @@ impl FileBrowser {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
             self.kick_detail_preview(file);
-        } else {
+        } else if !self.save_mode {
             self.file_name.clear();
             self.detail_path = None;
             self.detail_tex = None;
@@ -1249,12 +1521,25 @@ impl FileBrowser {
             self.error = Some("Введите имя файла".into());
             return;
         }
-        let ext = self.save_format.extension();
+        let ext = if self.job == BrowserJob::SaveVideo {
+            self.video_format.ext()
+        } else {
+            self.save_format.extension()
+        };
         let path = crate::file::ensure_extension(self.cwd.join(name), ext);
         self.file_name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or(self.file_name.clone());
+        if path.exists() && self.overwrite_prompt.as_ref() != Some(&path) {
+            self.overwrite_prompt = Some(path);
+            return;
+        }
+        self.finish_save(path);
+    }
+
+    fn finish_save(&mut self, path: PathBuf) {
+        self.overwrite_prompt = None;
         self.picked = vec![path];
         self.open = false;
         save_prefs(self);
@@ -1302,6 +1587,8 @@ impl FileBrowser {
         let mut delete_path: Option<PathBuf> = None;
         let mut section_order_dirty = false;
         let mut drop_section: Option<(SideSection, SideSection)> = None;
+        let mut overwrite_yes = false;
+        let mut overwrite_no = false;
 
         let folder_name = if self.in_gallery {
             "Gallery".to_owned()
@@ -1328,10 +1615,15 @@ impl FileBrowser {
                 .with_max_inner_size([1480.0, 900.0])
                 .with_resizable(true),
             |vp_ctx, class| {
-                if vp_ctx.input(|i| {
-                    i.viewport().close_requested() || i.key_pressed(egui::Key::Escape)
-                }) {
+                if vp_ctx.input(|i| i.viewport().close_requested()) {
                     close = true;
+                }
+                if vp_ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    if self.overwrite_prompt.is_some() {
+                        overwrite_no = true;
+                    } else {
+                        close = true;
+                    }
                 }
 
                 let window_title = self.title.clone();
@@ -1373,11 +1665,30 @@ impl FileBrowser {
                         }
                         ui.add_space(4.0);
                         // Filter funnel
-                        let filter_active = !self.type_filters.folders
-                            || !self.type_filters.txmh
-                            || !self.type_filters.psd
-                            || !self.type_filters.images
-                            || self.type_filters.show_hidden;
+                        let filter_active = match self.job {
+                            BrowserJob::PickImage => {
+                                !self.type_filters.folders
+                                    || !self.type_filters.images
+                                    || self.type_filters.show_hidden
+                            }
+                            BrowserJob::PickAudio => {
+                                !self.type_filters.folders
+                                    || !self.type_filters.audio
+                                    || self.type_filters.show_hidden
+                            }
+                            BrowserJob::SaveVideo => {
+                                !self.type_filters.folders
+                                    || !self.type_filters.video
+                                    || self.type_filters.show_hidden
+                            }
+                            _ => {
+                                !self.type_filters.folders
+                                    || !self.type_filters.txmh
+                                    || !self.type_filters.psd
+                                    || !self.type_filters.images
+                                    || self.type_filters.show_hidden
+                            }
+                        };
                         let filter_btn = ui.add(
                             egui::Button::new(
                                 egui::RichText::new("▾ Filter")
@@ -1416,14 +1727,33 @@ impl FileBrowser {
                             if ui.checkbox(&mut f.folders, "📁  Folders").changed() {
                                 filter_changed = true;
                             }
-                            if ui.checkbox(&mut f.txmh, "🖌  TXMH / Beautiful").changed() {
-                                filter_changed = true;
-                            }
-                            if ui.checkbox(&mut f.psd, "🗂  PSD Files").changed() {
-                                filter_changed = true;
-                            }
-                            if ui.checkbox(&mut f.images, "🖼  Image Files").changed() {
-                                filter_changed = true;
+                            match self.job {
+                                BrowserJob::PickImage => {
+                                    if ui.checkbox(&mut f.images, "🖼  Image Files").changed() {
+                                        filter_changed = true;
+                                    }
+                                }
+                                BrowserJob::PickAudio => {
+                                    if ui.checkbox(&mut f.audio, "🎵  Audio").changed() {
+                                        filter_changed = true;
+                                    }
+                                }
+                                BrowserJob::SaveVideo => {
+                                    if ui.checkbox(&mut f.video, "🎬  Video").changed() {
+                                        filter_changed = true;
+                                    }
+                                }
+                                _ => {
+                                    if ui.checkbox(&mut f.txmh, "🖌  TXMH / Beautiful").changed() {
+                                        filter_changed = true;
+                                    }
+                                    if ui.checkbox(&mut f.psd, "🗂  PSD Files").changed() {
+                                        filter_changed = true;
+                                    }
+                                    if ui.checkbox(&mut f.images, "🖼  Image Files").changed() {
+                                        filter_changed = true;
+                                    }
+                                }
                             }
                             ui.separator();
                             if ui.checkbox(&mut f.show_hidden, "Show Hidden").changed() {
@@ -1708,13 +2038,15 @@ impl FileBrowser {
                                                 }
                                             }
                                             SideSection::System => {
-                                                if side_row(
-                                                    ui,
-                                                    row_w,
-                                                    "🎨",
-                                                    "Gallery",
-                                                    self.in_gallery,
-                                                ) {
+                                                if self.job.allows_gallery()
+                                                    && side_row(
+                                                        ui,
+                                                        row_w,
+                                                        "🎨",
+                                                        "Gallery",
+                                                        self.in_gallery,
+                                                    )
+                                                {
                                                     open_gallery = true;
                                                 }
                                                 for p in &self.system_places {
@@ -2267,12 +2599,35 @@ impl FileBrowser {
                         } else {
                             "File name:"
                         }));
-                        ui.add(
+                        let name_edit = ui.add(
                             egui::TextEdit::singleline(&mut self.file_name)
                                 .desired_width((full.width() * 0.36).clamp(160.0, 360.0))
                                 .text_color(theme::text()),
                         );
-                        if self.save_mode {
+                        if name_edit.changed() {
+                            self.overwrite_prompt = None;
+                        }
+                        if self.job == BrowserJob::SaveVideo {
+                            let mut vfmt = self.video_format;
+                            egui::ComboBox::from_id_salt("fb_save_video_format")
+                                .selected_text(vfmt.label())
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    for f in [VideoFormat::Mp4, VideoFormat::Webm, VideoFormat::Gif]
+                                    {
+                                        ui.selectable_value(&mut vfmt, f, theme::label(f.label()));
+                                    }
+                                });
+                            if vfmt != self.video_format {
+                                let stem = Path::new(&self.file_name)
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or_else(|| "demo".into());
+                                self.video_format = vfmt;
+                                self.file_name = format!("{stem}.{}", vfmt.ext());
+                            }
+                        } else if self.save_mode {
                             let mut fmt = self.save_format;
                             egui::ComboBox::from_id_salt("fb_save_format")
                                 .selected_text(fmt.label())
@@ -2280,9 +2635,15 @@ impl FileBrowser {
                                 .show_ui(ui, |ui| {
                                     for f in [
                                         crate::file::ExportFormat::Txmh,
+                                        crate::file::ExportFormat::Psd,
                                         crate::file::ExportFormat::Png,
                                         crate::file::ExportFormat::Jpeg,
-                                        crate::file::ExportFormat::Psd,
+                                        crate::file::ExportFormat::Bmp,
+                                        crate::file::ExportFormat::Tga,
+                                        crate::file::ExportFormat::Webp,
+                                        crate::file::ExportFormat::Gif,
+                                        crate::file::ExportFormat::Tiff,
+                                        crate::file::ExportFormat::Ico,
                                     ] {
                                         ui.selectable_value(&mut fmt, f, theme::label(f.label()));
                                     }
@@ -2325,6 +2686,54 @@ impl FileBrowser {
                         });
                     });
                 });
+
+                if let Some(path) = self.overwrite_prompt.as_ref() {
+                    ui.painter().rect_filled(
+                        full,
+                        0.0,
+                        egui::Color32::from_black_alpha(150),
+                    );
+                    let card = egui::Rect::from_center_size(
+                        full.center(),
+                        egui::vec2(440.0, 148.0),
+                    );
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(card), |ui| {
+                        egui::Frame::window(&ui.ctx().style())
+                            .fill(theme::menu_fill())
+                            .stroke(theme::material_stroke())
+                            .corner_radius(10.0)
+                            .inner_margin(egui::Margin::same(14))
+                            .show(ui, |ui| {
+                                ui.set_min_width(410.0);
+                                ui.label(theme::label(crate::i18n::t(
+                                    "Файл уже существует. Заменить?",
+                                )));
+                                ui.add_space(6.0);
+                                let shown = path
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| path.display().to_string());
+                                ui.label(theme::label_dim(shown));
+                                ui.add_space(12.0);
+                                ui.horizontal(|ui| {
+                                    if theme::menu_btn(ui, theme::label(crate::i18n::t("Отмена")))
+                                        .clicked()
+                                    {
+                                        overwrite_no = true;
+                                    }
+                                    ui.add_space(8.0);
+                                    if theme::menu_btn(
+                                        ui,
+                                        theme::label(crate::i18n::t("Заменить")),
+                                    )
+                                    .clicked()
+                                    {
+                                        overwrite_yes = true;
+                                    }
+                                });
+                            });
+                    });
+                }
                 }; // end paint
 
                 if class == egui::ViewportClass::Embedded {
@@ -2359,6 +2768,15 @@ impl FileBrowser {
                 }
             },
         );
+
+        if overwrite_no {
+            self.overwrite_prompt = None;
+        }
+        if overwrite_yes {
+            if let Some(path) = self.overwrite_prompt.take() {
+                self.finish_save(path);
+            }
+        }
 
         if let Some((from, to)) = drop_section {
             if reorder_side_section(&mut self.section_order, from, to) {
@@ -2414,7 +2832,7 @@ impl FileBrowser {
         if let Some(p) = remove_bookmark {
             self.remove_bookmark(&p);
         }
-        if open_gallery {
+        if open_gallery && self.job.allows_gallery() {
             self.apply_loc(BrowserLoc::Gallery, true);
         }
         if let Some(p) = place_dir {

@@ -9,8 +9,7 @@ use eframe::egui;
 
 use crate::workspace::{SheetSnapshot, Workspace};
 
-/// Soft cap — refuse opening more rather than OOM.
-pub const MAX_OPEN_CANVASES: usize = 10;
+/// No hard open-tab limit (RAM only). Cold-unload still parks idle tabs.
 /// Keep this many recently focused tabs warm in RAM; older clean tabs may go cold.
 pub const KEEP_HOT_CANVASES: usize = 3;
 
@@ -56,6 +55,8 @@ pub struct OpenCanvas {
     pub parked: Option<ParkedCanvas>,
     /// Recency for cold-unload (higher = more recent).
     pub touch_seq: u64,
+    /// Time spent on this tab while it had no library path (merged on first save).
+    pub unsaved_time_secs: u64,
 }
 
 impl OpenCanvas {
@@ -88,6 +89,17 @@ pub struct OpenCanvasList {
 }
 
 impl OpenCanvasList {
+    /// Home screen: no holst tabs. Do not seed a dummy Untitled (that showed
+    /// the 1×1 RAM stub as a real canvas).
+    pub fn home_only() -> Self {
+        Self {
+            tabs: Vec::new(),
+            active: 0,
+            next_id: 1,
+            touch_clock: 0,
+        }
+    }
+
     pub fn new_primary(title: impl Into<String>) -> Self {
         Self {
             tabs: vec![OpenCanvas {
@@ -99,6 +111,7 @@ impl OpenCanvasList {
                 saved_edit_gen: 0,
                 parked: None,
                 touch_seq: 1,
+                unsaved_time_secs: 0,
             }],
             active: 0,
             next_id: 2,
@@ -132,11 +145,16 @@ impl OpenCanvasList {
     }
 
     pub fn can_open_more(&self) -> bool {
-        self.tabs.len() < MAX_OPEN_CANVASES
+        true
     }
 
     pub fn find_path(&self, path: &Path) -> Option<usize> {
         self.tabs.iter().position(|t| t.path.as_deref() == Some(path))
+    }
+
+    /// First tab whose `edit_gen != saved_edit_gen` (caller should sync active meta first).
+    pub fn first_dirty_index(&self) -> Option<usize> {
+        self.tabs.iter().position(|t| t.is_dirty())
     }
 
     fn bump_touch(&mut self, idx: usize) {
@@ -218,9 +236,38 @@ impl OpenCanvasList {
             saved_edit_gen,
             parked: None,
             touch_seq: self.touch_clock,
+            unsaved_time_secs: 0,
         });
         self.active = self.tabs.len() - 1;
         Ok(self.active)
+    }
+
+    /// Take parked body for the active tab without switching index (Home → same tab).
+    pub fn take_active_parked(&mut self) -> Option<ParkedCanvas> {
+        if self.tabs.is_empty() {
+            return None;
+        }
+        let i = self.active_index();
+        self.bump_touch(i);
+        self.tabs[i].parked.take()
+    }
+
+    /// Clear all canvas tabs (Home-only state after closing the last tab).
+    pub fn clear_all(&mut self) {
+        self.tabs.clear();
+        self.active = 0;
+    }
+
+    /// True when there are no holst tabs (only Home is shown).
+    pub fn has_no_tabs(&self) -> bool {
+        self.tabs.is_empty()
+    }
+
+    /// Ensure at least one tab exists before syncing meta / parking.
+    pub fn ensure_primary(&mut self, title: impl Into<String>) {
+        if self.tabs.is_empty() {
+            *self = Self::new_primary(title);
+        }
     }
 
     /// Take parked body for `idx` and make it active. Returns Warm workspace or Cold flag.
@@ -289,9 +336,20 @@ impl OpenCanvasList {
             if tab.is_dirty() || tab.path.is_none() {
                 continue;
             }
+            // Only cold-unload if the on-disk file is still there — otherwise a later
+            // focus would install an empty canvas and sync could clobber identity.
+            let path_ok = tab.path.as_ref().is_some_and(|p| p.is_file());
+            if !path_ok {
+                continue;
+            }
             let Some(ParkedCanvas::Warm { workspace }) = tab.parked.take() else {
                 continue;
             };
+            // Multi-sheet holsts are not representable by a single file reload.
+            if workspace.sheets().len() > 1 {
+                tab.parked = Some(ParkedCanvas::Warm { workspace });
+                continue;
+            }
             let thumb = workspace
                 .focused_sheet()
                 .snapshot

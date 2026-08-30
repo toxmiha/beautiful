@@ -54,7 +54,16 @@ pub struct BrushDef {
     pub texture_invert: bool,
     pub texture_angle: f32,
     pub texture_move_with_stroke: bool,
-    /// Wet mix (Mixer) — Phase 1 keeps simple pickup; 0 disables.
+    #[serde(default)]
+    pub shape_path: String,
+    #[serde(default)]
+    pub shape_invert: bool,
+    #[serde(default)]
+    pub paper_path: String,
+    #[serde(default)]
+    pub pattern_path: String,
+    #[serde(default = "default_one_scale")]
+    pub pattern_scale: f32,
     pub blending: f32,
     pub dilution: f32,
     pub persistence: f32,
@@ -83,22 +92,18 @@ impl BrushDef {
         } else {
             s.angle
         };
-        // density field = Opacity (serde-compatible name).
+        // density field = Opacity (serde-compatible name). Opacity and Flow are
+        // first-class for every kind — do not remap Airbrush Opacity→Flow (that
+        // made the Opacity slider feel like Flow and forced Opacity=100%).
         let opacity = s.density.clamp(0.0, 1.0);
-        let mut flow = s.flow.clamp(0.0, 1.0);
-        let mut opacity_out = opacity;
-        // Old saves: airbrush stored flow in density and had no flow field (default 1).
-        if s.kind == BrushKind::Airbrush && (s.flow - 1.0).abs() < 1e-5 && s.density < 0.99 {
-            flow = s.density.clamp(0.0, 1.0);
-            opacity_out = 1.0;
-        }
+        let flow = s.flow.clamp(0.0, 1.0);
         Self {
             color: s.color,
             eraser,
             size: s.size,
             min_size_pct: s.min_size_pct,
             hardness,
-            opacity: opacity_out,
+            opacity,
             flow,
             min_opacity: s.min_density.clamp(0.0, 1.0),
             min_flow: s.min_flow.clamp(0.0, 1.0),
@@ -134,6 +139,11 @@ impl BrushDef {
             texture_invert: s.texture_invert,
             texture_angle: s.texture_angle,
             texture_move_with_stroke: s.texture_move_with_stroke,
+            shape_path: s.shape_path.clone(),
+            shape_invert: s.shape_invert,
+            paper_path: s.paper_path.clone(),
+            pattern_path: s.pattern_path.clone(),
+            pattern_scale: s.pattern_scale.max(0.05),
             blending: s.blending,
             dilution: s.dilution,
             persistence: s.persistence,
@@ -223,6 +233,12 @@ impl BrushDef {
     }
 
     pub fn is_pixel_art(&self) -> bool {
-        self.shape == BrushShape::Square && self.hardness >= 0.999
+        matches!(self.shape, BrushShape::Square | BrushShape::Ring)
+            && self.hardness >= 0.999
+            && self.spacing >= 0.95
     }
+}
+
+fn default_one_scale() -> f32 {
+    1.0
 }

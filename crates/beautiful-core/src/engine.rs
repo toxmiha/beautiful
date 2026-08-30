@@ -6,17 +6,236 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::color::{
-    load_premul_linear, make_src_premul_linear, source_over_premul, srgb_to_linear,
+    linear_to_srgb, load_premul_linear, make_src_premul_linear, source_over_premul, srgb_to_linear,
 };
 use crate::selection::SelectionMask;
 use crate::tiles::{TileBuffer, TILE_SIZE};
 use crate::tip::TipCache;
 use crate::{BrushKind, BrushSettings, BrushShape, BrushTexture, Layer, StrokeState};
 
+/// Fabric force-point smudge (bullet / snake-hook): tip center pulls nearby
+/// pixels along the stroke. Long pulls sharpen naturally; a tiny empty-only
+/// pinch tapers slightly when there is nothing to push. Far tip edge barely moves.
+#[derive(Debug, Clone, Default)]
+pub struct SmudgeStroke {
+    last_x: f32,
+    last_y: f32,
+    has_last: bool,
+}
+
+impl SmudgeStroke {
+    pub fn clear(&mut self) {
+        self.last_x = 0.0;
+        self.last_y = 0.0;
+        self.has_last = false;
+    }
+}
+
+/// Reused float buffers for smudge / clone / blur (avoid per-dab alloc of large ROIs).
+#[derive(Debug, Clone, Default)]
+pub struct EffectScratch {
+    snap: Vec<f32>,
+    /// Tip sub-rect extract while a stroke workspace owns `snap`.
+    roi: Vec<f32>,
+    blur_temp: Vec<f32>,
+    blur_out: Vec<f32>,
+    /// Dab positions for spacing planner (reused).
+    planned: Vec<(f32, f32, f32)>,
+    /// Accumulated dabs across a polyline (reused).
+    chain: Vec<(f32, f32, f32)>,
+}
+
+impl EffectScratch {
+    fn acquire(buf: &mut Vec<f32>, n: usize) -> Vec<f32> {
+        let mut v = std::mem::take(buf);
+        v.clear();
+        v.resize(n, 0.0);
+        v
+    }
+
+    fn release(buf: &mut Vec<f32>, v: Vec<f32>) {
+        *buf = v;
+    }
+}
+
+/// Stroke spacing for Blur / Smudge — same accumulator model as DabPlanner.
+/// Stationary pointer accumulates nothing → **no** dab (unlike old ceil-steps path).
+#[derive(Debug, Clone, Default)]
+pub struct EffectSpacing {
+    pub acc: f32,
+    /// First dab/seed of this stroke already happened.
+    pub started: bool,
+}
+
+impl EffectSpacing {
+    pub fn clear(&mut self) {
+        self.acc = 0.0;
+        self.started = false;
+    }
+}
+
+/// Premul mix for blur: never punch opaque paint with empty/transparent samples.
+#[inline]
+fn mix_premul_no_erase(src: [f32; 4], dst: [f32; 4], mix: f32) -> [f32; 4] {
+    let mix = mix.clamp(0.0, 1.0);
+    if src[3] <= 1e-5 {
+        return dst;
+    }
+    let inv = 1.0 - mix;
+    let mut out = [
+        src[0] * mix + dst[0] * inv,
+        src[1] * mix + dst[1] * inv,
+        src[2] * mix + dst[2] * inv,
+        src[3] * mix + dst[3] * inv,
+    ];
+    if out[3] < dst[3] {
+        let scale = dst[3] / out[3].max(1e-8);
+        out[0] *= scale;
+        out[1] *= scale;
+        out[2] *= scale;
+        out[3] = dst[3];
+    }
+    out
+}
+
+/// Same hash as brush color jitter; applied in sRGB on unpremul clone samples.
+#[inline]
+fn jitter_clone_premul(src: [f32; 4], x: f32, y: f32, jitter: f32) -> [f32; 4] {
+    if jitter <= 1e-5 {
+        return src;
+    }
+    let a = src[3];
+    if a <= 1e-5 {
+        return src;
+    }
+    let inv_a = 1.0 / a;
+    let j = jitter.clamp(0.0, 1.0) * 0.35;
+    let h = x.to_bits().wrapping_mul(0x9E37_79B9).wrapping_add(y.to_bits());
+    let h2 = h.wrapping_mul(1664525).wrapping_add(1013904223);
+    let h3 = h2.wrapping_mul(1664525).wrapping_add(1013904223);
+    let u = |bits: u32| (bits >> 8) as f32 * (1.0 / 16_777_216.0);
+    let jr = (u(h) * 2.0 - 1.0) * j;
+    let jg = (u(h2) * 2.0 - 1.0) * j;
+    let jb = (u(h3) * 2.0 - 1.0) * j;
+    let r = (linear_to_srgb(src[0] * inv_a) + jr).clamp(0.0, 1.0);
+    let g = (linear_to_srgb(src[1] * inv_a) + jg).clamp(0.0, 1.0);
+    let b = (linear_to_srgb(src[2] * inv_a) + jb).clamp(0.0, 1.0);
+    [
+        srgb_to_linear(r) * a,
+        srgb_to_linear(g) * a,
+        srgb_to_linear(b) * a,
+        a,
+    ]
+}
+
+/// Image-space fabric deposit: lerp warped sample over destination.
+/// Empty samples are valid — they stretch the sheet (snake-hook / liquify).
+/// Skipping empty was a false “anti-erase” fix that froze deformation.
+#[inline]
+fn mix_premul_smudge(src: [f32; 4], dst: [f32; 4], mix: f32) -> [f32; 4] {
+    let mix = mix.clamp(0.0, 1.0);
+    if mix <= 1e-5 {
+        return dst;
+    }
+    let inv = 1.0 - mix;
+    [
+        src[0] * mix + dst[0] * inv,
+        src[1] * mix + dst[1] * inv,
+        src[2] * mix + dst[2] * inv,
+        src[3] * mix + dst[3] * inv,
+    ]
+}
+
+/// Walk a segment placing dabs only when spacing is satisfied (paint-brush pipeline).
+/// Returns positions `(x, y, pressure)` to stamp; updates `spacing` in place.
+fn plan_effect_dabs(
+    x0: f32,
+    y0: f32,
+    p0: f32,
+    x1: f32,
+    y1: f32,
+    p1: f32,
+    step: f32,
+    spacing: &mut EffectSpacing,
+    out: &mut Vec<(f32, f32, f32)>,
+) {
+    out.clear();
+    let step = step.max(MIN_SPACING_PX);
+    let dx = x1 - x0;
+    let dy = y1 - y0;
+    let dist = (dx * dx + dy * dy).sqrt();
+
+    if !spacing.started {
+        // First contact: one dab at stroke start (matches paint_stamp on press).
+        out.push((x0, y0, p0));
+        spacing.started = true;
+        spacing.acc = 0.0;
+        if dist < 1e-6 {
+            return;
+        }
+    }
+
+    if dist < 1e-6 {
+        // Stationary — do not re-stamp (was the freeze / re-blur bug).
+        return;
+    }
+
+    let ux = dx / dist;
+    let uy = dy / dist;
+    let mut traveled = 0.0_f32;
+    let mut acc = spacing.acc;
+    let mut guard = 0_u32;
+    while traveled < dist && guard < 100_000 {
+        guard += 1;
+        let need = step - acc;
+        let remain = dist - traveled;
+        if remain < need {
+            acc += remain;
+            break;
+        }
+        traveled += need;
+        acc = 0.0;
+        let t = (traveled / dist).clamp(0.0, 1.0);
+        let p = p0 + (p1 - p0) * t;
+        out.push((x0 + ux * traveled, y0 + uy * traveled, p));
+    }
+    spacing.acc = acc;
+}
+
+/// Horizontal pixel span where tip coverage can be non-zero (circular support).
+/// Same geometry as `TipCache::coverage_at` early-out — no quality change.
+#[inline]
+fn tip_row_x_span(cx: f32, cy: f32, py: i32, r2: f32) -> Option<(i32, i32)> {
+    let dy = (py as f32 + 0.5) - cy;
+    let t = r2 - dy * dy;
+    if t < 0.0 {
+        return None;
+    }
+    let dx = t.sqrt();
+    let x0 = (cx - dx - 0.5).ceil() as i32;
+    let x1 = (cx + dx - 0.5).floor() as i32 + 1;
+    if x0 >= x1 {
+        None
+    } else {
+        Some((x0, x1))
+    }
+}
+
 /// Minimum spacing as fraction of diameter.
 pub const MIN_SPACING: f32 = 0.025;
 /// Floor on absolute spacing in pixels (below this is wasteful).
 pub const MIN_SPACING_PX: f32 = 0.35;
+
+#[inline]
+fn effect_parallel_tiles(n_keys: usize, x0c: i32, y0c: i32, x1c: i32, y1c: i32) -> bool {
+    n_keys >= 2 && (x1c - x0c) as u64 * (y1c - y0c) as u64 >= (TILE_SIZE as u64).pow(2)
+}
+
+#[inline]
+fn copy_f32_px_span(dst: &mut [f32], di: usize, src: &[f32], si: usize, px: usize) {
+    let n = px * 4;
+    dst[di..di + n].copy_from_slice(&src[si..si + n]);
+}
 
 impl Layer {
     /// Stamp into paint tiles only. Returns dab bounds; caller must `flush_paint_f_rect`
@@ -396,6 +615,10 @@ impl Layer {
                 y0c,
                 x1c,
                 y1c,
+                x0,
+                y0,
+                n,
+                brush.shape,
                 density,
                 eraser,
                 ink_lin,
@@ -566,29 +789,66 @@ impl Layer {
         Some((bx0, by0, bx1, by1))
     }
 
+    /// Fabric force-point smudge: tip center pulls nearby pixels along Δ (like grabbing cloth).
+    /// Empty has no material → effect dies into a cone; moving back onto paint pulls again.
     pub fn smudge_stamp(
         &mut self,
         x: f32,
         y: f32,
         radius: f32,
         strength: f32,
+        hardness: f32,
         tip: &mut TipCache,
         clip: Option<&SelectionMask>,
+        stroke: &mut SmudgeStroke,
+        scratch: &mut EffectScratch,
     ) -> Option<(i32, i32, i32, i32)> {
         let radius = radius.clamp(0.5, 256.0);
         let strength = strength.clamp(0.0, 1.0);
         if strength <= 0.001 {
             return None;
         }
-        let hardness = 0.35;
+        let hardness = hardness.clamp(0.0, 1.0);
         let extent = tip.ensure(radius, hardness);
 
-        let (sr, sg, sb, sa) = self.sample_rgba_f(x, y);
-        if sa < 0.01 {
+        if !stroke.has_last {
+            stroke.last_x = x;
+            stroke.last_y = y;
+            stroke.has_last = true;
             return None;
         }
-        let ink_lin = [srgb_to_linear(sr), srgb_to_linear(sg), srgb_to_linear(sb)];
+        let off_x = x - stroke.last_x;
+        let off_y = y - stroke.last_y;
+        if off_x * off_x + off_y * off_y < 1e-8 {
+            stroke.last_x = x;
+            stroke.last_y = y;
+            return None;
+        }
 
+        let (x0c, y0c, x1c, y1c) = self.effect_tip_clip(x, y, extent, clip)?;
+        // Samples follow dab Δ only (no artificial pinch lookup).
+        let pad = (off_x.abs().ceil() as i32).max(off_y.abs().ceil() as i32) + 3;
+        let sx0 = ((x0c as f32 - off_x).floor() as i32 - pad).min(x0c - pad);
+        let sy0 = ((y0c as f32 - off_y).floor() as i32 - pad).min(y0c - pad);
+        let sx1 = ((x1c as f32 - off_x).ceil() as i32 + pad).max(x1c + pad);
+        let sy1 = ((y1c as f32 - off_y).ceil() as i32 + pad).max(y1c + pad);
+        self.warm_paint_rect(sx0, sy0, sx1, sy1);
+        let mut snap = self.snapshot_premul_roi_ex(sx0, sy0, sx1, sy1, true, false, scratch);
+        let bounds = self.smudge_fabric_dab(
+            x, y, radius, strength, hardness, tip, clip, stroke, &mut snap,
+        );
+        EffectScratch::release(&mut scratch.snap, snap.data);
+        bounds
+    }
+
+    /// Tip bbox clipped to canvas (+ optional selection).
+    fn effect_tip_clip(
+        &self,
+        x: f32,
+        y: f32,
+        extent: i32,
+        clip: Option<&SelectionMask>,
+    ) -> Option<(i32, i32, i32, i32)> {
         let x0 = (x - extent as f32).floor() as i32;
         let y0 = (y - extent as f32).floor() as i32;
         let x1 = (x + extent as f32).ceil() as i32 + 1;
@@ -605,7 +865,7 @@ impl Layer {
             let mx1 = mx0 + m.width as i32;
             let my1 = my0 + m.height as i32;
             if x1c <= mx0 || y1c <= my0 || x0c >= mx1 || y0c >= my1 {
-                return Some((x0, y0, x1, y1));
+                return None;
             }
             x0c = x0c.max(mx0);
             y0c = y0c.max(my0);
@@ -613,56 +873,334 @@ impl Layer {
             y1c = y1c.min(my1);
         }
         if x0c >= x1c || y0c >= y1c {
-            return Some((x0, y0, x1, y1));
+            None
+        } else {
+            Some((x0c, y0c, x1c, y1c))
+        }
+    }
+
+    fn warm_paint_rect(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
+        let w = self.width as i32;
+        let h = self.height as i32;
+        let x0 = x0.clamp(0, w);
+        let y0 = y0.clamp(0, h);
+        let x1 = x1.clamp(0, w).max(x0);
+        let y1 = y1.clamp(0, h).max(y0);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        for key in TileBuffer::tiles_covering_rect(x0, y0, x1, y1) {
+            self.paint_tiles
+                .ensure_region(key, &self.tiles, x0, y0, x1, y1);
+        }
+    }
+
+    /// One fabric dab. Snap is read-only during the dab; patched from paint afterward.
+    fn smudge_fabric_dab(
+        &mut self,
+        x: f32,
+        y: f32,
+        radius: f32,
+        strength: f32,
+        hardness: f32,
+        tip: &mut TipCache,
+        clip: Option<&SelectionMask>,
+        stroke: &mut SmudgeStroke,
+        snap: &mut PremulRoi,
+    ) -> Option<(i32, i32, i32, i32)> {
+        let radius = radius.clamp(0.5, 256.0);
+        let strength = strength.clamp(0.0, 1.0);
+        if strength <= 0.001 {
+            return None;
+        }
+        let hardness = hardness.clamp(0.0, 1.0);
+        let extent = tip.ensure(radius, hardness);
+        let r2 = (extent as f32) * (extent as f32);
+
+        let x0 = (x - extent as f32).floor() as i32;
+        let y0 = (y - extent as f32).floor() as i32;
+        let x1 = (x + extent as f32).ceil() as i32 + 1;
+        let y1 = (y + extent as f32).ceil() as i32 + 1;
+
+        if !stroke.has_last {
+            stroke.last_x = x;
+            stroke.last_y = y;
+            stroke.has_last = true;
+            return None;
+        }
+        let off_x = x - stroke.last_x;
+        let off_y = y - stroke.last_y;
+        if off_x * off_x + off_y * off_y < 1e-8 {
+            stroke.last_x = x;
+            stroke.last_y = y;
+            return None;
         }
 
+        let (x0c, y0c, x1c, y1c) = self.effect_tip_clip(x, y, extent, clip)?;
+        let pull = strength.clamp(0.05, 1.0);
+        // Bullet core, but not a needle: mild steepness so capture isn't tiny.
+        let fall_gamma = 1.65_f32;
+        // Tiny axis pinch only when there's nothing to push (empty α) — slight
+        // taper into transparency, not a full artificial cone on solid paint.
+        let empty_pinch = 0.08_f32;
+        let move_x = off_x;
+        let move_y = off_y;
+
         let keys: Vec<_> = TileBuffer::tiles_covering_rect(x0c, y0c, x1c, y1c).collect();
-        let ts = TILE_SIZE as i32;
-        self.paint_tiles.mark_dirty_keys(&keys);
-        for key in keys {
-            let (tx, ty) = key;
-            let (ox, oy) = TileBuffer::tile_origin(tx, ty);
-            let tip_ref = &*tip;
+        for &key in &keys {
             self.paint_tiles
                 .ensure_region(key, &self.tiles, x0c, y0c, x1c, y1c);
-            let pf = self
-                .paint_tiles
-                .get_mut_slice(key)
-                .expect("paint tile warmed");
-            let py0 = y0c.max(oy);
-            let py1 = y1c.min(oy + ts);
-            let px_lo = x0c.max(ox);
-            let px_hi = x1c.min(ox + ts);
+        }
+        self.paint_tiles.mark_dirty_keys(&keys);
+        let tip_ref = &*tip;
+        if effect_parallel_tiles(keys.len(), x0c, y0c, x1c, y1c) {
+            let mut tiles = self.paint_tiles.take_tiles(&keys);
+            tiles.par_iter_mut().for_each(|(key, tile)| {
+                let pf: &mut Vec<f32> = Arc::make_mut(tile);
+                stamp_smudge_tile(
+                    key,
+                    pf.as_mut_slice(),
+                    x,
+                    y,
+                    r2,
+                    x0c,
+                    y0c,
+                    x1c,
+                    y1c,
+                    pull,
+                    fall_gamma,
+                    empty_pinch,
+                    move_x,
+                    move_y,
+                    tip_ref,
+                    snap,
+                    clip,
+                );
+            });
+            self.paint_tiles.put_tiles(tiles);
+        } else {
+            for key in keys {
+                let Some(pf) = self.paint_tiles.get_mut_slice(key) else {
+                    continue;
+                };
+                stamp_smudge_tile(
+                    &key,
+                    pf,
+                    x,
+                    y,
+                    r2,
+                    x0c,
+                    y0c,
+                    x1c,
+                    y1c,
+                    pull,
+                    fall_gamma,
+                    empty_pinch,
+                    move_x,
+                    move_y,
+                    tip_ref,
+                    snap,
+                    clip,
+                );
+            }
+        }
+        self.patch_snap_from_paint(snap, x0c, y0c, x1c, y1c, x, y, r2);
+        stroke.last_x = x;
+        stroke.last_y = y;
+        Some((x0, y0, x1, y1))
+    }
+
+    /// Copy painted tip pixels back into the workspace. Only the circular
+    /// support is written by the dab — patching the AABB square was wasted work.
+    fn patch_snap_from_paint(
+        &self,
+        snap: &mut PremulRoi,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        cx: f32,
+        cy: f32,
+        r2: f32,
+    ) {
+        let ts = TILE_SIZE as i32;
+        for key in TileBuffer::tiles_covering_rect(x0, y0, x1, y1) {
+            let (ox, oy) = TileBuffer::tile_origin(key.0, key.1);
+            let Some(pf) = self.paint_tiles.get_f_slice(key) else {
+                continue;
+            };
+            let py0 = y0.max(oy);
+            let py1 = y1.min(oy + ts);
+            if py0 >= py1 {
+                continue;
+            }
             for py in py0..py1 {
+                let Some((sx0, sx1)) = tip_row_x_span(cx, cy, py, r2) else {
+                    continue;
+                };
                 let ly = (py - oy) as usize;
-                for px in px_lo..px_hi {
-                    let dx = (px as f32 + 0.5) - x;
-                    let dy = (py as f32 + 0.5) - y;
-                    let cov = tip_ref.coverage_at(dx, dy);
-                    if cov <= 1e-5 {
-                        continue;
-                    }
-                    let mut mix = (strength * cov).clamp(0.0, 1.0);
-                    if let Some(m) = clip {
-                        let ma = m.sample(px as f32 + 0.5, py as f32 + 0.5) as f32 / 255.0;
-                        if ma <= 1e-5 {
-                            continue;
-                        }
-                        mix *= ma;
-                    }
-                    if mix <= 1e-5 {
-                        continue;
-                    }
+                let px0 = x0.max(ox).max(sx0);
+                let px1 = x1.min(ox + ts).min(sx1);
+                if px0 >= px1 {
+                    continue;
+                }
+                for px in px0..px1 {
                     let lx = (px - ox) as usize;
                     let i = (ly * TILE_SIZE as usize + lx) * 4;
-                    let dst = [pf[i], pf[i + 1], pf[i + 2], pf[i + 3]];
-                    let src = make_src_premul_linear(ink_lin, mix * sa);
-                    let out = source_over_premul(src, dst);
-                    pf[i..i + 4].copy_from_slice(&out);
+                    snap.put_doc(px, py, [pf[i], pf[i + 1], pf[i + 2], pf[i + 3]]);
                 }
             }
         }
-        Some((x0, y0, x1, y1))
+    }
+
+    /// Premul RGBA snapshot. When `edge_clamp` is set, the requested rect may extend
+    /// outside the canvas — out-of-bounds samples repeat the edge pixel (no zero pad).
+    fn snapshot_premul_roi_ex(
+        &self,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        include_paint: bool,
+        edge_clamp: bool,
+        scratch: &mut EffectScratch,
+    ) -> PremulRoi {
+        let w = self.width as i32;
+        let h = self.height as i32;
+        let (x0, y0, x1, y1) = if edge_clamp {
+            (x0, y0, x1.max(x0), y1.max(y0))
+        } else {
+            let x0 = x0.clamp(0, w);
+            let y0 = y0.clamp(0, h);
+            let x1 = x1.clamp(0, w).max(x0);
+            let y1 = y1.clamp(0, h).max(y0);
+            (x0, y0, x1, y1)
+        };
+        let rw = (x1 - x0) as usize;
+        let rh = (y1 - y0) as usize;
+        let n = rw.saturating_mul(rh).saturating_mul(4);
+        let mut data = EffectScratch::acquire(&mut scratch.snap, n);
+        if rw == 0 || rh == 0 || w <= 0 || h <= 0 {
+            return PremulRoi {
+                x0,
+                y0,
+                w: rw as i32,
+                h: rh as i32,
+                data,
+            };
+        }
+        let wm1 = w - 1;
+        let hm1 = h - 1;
+
+        if edge_clamp {
+            let ix0 = x0.max(0);
+            let iy0 = y0.max(0);
+            let ix1 = x1.min(w);
+            let iy1 = y1.min(h);
+            if ix0 < ix1 && iy0 < iy1 {
+                for key in TileBuffer::tiles_covering_rect(ix0, iy0, ix1, iy1) {
+                    let (ox, oy) = TileBuffer::tile_origin(key.0, key.1);
+                    let ts = TILE_SIZE as i32;
+                    let tx0 = ix0.max(ox);
+                    let ty0 = iy0.max(oy);
+                    let tx1 = ix1.min(ox + ts);
+                    let ty1 = iy1.min(oy + ts);
+                    if tx0 >= tx1 || ty0 >= ty1 {
+                        continue;
+                    }
+                    if include_paint {
+                        if let Some(pf) = self.paint_tiles.get_f_slice(key) {
+                            for py in ty0..ty1 {
+                                let ly = (py - oy) as usize;
+                                let row = ((py - y0) as usize) * rw;
+                                let src_row = ly * TILE_SIZE as usize;
+                                let si = (src_row + (tx0 - ox) as usize) * 4;
+                                let di = (row + (tx0 - x0) as usize) * 4;
+                                copy_f32_px_span(&mut data, di, pf, si, (tx1 - tx0) as usize);
+                            }
+                            continue;
+                        }
+                    }
+                    if let Some(tile) = self.tiles.get_tile(key.0, key.1) {
+                        for py in ty0..ty1 {
+                            let ly = (py - oy) as usize;
+                            let row = ((py - y0) as usize) * rw;
+                            let src_row = ly * TILE_SIZE as usize;
+                            for px in tx0..tx1 {
+                                let lx = (px - ox) as usize;
+                                let si = (src_row + lx) * 4;
+                                let di = (row + (px - x0) as usize) * 4;
+                                let p = load_premul_linear(&tile[si..si + 4]);
+                                data[di..di + 4].copy_from_slice(&p);
+                            }
+                        }
+                    }
+                }
+            }
+            let copy_pix = |data: &mut [f32], dx: i32, dy: i32, sx: i32, sy: i32| {
+                let di = (((dy - y0) as usize) * rw + (dx - x0) as usize) * 4;
+                let si = (((sy - y0) as usize) * rw + (sx - x0) as usize) * 4;
+                if di + 4 <= data.len() && si + 4 <= data.len() {
+                    data.copy_within(si..si + 4, di);
+                }
+            };
+            for py in y0..y1 {
+                let sy = py.clamp(0, hm1);
+                for px in x0..x1 {
+                    let sx = px.clamp(0, wm1);
+                    if sx == px && sy == py {
+                        continue;
+                    }
+                    copy_pix(&mut data, px, py, sx, sy);
+                }
+            }
+        } else {
+            for key in TileBuffer::tiles_covering_rect(x0, y0, x1, y1) {
+                let (ox, oy) = TileBuffer::tile_origin(key.0, key.1);
+                let ts = TILE_SIZE as i32;
+                let ix0 = x0.max(ox);
+                let iy0 = y0.max(oy);
+                let ix1 = x1.min(ox + ts);
+                let iy1 = y1.min(oy + ts);
+                if ix0 >= ix1 || iy0 >= iy1 {
+                    continue;
+                }
+                if include_paint {
+                    if let Some(pf) = self.paint_tiles.get_f_slice(key) {
+                        for py in iy0..iy1 {
+                            let ly = (py - oy) as usize;
+                            let row = ((py - y0) as usize) * rw;
+                            let src_row = ly * TILE_SIZE as usize;
+                            let si = (src_row + (ix0 - ox) as usize) * 4;
+                            let di = (row + (ix0 - x0) as usize) * 4;
+                            copy_f32_px_span(&mut data, di, pf, si, (ix1 - ix0) as usize);
+                        }
+                        continue;
+                    }
+                }
+                if let Some(tile) = self.tiles.get_tile(key.0, key.1) {
+                    for py in iy0..iy1 {
+                        let ly = (py - oy) as usize;
+                        let row = ((py - y0) as usize) * rw;
+                        let src_row = ly * TILE_SIZE as usize;
+                        for px in ix0..ix1 {
+                            let lx = (px - ox) as usize;
+                            let si = (src_row + lx) * 4;
+                            let di = (row + (px - x0) as usize) * 4;
+                            let p = load_premul_linear(&tile[si..si + 4]);
+                            data[di..di + 4].copy_from_slice(&p);
+                        }
+                    }
+                }
+            }
+        }
+        PremulRoi {
+            x0,
+            y0,
+            w: rw as i32,
+            h: rh as i32,
+            data,
+        }
     }
 
     pub fn smudge_segment(
@@ -676,40 +1214,629 @@ impl Layer {
         brush: &BrushSettings,
         tip: &mut TipCache,
         clip: Option<&SelectionMask>,
+        stroke: &mut SmudgeStroke,
+        scratch: &mut EffectScratch,
+        spacing: &mut EffectSpacing,
     ) -> Option<(i32, i32, i32, i32)> {
-        let dx = x1 - x0;
-        let dy = y1 - y0;
-        let dist = (dx * dx + dy * dy).sqrt();
-        if dist < 1e-4 {
+        let avg_size = (brush.effective_size(p0) + brush.effective_size(p1)) * 0.5;
+        let spacing_frac = brush.spacing.clamp(MIN_SPACING, 1.0).min(0.03);
+        let step = (avg_size * spacing_frac).max(0.25);
+        plan_effect_dabs(
+            x0,
+            y0,
+            p0,
+            x1,
+            y1,
+            p1,
+            step,
+            spacing,
+            &mut scratch.planned,
+        );
+        if scratch.planned.is_empty() {
             return None;
         }
-        let avg_size = (brush.effective_size(p0) + brush.effective_size(p1)) * 0.5;
-        let step = (avg_size * 0.15).max(1.0);
-        let steps = (dist / step).ceil() as i32;
-        let steps = steps.clamp(1, 100_000);
+        let planned = std::mem::take(&mut scratch.planned);
+        let pad = (step.ceil() as i32) + 4;
+        let bounds = self.smudge_planned_dabs(
+            &planned,
+            brush,
+            pad,
+            tip,
+            clip,
+            stroke,
+            scratch,
+        );
+        scratch.planned = planned;
+        scratch.planned.clear();
+        bounds
+    }
+
+    /// All smudge dabs of a polyline with **one** paint snapshot. Equivalent to
+    /// per-segment resnapshot because each dab patches the workspace from paint.
+    pub fn smudge_polyline(
+        &mut self,
+        points: &[(f32, f32, f32)],
+        brush: &BrushSettings,
+        tip: &mut TipCache,
+        clip: Option<&SelectionMask>,
+        stroke: &mut SmudgeStroke,
+        scratch: &mut EffectScratch,
+        spacing: &mut EffectSpacing,
+    ) -> Option<(i32, i32, i32, i32)> {
+        if points.len() < 2 {
+            return None;
+        }
+        scratch.chain.clear();
+        let mut max_step = 0.25_f32;
+        for w in points.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let avg_size = (brush.effective_size(a.2) + brush.effective_size(b.2)) * 0.5;
+            let spacing_frac = brush.spacing.clamp(MIN_SPACING, 1.0).min(0.03);
+            let step = (avg_size * spacing_frac).max(0.25);
+            max_step = max_step.max(step);
+            plan_effect_dabs(
+                a.0,
+                a.1,
+                a.2,
+                b.0,
+                b.1,
+                b.2,
+                step,
+                spacing,
+                &mut scratch.planned,
+            );
+            scratch.chain.extend_from_slice(&scratch.planned);
+        }
+        if scratch.chain.is_empty() {
+            return None;
+        }
+        let planned = std::mem::take(&mut scratch.chain);
+        let pad = (max_step.ceil() as i32) + 4;
+        let bounds = self.smudge_planned_dabs(
+            &planned,
+            brush,
+            pad,
+            tip,
+            clip,
+            stroke,
+            scratch,
+        );
+        scratch.chain = planned;
+        scratch.chain.clear();
+        bounds
+    }
+
+    fn smudge_planned_dabs(
+        &mut self,
+        planned: &[(f32, f32, f32)],
+        brush: &BrushSettings,
+        pad: i32,
+        tip: &mut TipCache,
+        clip: Option<&SelectionMask>,
+        stroke: &mut SmudgeStroke,
+        scratch: &mut EffectScratch,
+    ) -> Option<(i32, i32, i32, i32)> {
+        if planned.is_empty() {
+            return None;
+        }
+        let hardness = brush.hardness.clamp(0.0, 1.0);
+
+        let mut ux0 = i32::MAX;
+        let mut uy0 = i32::MAX;
+        let mut ux1 = i32::MIN;
+        let mut uy1 = i32::MIN;
+        for &(x, y, p) in planned {
+            let r = brush.effective_size(p) * 0.5;
+            let e = (TipCache::effective_radius(r, hardness) + 1.0).ceil() as i32;
+            ux0 = ux0.min((x - e as f32).floor() as i32);
+            uy0 = uy0.min((y - e as f32).floor() as i32);
+            ux1 = ux1.max((x + e as f32).ceil() as i32 + 1);
+            uy1 = uy1.max((y + e as f32).ceil() as i32 + 1);
+        }
+        // Room for dab Δ + tiny empty-pinch samples.
+        ux0 -= pad;
+        uy0 -= pad;
+        ux1 += pad;
+        uy1 += pad;
+        let w = self.width as i32;
+        let h = self.height as i32;
+        ux0 = ux0.clamp(0, w);
+        uy0 = uy0.clamp(0, h);
+        ux1 = ux1.clamp(0, w).max(ux0);
+        uy1 = uy1.clamp(0, h).max(uy0);
+
+        self.warm_paint_rect(ux0, uy0, ux1, uy1);
+        let mut snap = self.snapshot_premul_roi_ex(ux0, uy0, ux1, uy1, true, false, scratch);
+
         let mut bx0 = i32::MAX;
         let mut by0 = i32::MAX;
         let mut bx1 = i32::MIN;
         let mut by1 = i32::MIN;
-        for i in 1..=steps {
-            let t = i as f32 / steps as f32;
-            let x = x0 + dx * t;
-            let y = y0 + dy * t;
-            let p = p0 + (p1 - p0) * t;
+        for &(x, y, p) in planned {
             let r = brush.effective_size(p) * 0.5;
-            let s = brush.effective_density(p);
-            if let Some((a, b, c, d)) = self.smudge_stamp(x, y, r, s, tip, clip) {
+            let s = brush
+                .effective_density(p)
+                .max(brush.effective_blending(p))
+                .clamp(0.0, 1.0);
+            if let Some((a, b, c, d)) =
+                self.smudge_fabric_dab(x, y, r, s, hardness, tip, clip, stroke, &mut snap)
+            {
                 bx0 = bx0.min(a);
                 by0 = by0.min(b);
                 bx1 = bx1.max(c);
                 by1 = by1.max(d);
             }
         }
+        EffectScratch::release(&mut scratch.snap, snap.data);
         if bx0 >= bx1 || by0 >= by1 {
             return None;
         }
         Some((bx0, by0, bx1, by1))
     }
+
+    pub fn clone_brush_dab(
+        &mut self,
+        src_x: f32,
+        src_y: f32,
+        dst_x: f32,
+        dst_y: f32,
+        radius: f32,
+        strength: f32,
+        hardness: f32,
+        tip: &mut TipCache,
+        clip: Option<&SelectionMask>,
+        scratch: &mut EffectScratch,
+        color_jitter: f32,
+    ) -> Option<(i32, i32, i32, i32)> {
+        self.clone_brush_dabs(
+            &[(dst_x, dst_y, radius, strength)],
+            src_x - dst_x,
+            src_y - dst_y,
+            hardness,
+            tip,
+            clip,
+            scratch,
+            color_jitter,
+        )
+    }
+
+    /// Stamp many clone dabs with one committed-layer source snapshot.
+    /// `dabs` are `(dst_x, dst_y, radius, strength)`; source is dest + (off_x, off_y).
+    pub fn clone_brush_dabs(
+        &mut self,
+        dabs: &[(f32, f32, f32, f32)],
+        off_x: f32,
+        off_y: f32,
+        hardness: f32,
+        tip: &mut TipCache,
+        clip: Option<&SelectionMask>,
+        scratch: &mut EffectScratch,
+        color_jitter: f32,
+    ) -> Option<(i32, i32, i32, i32)> {
+        if dabs.is_empty() {
+            return None;
+        }
+        let hardness = hardness.clamp(0.0, 1.0);
+        let w = self.width as i32;
+        let h = self.height as i32;
+        let mut ux0 = i32::MAX;
+        let mut uy0 = i32::MAX;
+        let mut ux1 = i32::MIN;
+        let mut uy1 = i32::MIN;
+        let mut sx0u = i32::MAX;
+        let mut sy0u = i32::MAX;
+        let mut sx1u = i32::MIN;
+        let mut sy1u = i32::MIN;
+        let mut any = false;
+        for &(dst_x, dst_y, radius, strength) in dabs {
+            let radius = radius.clamp(0.5, 512.0);
+            if strength <= 0.001 {
+                continue;
+            }
+            let extent = tip.ensure(radius, hardness);
+            let x0 = (dst_x - extent as f32).floor() as i32;
+            let y0 = (dst_y - extent as f32).floor() as i32;
+            let x1 = (dst_x + extent as f32).ceil() as i32 + 1;
+            let y1 = (dst_y + extent as f32).ceil() as i32 + 1;
+            ux0 = ux0.min(x0);
+            uy0 = uy0.min(y0);
+            ux1 = ux1.max(x1);
+            uy1 = uy1.max(y1);
+            sx0u = sx0u.min((x0 as f32 + off_x - 1.0).floor() as i32);
+            sy0u = sy0u.min((y0 as f32 + off_y - 1.0).floor() as i32);
+            sx1u = sx1u.max((x1 as f32 + off_x + 1.0).ceil() as i32);
+            sy1u = sy1u.max((y1 as f32 + off_y + 1.0).ceil() as i32);
+            any = true;
+        }
+        if !any || ux0 >= ux1 || uy0 >= uy1 {
+            return None;
+        }
+        let snap = self.snapshot_premul_roi_ex(sx0u, sy0u, sx1u, sy1u, false, false, scratch);
+        let jitter = color_jitter > 1e-5;
+        let mut bx0 = i32::MAX;
+        let mut by0 = i32::MAX;
+        let mut bx1 = i32::MIN;
+        let mut by1 = i32::MIN;
+        for &(dst_x, dst_y, radius, strength) in dabs {
+            let radius = radius.clamp(0.5, 512.0);
+            let strength = strength.clamp(0.0, 1.0);
+            if strength <= 0.001 {
+                continue;
+            }
+            let extent = tip.ensure(radius, hardness);
+            let r2 = (extent as f32) * (extent as f32);
+            let x0 = (dst_x - extent as f32).floor() as i32;
+            let y0 = (dst_y - extent as f32).floor() as i32;
+            let x1 = (dst_x + extent as f32).ceil() as i32 + 1;
+            let y1 = (dst_y + extent as f32).ceil() as i32 + 1;
+            let mut x0c = x0.max(0);
+            let mut y0c = y0.max(0);
+            let mut x1c = x1.min(w);
+            let mut y1c = y1.min(h);
+            if let Some(m) = clip {
+                let mx0 = m.x.floor() as i32;
+                let my0 = m.y.floor() as i32;
+                let mx1 = mx0 + m.width as i32;
+                let my1 = my0 + m.height as i32;
+                if x1c <= mx0 || y1c <= my0 || x0c >= mx1 || y0c >= my1 {
+                    bx0 = bx0.min(x0);
+                    by0 = by0.min(y0);
+                    bx1 = bx1.max(x1);
+                    by1 = by1.max(y1);
+                    continue;
+                }
+                x0c = x0c.max(mx0);
+                y0c = y0c.max(my0);
+                x1c = x1c.min(mx1);
+                y1c = y1c.min(my1);
+            }
+            if x0c >= x1c || y0c >= y1c {
+                bx0 = bx0.min(x0);
+                by0 = by0.min(y0);
+                bx1 = bx1.max(x1);
+                by1 = by1.max(y1);
+                continue;
+            }
+            let keys: Vec<_> = TileBuffer::tiles_covering_rect(x0c, y0c, x1c, y1c).collect();
+            for &key in &keys {
+                self.paint_tiles
+                    .ensure_region(key, &self.tiles, x0c, y0c, x1c, y1c);
+            }
+            self.paint_tiles.mark_dirty_keys(&keys);
+            let tip_ref = &*tip;
+            if effect_parallel_tiles(keys.len(), x0c, y0c, x1c, y1c) {
+                let mut tiles = self.paint_tiles.take_tiles(&keys);
+                tiles.par_iter_mut().for_each(|(key, tile)| {
+                    let pf: &mut Vec<f32> = Arc::make_mut(tile);
+                    stamp_clone_tile(
+                        key,
+                        pf.as_mut_slice(),
+                        dst_x,
+                        dst_y,
+                        r2,
+                        x0c,
+                        y0c,
+                        x1c,
+                        y1c,
+                        strength,
+                        off_x,
+                        off_y,
+                        tip_ref,
+                        &snap,
+                        jitter,
+                        color_jitter,
+                        clip,
+                    );
+                });
+                self.paint_tiles.put_tiles(tiles);
+            } else {
+                for key in keys {
+                    let Some(pf) = self.paint_tiles.get_mut_slice(key) else {
+                        continue;
+                    };
+                    stamp_clone_tile(
+                        &key,
+                        pf,
+                        dst_x,
+                        dst_y,
+                        r2,
+                        x0c,
+                        y0c,
+                        x1c,
+                        y1c,
+                        strength,
+                        off_x,
+                        off_y,
+                        tip_ref,
+                        &snap,
+                        jitter,
+                        color_jitter,
+                        clip,
+                    );
+                }
+            }
+            bx0 = bx0.min(x0);
+            by0 = by0.min(y0);
+            bx1 = bx1.max(x1);
+            by1 = by1.max(y1);
+        }
+        EffectScratch::release(&mut scratch.snap, snap.data);
+        if bx0 >= bx1 || by0 >= by1 {
+            return None;
+        }
+        Some((bx0, by0, bx1, by1))
+    }
+
+    pub fn blur_segment(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        p0: f32,
+        x1: f32,
+        y1: f32,
+        p1: f32,
+        brush: &BrushSettings,
+        tip: &mut TipCache,
+        clip: Option<&SelectionMask>,
+        scratch: &mut EffectScratch,
+        spacing: &mut EffectSpacing,
+    ) -> Option<(i32, i32, i32, i32)> {
+        let avg_size = (brush.effective_size(p0) + brush.effective_size(p1)) * 0.5;
+        let spacing_frac = brush.spacing.clamp(0.20, 0.40);
+        let step = (avg_size * spacing_frac).max(1.0);
+        plan_effect_dabs(
+            x0,
+            y0,
+            p0,
+            x1,
+            y1,
+            p1,
+            step,
+            spacing,
+            &mut scratch.planned,
+        );
+        if scratch.planned.is_empty() {
+            return None;
+        }
+        let planned = std::mem::take(&mut scratch.planned);
+        let bounds = self.blur_planned_dabs(&planned, brush, tip, clip, scratch);
+        scratch.planned = planned;
+        scratch.planned.clear();
+        bounds
+    }
+
+    /// All blur dabs of a polyline with **one** workspace snapshot. Overlapping
+    /// dabs still re-blur from patched results (same as per-segment resnapshot).
+    pub fn blur_polyline(
+        &mut self,
+        points: &[(f32, f32, f32)],
+        brush: &BrushSettings,
+        tip: &mut TipCache,
+        clip: Option<&SelectionMask>,
+        scratch: &mut EffectScratch,
+        spacing: &mut EffectSpacing,
+    ) -> Option<(i32, i32, i32, i32)> {
+        if points.len() < 2 {
+            return None;
+        }
+        scratch.chain.clear();
+        for w in points.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let avg_size = (brush.effective_size(a.2) + brush.effective_size(b.2)) * 0.5;
+            let spacing_frac = brush.spacing.clamp(0.20, 0.40);
+            let step = (avg_size * spacing_frac).max(1.0);
+            plan_effect_dabs(
+                a.0,
+                a.1,
+                a.2,
+                b.0,
+                b.1,
+                b.2,
+                step,
+                spacing,
+                &mut scratch.planned,
+            );
+            scratch.chain.extend_from_slice(&scratch.planned);
+        }
+        if scratch.chain.is_empty() {
+            return None;
+        }
+        let planned = std::mem::take(&mut scratch.chain);
+        let bounds = self.blur_planned_dabs(&planned, brush, tip, clip, scratch);
+        scratch.chain = planned;
+        scratch.chain.clear();
+        bounds
+    }
+
+    fn blur_planned_dabs(
+        &mut self,
+        planned: &[(f32, f32, f32)],
+        brush: &BrushSettings,
+        tip: &mut TipCache,
+        clip: Option<&SelectionMask>,
+        scratch: &mut EffectScratch,
+    ) -> Option<(i32, i32, i32, i32)> {
+        if planned.is_empty() {
+            return None;
+        }
+        let hardness = brush.hardness.clamp(0.0, 1.0);
+
+        // Max kernel already padded into union above.
+        let mut ux0 = i32::MAX;
+        let mut uy0 = i32::MAX;
+        let mut ux1 = i32::MIN;
+        let mut uy1 = i32::MIN;
+        for &(x, y, p) in planned {
+            let r = brush.effective_size(p) * 0.5;
+            let s = (brush.effective_density(p) * brush.effective_flow(p)).clamp(0.0, 1.0);
+            let kr = ((r * 0.12) * (0.5 + 0.5 * s)).round().clamp(1.0, 10.0) as i32;
+            let e = (TipCache::effective_radius(r, hardness) + 1.0).ceil() as i32;
+            ux0 = ux0.min((x - e as f32).floor() as i32 - kr);
+            uy0 = uy0.min((y - e as f32).floor() as i32 - kr);
+            ux1 = ux1.max((x + e as f32).ceil() as i32 + 1 + kr);
+            uy1 = uy1.max((y + e as f32).ceil() as i32 + 1 + kr);
+        }
+        let w = self.width as i32;
+        let h = self.height as i32;
+        ux0 = ux0.clamp(0, w);
+        uy0 = uy0.clamp(0, h);
+        ux1 = ux1.clamp(0, w).max(ux0);
+        uy1 = uy1.clamp(0, h).max(uy0);
+
+        self.warm_paint_rect(ux0, uy0, ux1, uy1);
+        // Edge-clamp for blur (repeat border) — same as per-dab path.
+        let mut snap = self.snapshot_premul_roi_ex(ux0, uy0, ux1, uy1, true, true, scratch);
+
+        let mut bx0 = i32::MAX;
+        let mut by0 = i32::MAX;
+        let mut bx1 = i32::MIN;
+        let mut by1 = i32::MIN;
+        for &(x, y, p) in planned {
+            let r = brush.effective_size(p) * 0.5;
+            let s = (brush.effective_density(p) * brush.effective_flow(p)).clamp(0.0, 1.0);
+            let kr = ((r * 0.12) * (0.5 + 0.5 * s)).round().clamp(1.0, 10.0) as i32;
+            if let Some((a, b, c, d)) =
+                self.blur_dab_on_snap(x, y, r, s, hardness, kr, tip, clip, &mut snap, scratch)
+            {
+                bx0 = bx0.min(a);
+                by0 = by0.min(b);
+                bx1 = bx1.max(c);
+                by1 = by1.max(d);
+            }
+        }
+        EffectScratch::release(&mut scratch.snap, snap.data);
+        if bx0 >= bx1 || by0 >= by1 {
+            return None;
+        }
+        Some((bx0, by0, bx1, by1))
+    }
+
+    /// Tip-local stationary blur (single separable box). No stroke memory.
+    /// Uses no-erase mix so transparent samples cannot punch checkerboard holes.
+    pub fn blur_stamp(
+        &mut self,
+        x: f32,
+        y: f32,
+        radius: f32,
+        strength: f32,
+        hardness: f32,
+        kernel_r: i32,
+        tip: &mut TipCache,
+        clip: Option<&SelectionMask>,
+        scratch: &mut EffectScratch,
+    ) -> Option<(i32, i32, i32, i32)> {
+        let radius = radius.clamp(0.5, 256.0);
+        let strength = strength.clamp(0.0, 1.0);
+        if strength <= 0.001 {
+            return None;
+        }
+        let hardness = hardness.clamp(0.0, 1.0);
+        let extent = tip.ensure(radius, hardness);
+        let kr = kernel_r.clamp(1, 10);
+        let (x0c, y0c, x1c, y1c) = self.effect_tip_clip(x, y, extent, clip)?;
+        self.warm_paint_rect(x0c - kr, y0c - kr, x1c + kr, y1c + kr);
+        let mut snap = self.snapshot_premul_roi_ex(
+            x0c - kr,
+            y0c - kr,
+            x1c + kr,
+            y1c + kr,
+            true,
+            true,
+            scratch,
+        );
+        let bounds =
+            self.blur_dab_on_snap(x, y, radius, strength, hardness, kr, tip, clip, &mut snap, scratch);
+        EffectScratch::release(&mut scratch.snap, snap.data);
+        bounds
+    }
+
+    fn blur_dab_on_snap(
+        &mut self,
+        x: f32,
+        y: f32,
+        radius: f32,
+        strength: f32,
+        hardness: f32,
+        kernel_r: i32,
+        tip: &mut TipCache,
+        clip: Option<&SelectionMask>,
+        snap: &mut PremulRoi,
+        scratch: &mut EffectScratch,
+    ) -> Option<(i32, i32, i32, i32)> {
+        let radius = radius.clamp(0.5, 256.0);
+        let strength = strength.clamp(0.0, 1.0);
+        if strength <= 0.001 {
+            return None;
+        }
+        let hardness = hardness.clamp(0.0, 1.0);
+        let extent = tip.ensure(radius, hardness);
+        let kr = kernel_r.clamp(1, 10);
+        let r2 = (extent as f32) * (extent as f32);
+
+        let x0 = (x - extent as f32).floor() as i32;
+        let y0 = (y - extent as f32).floor() as i32;
+        let x1 = (x + extent as f32).ceil() as i32 + 1;
+        let y1 = (y + extent as f32).ceil() as i32 + 1;
+        let (x0c, y0c, x1c, y1c) = self.effect_tip_clip(x, y, extent, clip)?;
+
+        // Blur only the tip+kernel subrect (same pixels as extract + box blur).
+        let blurred = snap.blur_window(x0c - kr, y0c - kr, x1c + kr, y1c + kr, kr, scratch);
+
+        let keys: Vec<_> = TileBuffer::tiles_covering_rect(x0c, y0c, x1c, y1c).collect();
+        for &key in &keys {
+            self.paint_tiles
+                .ensure_region(key, &self.tiles, x0c, y0c, x1c, y1c);
+        }
+        self.paint_tiles.mark_dirty_keys(&keys);
+        let tip_ref = &*tip;
+        if effect_parallel_tiles(keys.len(), x0c, y0c, x1c, y1c) {
+            let mut tiles = self.paint_tiles.take_tiles(&keys);
+            tiles.par_iter_mut().for_each(|(key, tile)| {
+                let pf: &mut Vec<f32> = Arc::make_mut(tile);
+                stamp_blur_tile(
+                    key,
+                    pf.as_mut_slice(),
+                    x,
+                    y,
+                    r2,
+                    x0c,
+                    y0c,
+                    x1c,
+                    y1c,
+                    strength,
+                    tip_ref,
+                    &blurred,
+                    clip,
+                );
+            });
+            self.paint_tiles.put_tiles(tiles);
+        } else {
+            for key in keys {
+                let Some(pf) = self.paint_tiles.get_mut_slice(key) else {
+                    continue;
+                };
+                stamp_blur_tile(
+                    &key,
+                    pf,
+                    x,
+                    y,
+                    r2,
+                    x0c,
+                    y0c,
+                    x1c,
+                    y1c,
+                    strength,
+                    tip_ref,
+                    &blurred,
+                    clip,
+                );
+            }
+        }
+        self.patch_snap_from_paint(snap, x0c, y0c, x1c, y1c, x, y, r2);
+        EffectScratch::release(&mut scratch.blur_out, blurred.data);
+        Some((x0, y0, x1, y1))
+    }
+
     fn sample_rgba_f(&self, x: f32, y: f32) -> (f32, f32, f32, f32) {
         let px = x.floor() as i32;
         let py = y.floor() as i32;
@@ -736,6 +1863,644 @@ impl Layer {
     }
 }
 
+#[derive(Clone)]
+struct PremulRoi {
+    x0: i32,
+    y0: i32,
+    w: i32,
+    h: i32,
+    data: Vec<f32>,
+}
+
+impl PremulRoi {
+    #[inline]
+    fn sample_bilinear(&self, x: f32, y: f32) -> [f32; 4] {
+        if self.w <= 0 || self.h <= 0 {
+            return [0.0; 4];
+        }
+        let fx = x - 0.5 - self.x0 as f32;
+        let fy = y - 0.5 - self.y0 as f32;
+        let x0 = fx.floor() as i32;
+        let y0 = fy.floor() as i32;
+        let tx = (fx - x0 as f32).clamp(0.0, 1.0);
+        let ty = (fy - y0 as f32).clamp(0.0, 1.0);
+        let c00 = self.get(x0, y0);
+        let c10 = self.get(x0 + 1, y0);
+        let c01 = self.get(x0, y0 + 1);
+        let c11 = self.get(x0 + 1, y0 + 1);
+        let mut out = [0.0f32; 4];
+        for i in 0..4 {
+            let a = c00[i] + (c10[i] - c00[i]) * tx;
+            let b = c01[i] + (c11[i] - c01[i]) * tx;
+            out[i] = a + (b - a) * ty;
+        }
+        out
+    }
+
+    #[inline]
+    fn put_doc(&mut self, doc_x: i32, doc_y: i32, px: [f32; 4]) {
+        let lx = doc_x - self.x0;
+        let ly = doc_y - self.y0;
+        if lx < 0 || ly < 0 || lx >= self.w || ly >= self.h {
+            return;
+        }
+        let i = ((ly * self.w + lx) * 4) as usize;
+        if i + 4 <= self.data.len() {
+            self.data[i..i + 4].copy_from_slice(&px);
+        }
+    }
+
+    /// Copy a document-space rect (OOB → 0). Uses `scratch.roi` (not `snap`).
+    fn extract_rect(
+        &self,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        scratch: &mut EffectScratch,
+    ) -> PremulRoi {
+        let rw = (x1 - x0).max(0) as usize;
+        let rh = (y1 - y0).max(0) as usize;
+        let n = rw.saturating_mul(rh).saturating_mul(4);
+        let mut data = EffectScratch::acquire(&mut scratch.roi, n);
+        if rw == 0 || rh == 0 {
+            return PremulRoi {
+                x0,
+                y0,
+                w: rw as i32,
+                h: rh as i32,
+                data,
+            };
+        }
+        for py in y0..y1 {
+            let ly = py - self.y0;
+            let row = ((py - y0) as usize) * rw;
+            if ly >= 0 && ly < self.h {
+                let src_row = (ly as usize) * self.w as usize;
+                let lx0 = x0 - self.x0;
+                let lx1 = x1 - self.x0;
+                if lx0 >= 0 && lx1 <= self.w {
+                    let s0 = (src_row + lx0 as usize) * 4;
+                    let s1 = (src_row + lx1 as usize) * 4;
+                    let d0 = row * 4;
+                    data[d0..d0 + (s1 - s0)].copy_from_slice(&self.data[s0..s1]);
+                    continue;
+                }
+            }
+            for px in x0..x1 {
+                let lx = px - self.x0;
+                let di = (row + (px - x0) as usize) * 4;
+                let pix = self.get(lx, ly);
+                data[di..di + 4].copy_from_slice(&pix);
+            }
+        }
+        PremulRoi {
+            x0,
+            y0,
+            w: rw as i32,
+            h: rh as i32,
+            data,
+        }
+    }
+
+    /// Separable box blur of a document-space window. Fully-inside windows skip
+    /// the extract copy; OOB windows fall back to extract (zero pad) + blur.
+    fn blur_window(
+        &self,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        radius: i32,
+        scratch: &mut EffectScratch,
+    ) -> PremulRoi {
+        let rw = (x1 - x0).max(0) as usize;
+        let rh = (y1 - y0).max(0) as usize;
+        if rw == 0 || rh == 0 {
+            return PremulRoi {
+                x0,
+                y0,
+                w: rw as i32,
+                h: rh as i32,
+                data: EffectScratch::acquire(&mut scratch.blur_out, 0),
+            };
+        }
+        let lx0 = x0 - self.x0;
+        let ly0 = y0 - self.y0;
+        let lx1 = x1 - self.x0;
+        let ly1 = y1 - self.y0;
+        if lx0 >= 0 && ly0 >= 0 && lx1 <= self.w && ly1 <= self.h {
+            self.blur_subrect(lx0 as usize, ly0 as usize, rw, rh, radius, x0, y0, scratch)
+        } else {
+            self.extract_rect(x0, y0, x1, y1, scratch)
+                .separable_box_blur(radius, scratch)
+        }
+    }
+
+    fn blur_subrect(
+        &self,
+        lx0: usize,
+        ly0: usize,
+        w: usize,
+        h: usize,
+        radius: i32,
+        doc_x0: i32,
+        doc_y0: i32,
+        scratch: &mut EffectScratch,
+    ) -> PremulRoi {
+        let r = radius.max(1);
+        let n = w * h * 4;
+        let mut temp = EffectScratch::acquire(&mut scratch.blur_temp, n);
+        let mut out = EffectScratch::acquire(&mut scratch.blur_out, n);
+        let window = (2 * r + 1) as f32;
+        let inv = 1.0 / window;
+        let wm1 = w as i32 - 1;
+        let hm1 = h as i32 - 1;
+        let r_i = r;
+        let src_w = self.w as usize;
+        let src = &self.data;
+
+        for y in 0..h {
+            let src_row = (ly0 + y) * src_w + lx0;
+            let dst_row = y * w;
+            let mut acc = [0.0f32; 4];
+            for k in -r_i..=r_i {
+                let sx = k.clamp(0, wm1) as usize;
+                let i = (src_row + sx) * 4;
+                for c in 0..4 {
+                    acc[c] += src[i + c];
+                }
+            }
+            let di0 = dst_row * 4;
+            for c in 0..4 {
+                temp[di0 + c] = acc[c] * inv;
+            }
+            for x in 1..w {
+                if x as i32 <= r_i || x as i32 + r_i >= w as i32 {
+                    acc = [0.0; 4];
+                    for k in -r_i..=r_i {
+                        let sx = (x as i32 + k).clamp(0, wm1) as usize;
+                        let i = (src_row + sx) * 4;
+                        for c in 0..4 {
+                            acc[c] += src[i + c];
+                        }
+                    }
+                } else {
+                    let leave = (x as i32 - 1 - r_i) as usize;
+                    let enter = (x as i32 + r_i) as usize;
+                    let li = (src_row + leave) * 4;
+                    let ei = (src_row + enter) * 4;
+                    for c in 0..4 {
+                        acc[c] += src[ei + c] - src[li + c];
+                    }
+                }
+                let di = (dst_row + x) * 4;
+                for c in 0..4 {
+                    temp[di + c] = acc[c] * inv;
+                }
+            }
+        }
+
+        for x in 0..w {
+            let mut acc = [0.0f32; 4];
+            for k in -r_i..=r_i {
+                let sy = k.clamp(0, hm1) as usize;
+                let i = (sy * w + x) * 4;
+                for c in 0..4 {
+                    acc[c] += temp[i + c];
+                }
+            }
+            let di0 = x * 4;
+            for c in 0..4 {
+                out[di0 + c] = acc[c] * inv;
+            }
+            for y in 1..h {
+                if y as i32 <= r_i || y as i32 + r_i >= h as i32 {
+                    acc = [0.0; 4];
+                    for k in -r_i..=r_i {
+                        let sy = (y as i32 + k).clamp(0, hm1) as usize;
+                        let i = (sy * w + x) * 4;
+                        for c in 0..4 {
+                            acc[c] += temp[i + c];
+                        }
+                    }
+                } else {
+                    let leave = (y as i32 - 1 - r_i) as usize;
+                    let enter = (y as i32 + r_i) as usize;
+                    let li = (leave * w + x) * 4;
+                    let ei = (enter * w + x) * 4;
+                    for c in 0..4 {
+                        acc[c] += temp[ei + c] - temp[li + c];
+                    }
+                }
+                let di = (y * w + x) * 4;
+                for c in 0..4 {
+                    out[di + c] = acc[c] * inv;
+                }
+            }
+        }
+
+        EffectScratch::release(&mut scratch.blur_temp, temp);
+        PremulRoi {
+            x0: doc_x0,
+            y0: doc_y0,
+            w: w as i32,
+            h: h as i32,
+            data: out,
+        }
+    }
+
+    #[inline]
+    fn sample_nearest(&self, x: f32, y: f32) -> [f32; 4] {
+        let lx = (x.floor() as i32) - self.x0;
+        let ly = (y.floor() as i32) - self.y0;
+        self.get(lx, ly)
+    }
+
+    /// Separable box blur — identical (2r+1)² mean, edge-clamped.
+    /// Sliding-window O(W·H) (not O(W·H·r)); input buffer returns to `scratch.roi`.
+    fn separable_box_blur(self, radius: i32, scratch: &mut EffectScratch) -> PremulRoi {
+        let r = radius.max(1);
+        let w = self.w.max(0) as usize;
+        let h = self.h.max(0) as usize;
+        if w == 0 || h == 0 {
+            EffectScratch::release(&mut scratch.roi, self.data);
+            return PremulRoi {
+                x0: self.x0,
+                y0: self.y0,
+                w: self.w,
+                h: self.h,
+                data: EffectScratch::acquire(&mut scratch.blur_out, 0),
+            };
+        }
+        let n = w * h * 4;
+        let mut temp = EffectScratch::acquire(&mut scratch.blur_temp, n);
+        let mut out = EffectScratch::acquire(&mut scratch.blur_out, n);
+        let window = (2 * r + 1) as f32;
+        let inv = 1.0 / window;
+        let wm1 = w as i32 - 1;
+        let hm1 = h as i32 - 1;
+        let r_i = r;
+
+        // Horizontal sliding window
+        for y in 0..h {
+            let row = y * w;
+            let mut acc = [0.0f32; 4];
+            for k in -r_i..=r_i {
+                let sx = k.clamp(0, wm1) as usize;
+                let i = (row + sx) * 4;
+                for c in 0..4 {
+                    acc[c] += self.data[i + c];
+                }
+            }
+            let di0 = row * 4;
+            for c in 0..4 {
+                temp[di0 + c] = acc[c] * inv;
+            }
+            for x in 1..w {
+                let leave = (x as i32 - 1 - r_i).clamp(0, wm1) as usize;
+                let enter = (x as i32 + r_i).clamp(0, wm1) as usize;
+                let li = (row + leave) * 4;
+                let ei = (row + enter) * 4;
+                // When clamp sticks, leave==previous leave or enter==previous enter —
+                // still correct because we remove the pixel that left the ideal window
+                // only if it was actually in the sum. Edge-clamp means the same index
+                // may be "removed" and "still present"; use recount on edges is safer.
+                // Full recount near borders (rare); sliding in the interior.
+                if x as i32 <= r_i || x as i32 + r_i >= w as i32 {
+                    acc = [0.0; 4];
+                    for k in -r_i..=r_i {
+                        let sx = (x as i32 + k).clamp(0, wm1) as usize;
+                        let i = (row + sx) * 4;
+                        for c in 0..4 {
+                            acc[c] += self.data[i + c];
+                        }
+                    }
+                } else {
+                    for c in 0..4 {
+                        acc[c] += self.data[ei + c] - self.data[li + c];
+                    }
+                }
+                let di = (row + x) * 4;
+                for c in 0..4 {
+                    temp[di + c] = acc[c] * inv;
+                }
+            }
+        }
+
+        // Vertical sliding window
+        for x in 0..w {
+            let mut acc = [0.0f32; 4];
+            for k in -r_i..=r_i {
+                let sy = k.clamp(0, hm1) as usize;
+                let i = (sy * w + x) * 4;
+                for c in 0..4 {
+                    acc[c] += temp[i + c];
+                }
+            }
+            let di0 = x * 4;
+            for c in 0..4 {
+                out[di0 + c] = acc[c] * inv;
+            }
+            for y in 1..h {
+                if y as i32 <= r_i || y as i32 + r_i >= h as i32 {
+                    acc = [0.0; 4];
+                    for k in -r_i..=r_i {
+                        let sy = (y as i32 + k).clamp(0, hm1) as usize;
+                        let i = (sy * w + x) * 4;
+                        for c in 0..4 {
+                            acc[c] += temp[i + c];
+                        }
+                    }
+                } else {
+                    let leave = (y as i32 - 1 - r_i) as usize;
+                    let enter = (y as i32 + r_i) as usize;
+                    let li = (leave * w + x) * 4;
+                    let ei = (enter * w + x) * 4;
+                    for c in 0..4 {
+                        acc[c] += temp[ei + c] - temp[li + c];
+                    }
+                }
+                let di = (y * w + x) * 4;
+                for c in 0..4 {
+                    out[di + c] = acc[c] * inv;
+                }
+            }
+        }
+
+        EffectScratch::release(&mut scratch.roi, self.data);
+        EffectScratch::release(&mut scratch.blur_temp, temp);
+        PremulRoi {
+            x0: self.x0,
+            y0: self.y0,
+            w: self.w,
+            h: self.h,
+            data: out,
+        }
+    }
+
+    #[inline]
+    fn get(&self, lx: i32, ly: i32) -> [f32; 4] {
+        if lx < 0 || ly < 0 || lx >= self.w || ly >= self.h {
+            return [0.0; 4];
+        }
+        let i = ((ly * self.w + lx) * 4) as usize;
+        [self.data[i], self.data[i + 1], self.data[i + 2], self.data[i + 3]]
+    }
+}
+
+fn stamp_smudge_tile(
+    &(tx, ty): &(i32, i32),
+    pf: &mut [f32],
+    x: f32,
+    y: f32,
+    r2: f32,
+    x0c: i32,
+    y0c: i32,
+    x1c: i32,
+    y1c: i32,
+    pull: f32,
+    fall_gamma: f32,
+    empty_pinch: f32,
+    move_x: f32,
+    move_y: f32,
+    tip: &TipCache,
+    snap: &PremulRoi,
+    clip: Option<&SelectionMask>,
+) {
+    let ts = TILE_SIZE as i32;
+    let (ox, oy) = TileBuffer::tile_origin(tx, ty);
+    let py0 = y0c.max(oy);
+    let py1 = y1c.min(oy + ts);
+    if py0 >= py1 {
+        return;
+    }
+    for py in py0..py1 {
+        let ly = (py - oy) as usize;
+        if ly >= TILE_SIZE as usize {
+            continue;
+        }
+        let Some((sx0r, sx1r)) = tip_row_x_span(x, y, py, r2) else {
+            continue;
+        };
+        let px_lo = x0c.max(ox).max(sx0r);
+        let px_hi = x1c.min(ox + ts).min(sx1r);
+        if px_lo >= px_hi {
+            continue;
+        }
+        for px in px_lo..px_hi {
+            let lx_t = (px - ox) as usize;
+            if lx_t >= TILE_SIZE as usize {
+                continue;
+            }
+            let dx = (px as f32 + 0.5) - x;
+            let dy = (py as f32 + 0.5) - y;
+            let cov = tip.coverage_at(dx, dy);
+            if cov <= 1e-5 {
+                continue;
+            }
+            let mut fall = cov;
+            if let Some(m) = clip {
+                let ma = m.sample(px as f32 + 0.5, py as f32 + 0.5) as f32 / 255.0;
+                if ma <= 1e-5 {
+                    continue;
+                }
+                fall *= ma;
+            }
+            let amount = (pull * fall.powf(fall_gamma)).clamp(0.0, 1.0);
+            if amount <= 1e-5 {
+                continue;
+            }
+            let along_x = px as f32 + 0.5 - move_x * amount;
+            let along_y = py as f32 + 0.5 - move_y * amount;
+            let probe = snap.sample_bilinear(along_x, along_y);
+            let i = (ly * TILE_SIZE as usize + lx_t) * 4;
+            let dst = [pf[i], pf[i + 1], pf[i + 2], pf[i + 3]];
+            let empty = (1.0 - probe[3].max(dst[3]).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            let micro = empty_pinch * empty * amount;
+            let src = if micro > 1e-6 {
+                snap.sample_bilinear(along_x + dx * micro, along_y + dy * micro)
+            } else {
+                probe
+            };
+            let out = mix_premul_smudge(src, dst, amount);
+            pf[i..i + 4].copy_from_slice(&out);
+        }
+    }
+}
+
+fn stamp_clone_tile(
+    &(tx, ty): &(i32, i32),
+    pf: &mut [f32],
+    dst_x: f32,
+    dst_y: f32,
+    r2: f32,
+    x0c: i32,
+    y0c: i32,
+    x1c: i32,
+    y1c: i32,
+    strength: f32,
+    off_x: f32,
+    off_y: f32,
+    tip: &TipCache,
+    snap: &PremulRoi,
+    jitter: bool,
+    color_jitter: f32,
+    clip: Option<&SelectionMask>,
+) {
+    let ts = TILE_SIZE as i32;
+    let (ox, oy) = TileBuffer::tile_origin(tx, ty);
+    let py0 = y0c.max(oy);
+    let py1 = y1c.min(oy + ts);
+    if py0 >= py1 {
+        return;
+    }
+    for py in py0..py1 {
+        let ly = (py - oy) as usize;
+        if ly >= TILE_SIZE as usize {
+            continue;
+        }
+        let Some((sx0r, sx1r)) = tip_row_x_span(dst_x, dst_y, py, r2) else {
+            continue;
+        };
+        let px_lo = x0c.max(ox).max(sx0r);
+        let px_hi = x1c.min(ox + ts).min(sx1r);
+        if px_lo >= px_hi {
+            continue;
+        }
+        for px in px_lo..px_hi {
+            let lx = (px - ox) as usize;
+            if lx >= TILE_SIZE as usize {
+                continue;
+            }
+            let dx = (px as f32 + 0.5) - dst_x;
+            let dy = (py as f32 + 0.5) - dst_y;
+            let cov = tip.coverage_at(dx, dy);
+            if cov <= 1e-5 {
+                continue;
+            }
+            let mut mix = (strength * cov).clamp(0.0, 1.0);
+            if let Some(m) = clip {
+                let ma = m.sample(px as f32 + 0.5, py as f32 + 0.5) as f32 / 255.0;
+                if ma <= 1e-5 {
+                    continue;
+                }
+                mix *= ma;
+            }
+            if mix <= 1e-5 {
+                continue;
+            }
+            let sx = px as f32 + 0.5 + off_x;
+            let sy = py as f32 + 0.5 + off_y;
+            let src = if jitter {
+                jitter_clone_premul(snap.sample_bilinear(sx, sy), sx, sy, color_jitter)
+            } else {
+                snap.sample_bilinear(sx, sy)
+            };
+            let i = (ly * TILE_SIZE as usize + lx) * 4;
+            let inv = 1.0 - mix;
+            pf[i] = src[0] * mix + pf[i] * inv;
+            pf[i + 1] = src[1] * mix + pf[i + 1] * inv;
+            pf[i + 2] = src[2] * mix + pf[i + 2] * inv;
+            pf[i + 3] = src[3] * mix + pf[i + 3] * inv;
+        }
+    }
+}
+
+fn stamp_blur_tile(
+    &(tx, ty): &(i32, i32),
+    pf: &mut [f32],
+    x: f32,
+    y: f32,
+    r2: f32,
+    x0c: i32,
+    y0c: i32,
+    x1c: i32,
+    y1c: i32,
+    strength: f32,
+    tip: &TipCache,
+    blurred: &PremulRoi,
+    clip: Option<&SelectionMask>,
+) {
+    let ts = TILE_SIZE as i32;
+    let (ox, oy) = TileBuffer::tile_origin(tx, ty);
+    let py0 = y0c.max(oy);
+    let py1 = y1c.min(oy + ts);
+    if py0 >= py1 {
+        return;
+    }
+    for py in py0..py1 {
+        let ly = (py - oy) as usize;
+        if ly >= TILE_SIZE as usize {
+            continue;
+        }
+        let Some((sx0r, sx1r)) = tip_row_x_span(x, y, py, r2) else {
+            continue;
+        };
+        let px_lo = x0c.max(ox).max(sx0r);
+        let px_hi = x1c.min(ox + ts).min(sx1r);
+        if px_lo >= px_hi {
+            continue;
+        }
+        for px in px_lo..px_hi {
+            let lx = (px - ox) as usize;
+            if lx >= TILE_SIZE as usize {
+                continue;
+            }
+            let dx = (px as f32 + 0.5) - x;
+            let dy = (py as f32 + 0.5) - y;
+            let cov = tip.coverage_at(dx, dy);
+            if cov <= 1e-5 {
+                continue;
+            }
+            let mut mix = (strength * cov).clamp(0.0, 1.0);
+            if let Some(m) = clip {
+                let ma = m.sample(px as f32 + 0.5, py as f32 + 0.5) as f32 / 255.0;
+                if ma <= 1e-5 {
+                    continue;
+                }
+                mix *= ma;
+            }
+            if mix <= 1e-5 {
+                continue;
+            }
+            let src = blurred.sample_nearest(px as f32 + 0.5, py as f32 + 0.5);
+            let i = (ly * TILE_SIZE as usize + lx) * 4;
+            let dst = [pf[i], pf[i + 1], pf[i + 2], pf[i + 3]];
+            let out = mix_premul_no_erase(src, dst, mix);
+            pf[i..i + 4].copy_from_slice(&out);
+        }
+    }
+}
+
+#[inline]
+fn pixel_tip_covers(shape: BrushShape, n: i32, px: i32, py: i32, x0: i32, y0: i32) -> bool {
+    let lx = px - x0;
+    let ly = py - y0;
+    if lx < 0 || ly < 0 || lx >= n || ly >= n {
+        return false;
+    }
+    match shape {
+        BrushShape::Square | BrushShape::Slash => true,
+        BrushShape::SimpleCircle | BrushShape::SoftEdge | BrushShape::Ring => {
+            let c = (n as f32 - 1.0) * 0.5;
+            let dx = lx as f32 - c;
+            let dy = ly as f32 - c;
+            let d2 = dx * dx + dy * dy;
+            let r = n as f32 * 0.5;
+            if d2 > r * r {
+                return false;
+            }
+            if matches!(shape, BrushShape::Ring) && n > 2 {
+                let inner = (r - 1.0).max(0.0);
+                d2 >= inner * inner
+            } else {
+                true
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stamp_pixel_tile(
     &(tx, ty): &(i32, i32),
@@ -746,6 +2511,10 @@ fn stamp_pixel_tile(
     y0c: i32,
     x1c: i32,
     y1c: i32,
+    tip_x0: i32,
+    tip_y0: i32,
+    n: i32,
+    shape: BrushShape,
     density: f32,
     eraser: bool,
     ink_lin: [f32; 3],
@@ -761,6 +2530,9 @@ fn stamp_pixel_tile(
     for py in py0..py1 {
         let ly = (py - oy) as usize;
         for px in px0..px1 {
+            if !pixel_tip_covers(shape, n, px, py, tip_x0, tip_y0) {
+                continue;
+            }
             if let Some(m) = clip {
                 // Pixel art: hard selection cut, no soft-mask AA.
                 if m.sample(px as f32 + 0.5, py as f32 + 0.5) < 128 {
@@ -1484,5 +3256,305 @@ mod spacing_tests {
         }
         assert_eq!(layer.tiles.get_rgba(8, 10)[3], 0);
         assert_eq!(layer.tiles.get_rgba(12, 10)[3], 0);
+    }
+
+    #[test]
+    fn pixel_brush_circle_and_ring() {
+        let mut layer = Layer::new("t", 64, 64);
+        let mut tip = TipCache::default();
+        let mut brush = BrushSettings::preset_pixel();
+        brush.size = 5.0;
+        brush.shape = BrushShape::SimpleCircle;
+        let mut stroke = StrokeState::new(brush.color);
+        if let Some((x0, y0, x1, y1)) =
+            layer.draw_stamp(20.0, 20.0, &brush, 1.0, &mut stroke, &mut tip, None)
+        {
+            layer.flush_paint_f_rect(x0, y0, x1, y1);
+        }
+        // Center of 5×5 block at cursor (20,20), offset n/2=2 → [18..23).
+        assert_eq!(layer.tiles.get_rgba(20, 20)[3], 255, "disk center");
+        assert_eq!(layer.tiles.get_rgba(18, 18)[3], 0, "AABB corner outside disk");
+
+        let mut layer2 = Layer::new("t", 64, 64);
+        brush.shape = BrushShape::Ring;
+        let mut stroke2 = StrokeState::new(brush.color);
+        if let Some((x0, y0, x1, y1)) =
+            layer2.draw_stamp(20.0, 20.0, &brush, 1.0, &mut stroke2, &mut tip, None)
+        {
+            layer2.flush_paint_f_rect(x0, y0, x1, y1);
+        }
+        assert_eq!(layer2.tiles.get_rgba(20, 20)[3], 0, "ring hollow");
+        assert!(
+            layer2.tiles.get_rgba(20, 18)[3] > 0 || layer2.tiles.get_rgba(18, 20)[3] > 0,
+            "ring rim painted"
+        );
+    }
+
+    #[test]
+    fn box_blur_sliding_matches_naive() {
+        // Quality lock: sliding-window box == old O(r) mean (edge-clamped).
+        let w = 31i32;
+        let h = 23i32;
+        let r = 4i32;
+        let mut data = vec![0.0f32; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                data[i] = (x + y) as f32 * 0.01;
+                data[i + 1] = (x * 3 + y) as f32 * 0.007;
+                data[i + 2] = (y * 2) as f32 * 0.01;
+                data[i + 3] = 0.5 + ((x + y) % 5) as f32 * 0.1;
+            }
+        }
+        let src = PremulRoi {
+            x0: 0,
+            y0: 0,
+            w,
+            h,
+            data: data.clone(),
+        };
+        let mut scratch = EffectScratch::default();
+        // Move data into roi pool path used by blur.
+        let local = PremulRoi {
+            x0: 0,
+            y0: 0,
+            w,
+            h,
+            data: EffectScratch::acquire(&mut scratch.roi, data.len()),
+        };
+        // fill local from clone
+        let mut local = local;
+        local.data.copy_from_slice(&data);
+        let fast = local.separable_box_blur(r, &mut scratch);
+
+        let wm1 = w - 1;
+        let hm1 = h - 1;
+        let window = (2 * r + 1) as f32;
+        let inv = 1.0 / window;
+        let mut temp = vec![0.0f32; data.len()];
+        let mut naive = vec![0.0f32; data.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = [0.0f32; 4];
+                for k in -r..=r {
+                    let sx = (x + k).clamp(0, wm1);
+                    let i = ((y * w + sx) * 4) as usize;
+                    for c in 0..4 {
+                        acc[c] += data[i + c];
+                    }
+                }
+                let di = ((y * w + x) * 4) as usize;
+                for c in 0..4 {
+                    temp[di + c] = acc[c] * inv;
+                }
+            }
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = [0.0f32; 4];
+                for k in -r..=r {
+                    let sy = (y + k).clamp(0, hm1);
+                    let i = ((sy * w + x) * 4) as usize;
+                    for c in 0..4 {
+                        acc[c] += temp[i + c];
+                    }
+                }
+                let di = ((y * w + x) * 4) as usize;
+                for c in 0..4 {
+                    naive[di + c] = acc[c] * inv;
+                }
+            }
+        }
+        assert_eq!(fast.data.len(), naive.len());
+        for (a, b) in fast.data.iter().zip(naive.iter()) {
+            assert!((a - b).abs() < 1e-5, "blur mismatch {a} vs {b}");
+        }
+        let _ = src;
+        EffectScratch::release(&mut scratch.blur_out, fast.data);
+    }
+
+    #[test]
+    fn smudge_pulls_opaque_into_empty() {
+        // Smoke: elastic smudge still deposits into transparent (spike path).
+        let mut layer = Layer::new("t", 128, 64);
+        for y in 20..44 {
+            for x in 20..60 {
+                layer.tiles.set_rgba(x, y, [40, 200, 80, 255]);
+            }
+        }
+        let mut tip = TipCache::default();
+        let mut brush = BrushSettings::preset_brush();
+        brush.size = 28.0;
+        brush.hardness = 0.25;
+        brush.density = 0.9;
+        brush.blending = 0.9;
+        brush.spacing = 0.03;
+        brush.pressure_size = false;
+        brush.pressure_density = false;
+        brush.pressure_blending = false;
+        let mut stroke = SmudgeStroke::default();
+        let mut scratch = EffectScratch::default();
+        let mut spacing = EffectSpacing::default();
+        let b = layer.smudge_segment(
+            50.0,
+            32.0,
+            1.0,
+            95.0,
+            32.0,
+            1.0,
+            &brush,
+            &mut tip,
+            None,
+            &mut stroke,
+            &mut scratch,
+            &mut spacing,
+        );
+        assert!(b.is_some(), "smudge segment should write");
+        layer.flush_paint_f_rect(0, 0, 128, 64);
+        let a = layer.tiles.get_rgba(80, 32)[3];
+        assert!(a > 20, "expected pulled paint into empty, a={a}");
+    }
+
+    #[test]
+    fn smudge_deforms_edge_not_eraser_capsule() {
+        // Left slab — vertical edge at x=48. Snake-hook must drag the edge right
+        // and must not carve a transparent tunnel through the slab.
+        let mut layer = Layer::new("t", 160, 64);
+        for y in 8..56 {
+            for x in 8..48 {
+                layer.tiles.set_rgba(x, y, [220, 40, 40, 255]);
+            }
+        }
+        let rightmost = |layer: &Layer| -> i32 {
+            let mut m = 0;
+            for x in 0..160 {
+                if layer.tiles.get_rgba(x, 32)[3] > 40 {
+                    m = x;
+                }
+            }
+            m
+        };
+        let before = rightmost(&layer);
+        assert!(before >= 47, "setup edge, got {before}");
+
+        let mut tip = TipCache::default();
+        let mut brush = BrushSettings::preset_brush();
+        brush.size = 36.0;
+        brush.hardness = 0.55;
+        brush.density = 0.95;
+        brush.blending = 0.95;
+        brush.spacing = 0.03;
+        brush.pressure_size = false;
+        brush.pressure_density = false;
+        brush.pressure_blending = false;
+        let mut stroke = SmudgeStroke::default();
+        let mut scratch = EffectScratch::default();
+        let mut spacing = EffectSpacing::default();
+        let b = layer.smudge_segment(
+            40.0,
+            32.0,
+            1.0,
+            110.0,
+            32.0,
+            1.0,
+            &brush,
+            &mut tip,
+            None,
+            &mut stroke,
+            &mut scratch,
+            &mut spacing,
+        );
+        assert!(b.is_some(), "smudge should write");
+        layer.flush_paint_f_rect(0, 0, 160, 64);
+        let after = rightmost(&layer);
+        assert!(
+            after >= before + 12,
+            "edge must deform forward: before={before} after={after}"
+        );
+        // Core of the slab must remain mostly opaque (not an eraser tunnel).
+        let mut core = 0u32;
+        let mut n = 0u32;
+        for y in 20..44 {
+            for x in 16..36 {
+                core += layer.tiles.get_rgba(x, y)[3] as u32;
+                n += 1;
+            }
+        }
+        let mean = core / n.max(1);
+        assert!(mean > 120, "slab core carved out (eraser tunnel), mean_a={mean}");
+    }
+
+    #[test]
+    fn blur_window_matches_extract_then_blur() {
+        let mut data = vec![0.0f32; 48 * 48 * 4];
+        for y in 0..48 {
+            for x in 0..48 {
+                let i = (y * 48 + x) * 4;
+                data[i] = (x as f32) * 0.01;
+                data[i + 1] = (y as f32) * 0.01;
+                data[i + 2] = 0.25;
+                data[i + 3] = 0.8;
+            }
+        }
+        let roi = PremulRoi {
+            x0: 4,
+            y0: 4,
+            w: 48,
+            h: 48,
+            data,
+        };
+        let mut scratch_a = EffectScratch::default();
+        let a = roi
+            .extract_rect(8, 8, 40, 40, &mut scratch_a)
+            .separable_box_blur(3, &mut scratch_a);
+        let mut scratch_b = EffectScratch::default();
+        let b = roi.blur_window(8, 8, 40, 40, 3, &mut scratch_b);
+        assert_eq!(a.w, b.w);
+        assert_eq!(a.h, b.h);
+        assert_eq!(a.data.len(), b.data.len());
+        let mut max_d = 0.0f32;
+        for i in 0..a.data.len() {
+            max_d = max_d.max((a.data[i] - b.data[i]).abs());
+        }
+        assert!(
+            max_d < 1e-5,
+            "blur_window drifted from extract+blur: {max_d}"
+        );
+    }
+
+    #[test]
+    fn blur_window_oob_matches_extract_then_blur() {
+        let mut data = vec![0.0f32; 16 * 16 * 4];
+        for y in 0..16 {
+            for x in 0..16 {
+                let i = (y * 16 + x) * 4;
+                data[i] = 0.3;
+                data[i + 1] = 0.4;
+                data[i + 2] = 0.5;
+                data[i + 3] = 0.9;
+            }
+        }
+        let roi = PremulRoi {
+            x0: 8,
+            y0: 8,
+            w: 16,
+            h: 16,
+            data,
+        };
+        let mut scratch_a = EffectScratch::default();
+        let a = roi
+            .extract_rect(0, 0, 20, 20, &mut scratch_a)
+            .separable_box_blur(2, &mut scratch_a);
+        let mut scratch_b = EffectScratch::default();
+        let b = roi.blur_window(0, 0, 20, 20, 2, &mut scratch_b);
+        assert_eq!(a.data.len(), b.data.len());
+        let mut max_d = 0.0f32;
+        for i in 0..a.data.len() {
+            max_d = max_d.max((a.data[i] - b.data[i]).abs());
+        }
+        assert!(
+            max_d < 1e-5,
+            "OOB blur_window drifted from extract+blur: {max_d}"
+        );
     }
 }

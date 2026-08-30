@@ -10,6 +10,160 @@ use crate::tiles::{CoverageTileMap, PaintTileMap, TileBuffer, TileKey, TILE_BYTE
 /// This deliberately excludes the layer's own mask: clipping uses
 /// [`Layer::effective_alpha`] for the clip base, then both base and clipped
 /// children receive this same ancestor coverage during compositing.
+
+/// First non-clipped paintable layer below `li` that a clipping chain attaches to.
+///
+/// Consecutive `clip_to_below` layers all share this base. They do **not** clip
+/// to each other: shadows / highlights / texture above one silhouette all test
+/// that silhouette's alpha independently. An unclipped layer in between breaks
+/// the chain (the next clip attaches to that layer instead).
+pub fn clip_base_index(layers: &[Layer], li: usize) -> Option<usize> {
+    if li == 0 || !layers.get(li).is_some_and(|layer| layer.clip_to_below) {
+        return None;
+    }
+    // Folder clip-to-below attaches to the layer under the *group*, not its children.
+    let skip_folder = layers[li].folder_uid();
+    let mut j = li;
+    while j > 0 {
+        j -= 1;
+        if skip_folder.is_some_and(|id| layer_is_under_folder(layers, j, id)) {
+            continue;
+        }
+        if layers[j].is_folder {
+            continue;
+        }
+        if layers[j].clip_to_below {
+            continue;
+        }
+        return Some(j);
+    }
+    None
+}
+
+fn layer_is_under_folder(layers: &[Layer], idx: usize, folder_id: u32) -> bool {
+    let mut parent = layers.get(idx).and_then(Layer::parent_id);
+    for _ in 0..layers.len() {
+        let Some(pid) = parent else {
+            return false;
+        };
+        if pid == folder_id {
+            return true;
+        }
+        parent = layers
+            .iter()
+            .find(|candidate| candidate.is_folder && candidate.group_id == Some(pid))
+            .and_then(|folder| folder.parent_folder);
+    }
+    false
+}
+
+/// Folder `clip_to_below` multiplies every descendant by the layer under that folder.
+pub fn ancestor_folder_clip_cov(layers: &[Layer], li: usize, x: i32, y: i32) -> f32 {
+    let Some(layer) = layers.get(li) else {
+        return 1.0;
+    };
+    let mut parent = layer.parent_id();
+    let mut cov = 1.0;
+    for _ in 0..layers.len() {
+        let Some(parent_id) = parent else {
+            break;
+        };
+        let Some((fi, folder)) = layers
+            .iter()
+            .enumerate()
+            .find(|(_, candidate)| candidate.is_folder && candidate.group_id == Some(parent_id))
+        else {
+            break;
+        };
+        if folder.clip_to_below {
+            cov *= clip_base_alpha(layers, fi, x, y);
+            if cov <= 0.0 {
+                return 0.0;
+            }
+        }
+        parent = folder.parent_folder;
+    }
+    cov
+}
+
+pub fn ancestor_has_folder_clip(layers: &[Layer], li: usize) -> bool {
+    let Some(layer) = layers.get(li) else {
+        return false;
+    };
+    let mut parent = layer.parent_id();
+    for _ in 0..layers.len() {
+        let Some(parent_id) = parent else {
+            return false;
+        };
+        let Some(folder) = layers
+            .iter()
+            .find(|candidate| candidate.is_folder && candidate.group_id == Some(parent_id))
+        else {
+            return false;
+        };
+        if folder.clip_to_below {
+            return true;
+        }
+        parent = folder.parent_folder;
+    }
+    false
+}
+
+/// Clip-base coverage at `(x, y)`. `0` if there is no base or the base is hidden.
+#[inline]
+pub fn clip_base_alpha(layers: &[Layer], li: usize, x: i32, y: i32) -> f32 {
+    let Some(j) = clip_base_index(layers, li) else {
+        return 0.0;
+    };
+    if !layers[j].visible {
+        return 0.0;
+    }
+    if ancestor_folder_opacity(layers, j) <= 0.0 {
+        return 0.0;
+    }
+    layers[j].effective_alpha(x, y)
+}
+
+/// Own eye on, and every ancestor folder's eye on.
+/// Hiding a folder must not rewrite children's `visible` flags.
+pub fn layer_effectively_visible(layers: &[Layer], idx: usize) -> bool {
+    let Some(layer) = layers.get(idx) else {
+        return false;
+    };
+    if !layer.visible {
+        return false;
+    }
+    ancestor_folder_opacity(layers, idx) > 0.0
+}
+
+/// Own lock on, or any ancestor folder locked.
+/// Locking a folder must not rewrite children's `locked` flags.
+pub fn layer_effectively_locked(layers: &[Layer], idx: usize) -> bool {
+    let Some(layer) = layers.get(idx) else {
+        return false;
+    };
+    if layer.locked {
+        return true;
+    }
+    let mut parent = layer.parent_id();
+    for _ in 0..layers.len() {
+        let Some(parent_id) = parent else {
+            return false;
+        };
+        let Some(folder) = layers
+            .iter()
+            .find(|candidate| candidate.is_folder && candidate.group_id == Some(parent_id))
+        else {
+            return false;
+        };
+        if folder.locked {
+            return true;
+        }
+        parent = folder.parent_folder;
+    }
+    false
+}
+
 pub fn ancestor_folder_mask_cov(layers: &[Layer], li: usize, x: usize, y: usize) -> f32 {
     let Some(layer) = layers.get(li) else {
         return 1.0;
@@ -39,6 +193,81 @@ pub fn ancestor_folder_mask_cov(layers: &[Layer], li: usize, x: usize, y: usize)
     cov
 }
 
+/// True if any ancestor folder has an enabled mask (cheap skip for span paths).
+pub fn ancestor_has_folder_mask(layers: &[Layer], li: usize) -> bool {
+    let Some(layer) = layers.get(li) else {
+        return false;
+    };
+    let mut parent = layer.parent_id();
+    for _ in 0..layers.len() {
+        let Some(parent_id) = parent else {
+            return false;
+        };
+        let Some(folder) = layers
+            .iter()
+            .find(|candidate| candidate.is_folder && candidate.group_id == Some(parent_id))
+        else {
+            return false;
+        };
+        if folder.mask_modulates() {
+            return true;
+        }
+        parent = folder.parent_folder;
+    }
+    false
+}
+
+/// Fold ancestor folder masks into `out` (len ≥ x1−x0). 255 = fully visible.
+pub fn ancestor_folder_mask_cov_span(
+    layers: &[Layer],
+    li: usize,
+    y: usize,
+    x0: usize,
+    x1: usize,
+    out: &mut [u8],
+) {
+    let n = x1.saturating_sub(x0);
+    if out.len() < n {
+        return;
+    }
+    out[..n].fill(255);
+    if n == 0 || !ancestor_has_folder_mask(layers, li) {
+        return;
+    }
+    let Some(layer) = layers.get(li) else {
+        return;
+    };
+    thread_local! {
+        static TMP: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
+    }
+    TMP.with(|tmp| {
+        let mut tmp = tmp.borrow_mut();
+        if tmp.len() < n {
+            tmp.resize(n, 255);
+        }
+        let tmp = &mut tmp[..n];
+        let mut parent = layer.parent_id();
+        for _ in 0..layers.len() {
+            let Some(parent_id) = parent else {
+                break;
+            };
+            let Some(folder) = layers
+                .iter()
+                .find(|candidate| candidate.is_folder && candidate.group_id == Some(parent_id))
+            else {
+                break;
+            };
+            if folder.mask_modulates() {
+                folder.copy_mask_span(y as u32, x0 as u32, x1 as u32, tmp);
+                for i in 0..n {
+                    out[i] = ((out[i] as u16 * tmp[i] as u16) / 255) as u8;
+                }
+            }
+            parent = folder.parent_folder;
+        }
+    });
+}
+
 /// Product of ancestor folder opacities (not including the layer's own opacity).
 pub fn ancestor_folder_opacity(layers: &[Layer], li: usize) -> f32 {
     let Some(layer) = layers.get(li) else {
@@ -57,7 +286,7 @@ pub fn ancestor_folder_opacity(layers: &[Layer], li: usize) -> f32 {
             break;
         };
         o *= folder.opacity.clamp(0.0, 1.0);
-        if o <= 0.0 {
+        if !folder.visible || o <= 0.0 {
             return 0.0;
         }
         parent = folder.parent_folder;
@@ -111,8 +340,9 @@ pub struct Layer {
     pub blend_mode: BlendMode,
     #[serde(default)]
     pub clip_to_below: bool,
-    /// Editing lock — blocks paint/erase/fill/shape/filters/transform on content.
-    /// Eye / opacity / blend / order still work.
+    /// Editing lock — blocks paint and layer actions (delete/merge/move/mask/…).
+    /// Eye and lock toggles still work. Folder lock covers descendants without
+    /// rewriting their own `locked` flags (same idea as visibility).
     #[serde(default)]
     pub locked: bool,
     /// Runtime layer mask (sparse 8-bit tiles). Missing tile = opaque.
@@ -138,6 +368,14 @@ pub struct Layer {
     /// Non-destructive correction layer (filter applied to composite below).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adjustment: Option<crate::filters::AdjustmentKind>,
+    /// Editable text IR + display cache (hybrid vector→raster).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<crate::text::TextPayload>,
+    /// RGB pattern overlay for adjustment layers (clipped to plate alpha).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub color_pattern: String,
+    #[serde(default = "default_pattern_scale")]
+    pub color_pattern_scale: f32,
 }
 
 /// Layer metadata for `document.json` (ZIP v4) and legacy JSON TXMH v1–v3.
@@ -173,6 +411,12 @@ struct LayerSerde {
     folder_color: [u8; 3],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     adjustment: Option<crate::filters::AdjustmentKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<crate::text::TextObject>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    color_pattern: String,
+    #[serde(default = "default_pattern_scale")]
+    color_pattern_scale: f32,
     /// Legacy JSON TXMH (v1–v3): base64 RGBA 64×64 tiles. Ignored / empty in ZIP v4.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tile_chunks: Vec<LegacyTileChunk>,
@@ -209,6 +453,9 @@ impl From<Layer> for LayerSerde {
             folder_open: l.folder_open,
             folder_color: l.folder_color,
             adjustment: l.adjustment,
+            text: l.text.map(|t| t.object),
+            color_pattern: l.color_pattern,
+            color_pattern_scale: l.color_pattern_scale,
             // Never embed tiles in ZIP `document.json`.
             tile_chunks: Vec::new(),
             mask: None,
@@ -260,6 +507,9 @@ impl From<LayerSerde> for Layer {
             folder_open: s.folder_open,
             folder_color: s.folder_color,
             adjustment: s.adjustment,
+            text: s.text.map(crate::text::TextPayload::new),
+            color_pattern: s.color_pattern,
+            color_pattern_scale: s.color_pattern_scale.max(0.05),
         }
     }
 }
@@ -288,13 +538,20 @@ impl Clone for Layer {
             is_folder: self.is_folder,
             folder_open: self.folder_open,
             folder_color: self.folder_color,
-            adjustment: self.adjustment,
+            adjustment: self.adjustment.clone(),
+            text: self.text.clone(),
+            color_pattern: self.color_pattern.clone(),
+            color_pattern_scale: self.color_pattern_scale,
         }
     }
 }
 
 fn default_true_folder() -> bool {
     true
+}
+
+fn default_pattern_scale() -> f32 {
+    1.0
 }
 
 fn default_folder_color() -> [u8; 3] {
@@ -316,7 +573,7 @@ pub enum BlendMode {
     HardLight,
     Difference,
     Exclusion,
-    /// Linear Dodge (Add).
+    /// Linear Dodge (additive).
     LinearDodge,
     LinearBurn,
     VividLight,
@@ -373,7 +630,7 @@ impl BlendMode {
             BlendMode::HardLight => "Hard Light",
             BlendMode::Difference => "Difference",
             BlendMode::Exclusion => "Exclusion",
-            BlendMode::LinearDodge => "Linear Dodge (Add)",
+            BlendMode::LinearDodge => "Linear Dodge",
             BlendMode::LinearBurn => "Linear Burn",
             BlendMode::VividLight => "Vivid Light",
             BlendMode::LinearLight => "Linear Light",
@@ -449,6 +706,8 @@ impl BlendMode {
             b"sat " => BlendMode::Saturation,
             b"colr" | b"color" => BlendMode::Color,
             b"lum " => BlendMode::Luminosity,
+            // Group Pass Through, Dissolve: Beautiful has no separate tags.
+            b"pass" | b"diss" | b"norm" => BlendMode::Normal,
             _ => BlendMode::Normal,
         }
     }
@@ -478,6 +737,9 @@ impl Layer {
             folder_open: true,
             folder_color: default_folder_color(),
             adjustment: None,
+            text: None,
+            color_pattern: String::new(),
+            color_pattern_scale: 1.0,
         }
     }
 
@@ -494,6 +756,57 @@ impl Layer {
 
     pub fn is_adjustment(&self) -> bool {
         self.adjustment.is_some()
+    }
+
+    pub fn new_text(name: impl Into<String>, width: u32, height: u32, object: crate::text::TextObject) -> Self {
+        let mut layer = Self::new(name, width, height);
+        layer.text = Some(crate::text::TextPayload::new(object));
+        layer
+    }
+
+    pub fn is_text(&self) -> bool {
+        self.text.is_some()
+    }
+
+    /// Folder / adjustment / text — brush paint goes elsewhere (rasterize text first).
+    pub fn is_non_paintable(&self) -> bool {
+        self.is_folder || self.is_adjustment() || self.is_text()
+    }
+
+    /// Ensure text raster cache is fresh (no-op if not text / already clean).
+    pub fn ensure_text_cache(&mut self) {
+        self.ensure_text_cache_in_view(None);
+    }
+
+    /// Overlay typing / color: dest pixels match a full raster inside `view`.
+    pub fn ensure_text_cache_in_view(&mut self, view: Option<(f32, f32, f32, f32)>) {
+        let Some(payload) = self.text.as_mut() else {
+            return;
+        };
+        payload.object.normalize_legacy();
+        if payload.layout.is_none() {
+            payload.layout = Some(crate::text::layout_glyphs(&payload.object));
+        }
+        let pivot = payload
+            .layout
+            .as_ref()
+            .map(|l| (l.pivot_x, l.pivot_y))
+            .unwrap_or((0.0, 0.0));
+        payload.object.sync_rot_pivot(pivot);
+        if payload.cache.dirty {
+            let layout = payload.layout.take().unwrap();
+            if let Some(v) = view {
+                crate::text::rasterize_text_in_view(
+                    &payload.object,
+                    &layout,
+                    &mut payload.cache,
+                    v,
+                );
+            } else {
+                crate::text::rasterize_text(&payload.object, &layout, &mut payload.cache);
+            }
+            payload.layout = Some(layout);
+        }
     }
 
     pub fn new_folder(name: impl Into<String>, width: u32, height: u32) -> Self {
@@ -519,6 +832,9 @@ impl Layer {
             folder_open: true,
             folder_color: default_folder_color(),
             adjustment: None,
+            text: None,
+            color_pattern: String::new(),
+            color_pattern_scale: 1.0,
         }
     }
 
@@ -546,6 +862,29 @@ impl Layer {
     /// Painted tile AABB in document space (None if empty / folder).
     pub fn content_bounds(&self) -> Option<crate::composite::DirtyRect> {
         if self.is_folder {
+            return None;
+        }
+        if let Some(payload) = self.text.as_ref() {
+            let c = &payload.cache;
+            if !c.is_empty() {
+                return Some(crate::composite::DirtyRect {
+                    x0: c.origin_x.max(0) as u32,
+                    y0: c.origin_y.max(0) as u32,
+                    x1: (c.origin_x + c.width as i32).max(0) as u32,
+                    y1: (c.origin_y + c.height as i32).max(0) as u32,
+                });
+            }
+            if let Some(layout) = payload.layout.as_ref() {
+                let (x0, y0, x1, y1) = layout.rotated_aabb();
+                if x1 > x0 && y1 > y0 {
+                    return Some(crate::composite::DirtyRect {
+                        x0: x0.floor().max(0.0) as u32,
+                        y0: y0.floor().max(0.0) as u32,
+                        x1: x1.ceil().max(0.0) as u32,
+                        y1: y1.ceil().max(0.0) as u32,
+                    });
+                }
+            }
             return None;
         }
         self.tiles.content_bounds()
@@ -635,7 +974,11 @@ impl Layer {
         {
             return 0.0;
         }
-        let pixel_a = self.tiles.get_rgba(x, y)[3] as f32 / 255.0;
+        let pixel_a = if let Some(payload) = self.text.as_ref() {
+            payload.cache.sample(x, y)[3] as f32 / 255.0
+        } else {
+            self.tiles.get_rgba(x, y)[3] as f32 / 255.0
+        };
         let m = self.mask_sample(x as usize, y as usize) as f32 / 255.0;
         pixel_a * self.opacity.clamp(0.0, 1.0) * m
     }
@@ -648,6 +991,23 @@ impl Layer {
             return 255;
         };
         mask.sample(x as i32, y as i32)
+    }
+
+    /// Fill `dst` with this layer's mask for scanline y, `[x0, x1)`. 255 if none.
+    pub fn copy_mask_span(&self, y: u32, x0: u32, x1: u32, dst: &mut [u8]) {
+        let n = x1.saturating_sub(x0) as usize;
+        if dst.len() < n {
+            return;
+        }
+        if !self.mask_enabled {
+            dst[..n].fill(255);
+            return;
+        }
+        let Some(mask) = self.mask.as_ref() else {
+            dst[..n].fill(255);
+            return;
+        };
+        mask.copy_span(y as i32, x0 as i32, x1 as i32, dst);
     }
 
     pub fn ensure_mask(&mut self) {
@@ -666,6 +1026,17 @@ impl Layer {
         self.mask.is_some()
     }
 
+    /// True when compositing must multiply by this layer's mask.
+    /// Empty sparse map ≡ all opaque (255) — skip the slow path (same pixels).
+    #[inline]
+    pub fn mask_modulates(&self) -> bool {
+        self.mask_enabled
+            && self
+                .mask
+                .as_ref()
+                .is_some_and(|m| !m.is_empty())
+    }
+
     pub fn mask_approx_bytes(&self) -> u64 {
         self.mask.as_ref().map_or(0, AlphaTileMap::approx_bytes)
     }
@@ -676,6 +1047,15 @@ impl Layer {
             return;
         }
         self.mask = Some(AlphaTileMap::from_dense(self.width, self.height, &dense));
+    }
+
+    /// Replace mask with a pre-built sparse map (PSD import path).
+    pub fn set_mask_map(&mut self, map: AlphaTileMap) {
+        if map.is_empty() {
+            self.mask = None;
+        } else {
+            self.mask = Some(map);
+        }
     }
 
     pub fn mask_to_dense(&self) -> Option<Vec<u8>> {
@@ -997,4 +1377,116 @@ fn hsl_to_rgb_blend(h: f32, s: f32, l: f32) -> [f32; 3] {
         hue_to_rgb(p, q, h),
         hue_to_rgb(p, q, h - 1.0 / 3.0),
     ]
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+
+    #[test]
+    fn clip_chain_shares_base_not_neighbor() {
+        let mut layers = vec![
+            Layer::new("base", 8, 8),
+            Layer::new("shadow", 8, 8),
+            Layer::new("highlight", 8, 8),
+        ];
+        layers[1].clip_to_below = true;
+        layers[2].clip_to_below = true;
+        assert_eq!(clip_base_index(&layers, 0), None);
+        assert_eq!(clip_base_index(&layers, 1), Some(0));
+        assert_eq!(clip_base_index(&layers, 2), Some(0));
+    }
+
+    #[test]
+    fn unclipped_layer_breaks_clip_chain() {
+        let mut layers = vec![
+            Layer::new("base", 8, 8),
+            Layer::new("clipped", 8, 8),
+            Layer::new("other", 8, 8),
+            Layer::new("next", 8, 8),
+        ];
+        layers[1].clip_to_below = true;
+        layers[3].clip_to_below = true;
+        assert_eq!(clip_base_index(&layers, 1), Some(0));
+        assert_eq!(clip_base_index(&layers, 3), Some(2));
+    }
+
+    #[test]
+    fn folders_are_skipped_when_finding_clip_base() {
+        let mut layers = vec![
+            Layer::new("base", 8, 8),
+            Layer::new_folder("g", 8, 8),
+            Layer::new("clipped", 8, 8),
+        ];
+        layers[1].group_id = Some(1);
+        layers[2].clip_to_below = true;
+        assert_eq!(clip_base_index(&layers, 2), Some(0));
+    }
+
+    #[test]
+    fn folder_eye_does_not_rewrite_child_flags() {
+        let mut layers = vec![
+            Layer::new("on", 8, 8),
+            Layer::new("off", 8, 8),
+            Layer::new_folder("g", 8, 8),
+        ];
+        layers[0].group_id = Some(1);
+        layers[1].group_id = Some(1);
+        layers[1].visible = false;
+        layers[2].group_id = Some(1);
+        layers[2].visible = false;
+        assert!(layers[0].visible);
+        assert!(!layers[1].visible);
+        assert!(!layer_effectively_visible(&layers, 0));
+        assert!(!layer_effectively_visible(&layers, 1));
+        layers[2].visible = true;
+        assert!(layer_effectively_visible(&layers, 0));
+        assert!(!layer_effectively_visible(&layers, 1));
+        assert!(layers[0].visible);
+        assert!(!layers[1].visible);
+    }
+
+    #[test]
+    fn nested_folder_eye_hides_without_touching_child_folder_flag() {
+        let mut layers = vec![
+            Layer::new("leaf", 8, 8),
+            Layer::new_folder("inner", 8, 8),
+            Layer::new_folder("outer", 8, 8),
+        ];
+        layers[0].group_id = Some(2);
+        layers[1].group_id = Some(2);
+        layers[1].parent_folder = Some(1);
+        layers[2].group_id = Some(1);
+        layers[2].visible = false;
+        assert!(layers[1].visible);
+        assert!(layers[0].visible);
+        assert!(!layer_effectively_visible(&layers, 0));
+        assert!(!layer_effectively_visible(&layers, 1));
+        layers[2].visible = true;
+        assert!(layer_effectively_visible(&layers, 0));
+        assert!(layers[1].visible);
+    }
+
+    #[test]
+    fn folder_lock_does_not_rewrite_child_flags() {
+        let mut layers = vec![
+            Layer::new("free", 8, 8),
+            Layer::new("own_lock", 8, 8),
+            Layer::new_folder("g", 8, 8),
+        ];
+        layers[0].group_id = Some(1);
+        layers[1].group_id = Some(1);
+        layers[1].locked = true;
+        layers[2].group_id = Some(1);
+        layers[2].locked = true;
+        assert!(!layers[0].locked);
+        assert!(layers[1].locked);
+        assert!(layer_effectively_locked(&layers, 0));
+        assert!(layer_effectively_locked(&layers, 1));
+        layers[2].locked = false;
+        assert!(!layer_effectively_locked(&layers, 0));
+        assert!(layer_effectively_locked(&layers, 1));
+        assert!(!layers[0].locked);
+        assert!(layers[1].locked);
+    }
 }

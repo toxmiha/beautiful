@@ -3,10 +3,8 @@
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $Alpha = Join-Path $Root "dist\Beautiful-Alpha"
-$LinuxOut = Join-Path $Alpha "linux"
 
 New-Item -ItemType Directory -Force -Path $Alpha | Out-Null
-New-Item -ItemType Directory -Force -Path $LinuxOut | Out-Null
 
 $Exe = Join-Path $Root "target\release\beautiful.exe"
 if (-not (Test-Path $Exe)) {
@@ -17,6 +15,10 @@ if (-not (Test-Path $Exe)) {
 }
 
 Copy-Item -Force $Exe (Join-Path $Alpha "Beautiful.exe")
+& (Join-Path $PSScriptRoot "ensure-python-embed.ps1") -DestDirs @(
+    $Alpha,
+    (Join-Path $Root "dist")
+)
 try {
     Copy-Item -Force $Exe (Join-Path $Root "dist\beautiful.exe")
 } catch {
@@ -29,20 +31,25 @@ cd /d "%~dp0"
 start "" "Beautiful.exe"
 '@ | Set-Content -Encoding ASCII (Join-Path $Alpha "START.bat")
 
-$hasLinux = Test-Path (Join-Path $LinuxOut "beautiful")
-$linuxNote = if ($hasLinux) {
+$LinuxDrop = Join-Path $Root "dist\Beautiful-Linux\beautiful"
+$Linux7z = Join-Path $Root "dist\beautiful-linux.7z"
+$linuxNote = if (Test-Path $Linux7z) {
     @"
 Linux / Steam Deck
-  Бинарник: linux/beautiful
-  Запуск:   linux/run-beautiful.sh
-  Нужен Vulkan (Mesa).
+  Архив: dist\beautiful-linux.7z
+  Внутри папка: beautiful + libpython3.12.so + lib/python3.12.
+  Распакуй на Deck и запусти ./beautiful из этой папки.
+"@
+} elseif (Test-Path $LinuxDrop) {
+    @"
+Linux / Steam Deck
+  Файл: dist\Beautiful-Linux\ (beautiful + libpython*.so)
+  На Deck: chmod +x beautiful && ./beautiful
 "@
 } else {
     @"
 Linux / Steam Deck
-  Пока нет linux/beautiful — собери через WSL:
-    wsl -e bash /mnt/c/modding/beautiful/tools/build-linux.sh
-  затем снова запусти tools/pack-alpha.ps1
+  Собери: wsl env CARGO_TARGET_DIR=/home/crab3/beautiful-target bash /mnt/c/modding/beautiful/tools/build-linux.sh
 "@
 }
 
@@ -54,8 +61,11 @@ Beautiful — alpha
   1. Дважды кликни START.bat
      или Beautiful.exe
 
-RUST НЕ НУЖЕН
-  Это уже собранная программа.
+RUST / PYTHON НЕ НУЖНЫ
+  Это уже собранная программа. CPython — DLL рядом с exe
+  (python3.dll), как у Blender. Скидывай всю папку, не один файл.
+  ffmpeg не входит в сборку: радио / экспорт MP4 — если ffmpeg в PATH
+  или в папке ffmpeg\ рядом с exe.
 
 СИСТЕМА (Windows)
   - Windows 10 / 11 (64-bit)
@@ -69,7 +79,7 @@ $linuxNote
 
 Сборка без zip — папка dist\Beautiful-Alpha.
 
-Версия: alpha 0.4.8
+Версия: alpha 0.4.9
 "@ | Set-Content -Encoding UTF8 (Join-Path $Alpha "README.txt")
 
 # Prefer folder over zip for distribution

@@ -1,6 +1,6 @@
 //! Mesh / FFD / Coons warp evaluation and rasterization.
 
-use crate::resample::{sample_with_filter, ResampleFilter};
+use crate::resample::{sample_with_filter, LivePixelRect, ResampleFilter};
 
 /// Industry-style tessellation density (typical mesh warp uses ~25px
 /// between subdivision lines when converting BezierSurface → Mesh).
@@ -176,6 +176,175 @@ pub fn mesh_warp_rgba_ex(
     }
 
     (out, ow, oh, origin_x, origin_y)
+}
+
+/// Viewport-clipped warp raster (same dest pixels as [`mesh_warp_rgba_ex`] in the clip).
+///
+/// `clip_*` are in the same local space as `controls`. `lod` ≥ 1 samples every Nth
+/// dest pixel. Confirm still uses the full [`mesh_warp_rgba_ex`] path.
+pub fn mesh_warp_rgba_rect(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    grid_n: usize,
+    controls: &[(f32, f32)],
+    node_handles: Option<&[[Option<(f32, f32)>; 4]]>,
+    filter: ResampleFilter,
+    subdiv: u32,
+    clip_x0: i32,
+    clip_y0: i32,
+    clip_x1: i32,
+    clip_y1: i32,
+    lod: u32,
+) -> LivePixelRect {
+    let n = grid_n.max(2);
+    let lod = lod.max(1);
+    let empty = || LivePixelRect {
+        pixels: vec![0; 4],
+        width: 1,
+        height: 1,
+        x: clip_x0 as f32,
+        y: clip_y0 as f32,
+        lod,
+    };
+    let expected = n * n;
+    if controls.len() != expected || sw == 0 || sh == 0 || src.len() < (sw * sh * 4) as usize {
+        return empty();
+    }
+    let (origin_x, origin_y, ow, oh) = warp_output_aabb(controls, node_handles, sw, sh);
+    let ox0 = origin_x as i32;
+    let oy0 = origin_y as i32;
+    let ox1 = ox0 + ow as i32;
+    let oy1 = oy0 + oh as i32;
+    let x0 = clip_x0.max(ox0);
+    let y0 = clip_y0.max(oy0);
+    let x1 = clip_x1.min(ox1);
+    let y1 = clip_y1.min(oy1);
+    if x0 >= x1 || y0 >= y1 {
+        return empty();
+    }
+    let span_w = (x1 - x0) as u32;
+    let span_h = (y1 - y0) as u32;
+    let dw = span_w.div_ceil(lod).max(1);
+    let dh = span_h.div_ceil(lod).max(1);
+    let mut out = vec![0u8; (dw as usize) * (dh as usize) * 4];
+
+    let cells: Vec<(usize, usize)> = (0..n - 1)
+        .flat_map(|cy| (0..n - 1).map(move |cx| (cx, cy)))
+        .collect();
+    use rayon::prelude::*;
+    let ffd = node_handles.is_none();
+    let subdiv = subdiv.clamp(2, 48) as usize;
+    let patches: Vec<(Vec<u8>, u32, u32, i32, i32)> = if ffd {
+        cells
+            .into_par_iter()
+            .map(|(cx, cy)| {
+                raster_ffd_cell_inverse_clip(
+                    src, sw, sh, controls, n, cx, cy, filter, x0, y0, x1, y1, lod,
+                )
+            })
+            .collect()
+    } else {
+        cells
+            .into_par_iter()
+            .map(|(cx, cy)| {
+                raster_bicubic_cell_clip(
+                    src,
+                    sw,
+                    sh,
+                    controls,
+                    node_handles,
+                    n,
+                    cx,
+                    cy,
+                    subdiv,
+                    filter,
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    lod,
+                )
+            })
+            .collect()
+    };
+
+    for (local, lw, lh, tx, ty) in patches {
+        if lw == 0 || lh == 0 {
+            continue;
+        }
+        for row in 0..lh {
+            let dy = ty + row as i32;
+            if dy < 0 || dy >= dh as i32 {
+                continue;
+            }
+            for col in 0..lw {
+                let dx = tx + col as i32;
+                if dx < 0 || dx >= dw as i32 {
+                    continue;
+                }
+                let si = ((row * lw + col) * 4) as usize;
+                if si + 3 >= local.len() {
+                    continue;
+                }
+                if local[si + 3] == 0 {
+                    continue;
+                }
+                let di = ((dy as u32 * dw + dx as u32) * 4) as usize;
+                out[di..di + 4].copy_from_slice(&local[si..si + 4]);
+            }
+        }
+    }
+
+    LivePixelRect {
+        pixels: out,
+        width: dw,
+        height: dh,
+        x: x0 as f32,
+        y: y0 as f32,
+        lod,
+    }
+}
+
+fn warp_output_aabb(
+    controls: &[(f32, f32)],
+    node_handles: Option<&[[Option<(f32, f32)>; 4]]>,
+    sw: u32,
+    sh: u32,
+) -> (f32, f32, u32, u32) {
+    let mut min_x = controls[0].0;
+    let mut max_x = controls[0].0;
+    let mut min_y = controls[0].1;
+    let mut max_y = controls[0].1;
+    for &(x, y) in controls {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    if let Some(hs) = node_handles {
+        for (i, c) in controls.iter().enumerate() {
+            if i >= hs.len() {
+                break;
+            }
+            for h in &hs[i] {
+                if let Some(o) = h {
+                    min_x = min_x.min(c.0 + o.0);
+                    max_x = max_x.max(c.0 + o.0);
+                    min_y = min_y.min(c.1 + o.1);
+                    max_y = max_y.max(c.1 + o.1);
+                }
+            }
+        }
+    }
+    let pad = 8.0;
+    let origin_x = (min_x - pad).floor();
+    let origin_y = (min_y - pad).floor();
+    let ow = (((max_x + pad).ceil() - origin_x).ceil() as u32).max(1);
+    let oh = (((max_y + pad).ceil() - origin_y).ceil() as u32).max(1);
+    let ow = ow.min(sw.saturating_mul(4).max(64));
+    let oh = oh.min(sh.saturating_mul(4).max(64));
+    (origin_x, origin_y, ow, oh)
 }
 
 /// Refit Bezier whiskers so the lattice passes smoothly through control points
@@ -1617,6 +1786,253 @@ fn raster_textured_triangle(
             let di = ((oy as u32 * ow + ox as u32) * 4) as usize;
             out[di..di + 4].copy_from_slice(&sample);
         }
+    }
+}
+
+fn first_lod_aligned(v: i32, origin: i32, lod: u32) -> i32 {
+    if v <= origin {
+        return origin;
+    }
+    let lod = lod.max(1) as i32;
+    let rel = v - origin;
+    origin + ((rel + lod - 1) / lod) * lod
+}
+
+fn raster_ffd_cell_inverse_clip(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    controls: &[(f32, f32)],
+    n: usize,
+    cx: usize,
+    cy: usize,
+    filter: ResampleFilter,
+    clip_x0: i32,
+    clip_y0: i32,
+    clip_x1: i32,
+    clip_y1: i32,
+    lod: u32,
+) -> (Vec<u8>, u32, u32, i32, i32) {
+    let i00 = cy * n + cx;
+    let i10 = i00 + 1;
+    let i01 = i00 + n;
+    let i11 = i01 + 1;
+    if i11 >= controls.len() {
+        return (Vec::new(), 0, 0, 0, 0);
+    }
+    let a = controls[i00];
+    let b = controls[i10];
+    let c = controls[i11];
+    let d = controls[i01];
+    let min_x = a.0.min(b.0).min(c.0).min(d.0);
+    let max_x = a.0.max(b.0).max(c.0).max(d.0);
+    let min_y = a.1.min(b.1).min(c.1).min(d.1);
+    let max_y = a.1.max(b.1).max(c.1).max(d.1);
+    let gx0 = first_lod_aligned((min_x.floor() as i32).max(clip_x0), clip_x0, lod);
+    let gy0 = first_lod_aligned((min_y.floor() as i32).max(clip_y0), clip_y0, lod);
+    let gx1 = (max_x.ceil() as i32).min(clip_x1);
+    let gy1 = (max_y.ceil() as i32).min(clip_y1);
+    if gx0 >= gx1 || gy0 >= gy1 {
+        return (Vec::new(), 0, 0, 0, 0);
+    }
+    let lod_i = lod as i32;
+    let lw = ((gx1 - gx0 + lod_i - 1) / lod_i).max(1) as u32;
+    let lh = ((gy1 - gy0 + lod_i - 1) / lod_i).max(1) as u32;
+    let mut local = vec![0u8; (lw * lh * 4) as usize];
+    let n1 = (n - 1) as f32;
+    let swf = (sw - 1).max(1) as f32;
+    let shf = (sh - 1).max(1) as f32;
+    let mut py = 0u32;
+    let mut gy = gy0;
+    while gy < gy1 {
+        let mut px = 0u32;
+        let mut gx = gx0;
+        while gx < gx1 {
+            let lx = gx as f32 + 0.5;
+            let ly = gy as f32 + 0.5;
+            if let Some((fu, fv)) = inverse_bilinear_quad((lx, ly), a, b, c, d) {
+                let u = cx as f32 + fu;
+                let v = cy as f32 + fv;
+                let sx = u / n1 * swf;
+                let sy = v / n1 * shf;
+                let sample = sample_with_filter(filter, src, sw, sh, sx, sy);
+                let di = ((py * lw + px) * 4) as usize;
+                local[di..di + 4].copy_from_slice(&sample);
+            }
+            px += 1;
+            gx += lod_i;
+        }
+        py += 1;
+        gy += lod_i;
+    }
+    let tx = (gx0 - clip_x0) / lod_i;
+    let ty = (gy0 - clip_y0) / lod_i;
+    (local, lw, lh, tx, ty)
+}
+
+fn raster_bicubic_cell_clip(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    controls: &[(f32, f32)],
+    node_handles: Option<&[[Option<(f32, f32)>; 4]]>,
+    n: usize,
+    cx: usize,
+    cy: usize,
+    subdiv: usize,
+    filter: ResampleFilter,
+    clip_x0: i32,
+    clip_y0: i32,
+    clip_x1: i32,
+    clip_y1: i32,
+    lod: u32,
+) -> (Vec<u8>, u32, u32, i32, i32) {
+    let mut pts = vec![(0.0f32, 0.0f32); (subdiv + 1) * (subdiv + 1)];
+    let mut srcs = vec![(0.0f32, 0.0f32); (subdiv + 1) * (subdiv + 1)];
+    let inv = 1.0 / subdiv as f32;
+    let swf = (sw - 1).max(1) as f32;
+    let shf = (sh - 1).max(1) as f32;
+    let n1 = (n - 1) as f32;
+    for iy in 0..=subdiv {
+        for ix in 0..=subdiv {
+            let u = cx as f32 + ix as f32 * inv;
+            let v = cy as f32 + iy as f32 * inv;
+            pts[iy * (subdiv + 1) + ix] = eval_warp_surface_nodes(controls, n, u, v, node_handles);
+            srcs[iy * (subdiv + 1) + ix] = (u / n1 * swf, v / n1 * shf);
+        }
+    }
+    let mut min_x = pts[0].0;
+    let mut max_x = pts[0].0;
+    let mut min_y = pts[0].1;
+    let mut max_y = pts[0].1;
+    for &(x, y) in &pts {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    if max_x < clip_x0 as f32
+        || min_x > clip_x1 as f32
+        || max_y < clip_y0 as f32
+        || min_y > clip_y1 as f32
+    {
+        return (Vec::new(), 0, 0, 0, 0);
+    }
+    let lod_i = lod as i32;
+    let gx0 = first_lod_aligned((min_x.floor() as i32).max(clip_x0), clip_x0, lod);
+    let gy0 = first_lod_aligned((min_y.floor() as i32).max(clip_y0), clip_y0, lod);
+    let gx1 = (max_x.ceil() as i32).min(clip_x1);
+    let gy1 = (max_y.ceil() as i32).min(clip_y1);
+    if gx0 >= gx1 || gy0 >= gy1 {
+        return (Vec::new(), 0, 0, 0, 0);
+    }
+    let lw = ((gx1 - gx0 + lod_i - 1) / lod_i).max(1) as u32;
+    let lh = ((gy1 - gy0 + lod_i - 1) / lod_i).max(1) as u32;
+    let mut local = vec![0u8; (lw * lh * 4) as usize];
+    for iy in 0..subdiv {
+        for ix in 0..subdiv {
+            let i00 = iy * (subdiv + 1) + ix;
+            let i10 = i00 + 1;
+            let i01 = i00 + (subdiv + 1);
+            let i11 = i01 + 1;
+            raster_textured_triangle_clip(
+                &mut local,
+                lw,
+                lh,
+                gx0,
+                gy0,
+                lod,
+                pts[i00],
+                pts[i10],
+                pts[i11],
+                srcs[i00],
+                srcs[i10],
+                srcs[i11],
+                src,
+                sw,
+                sh,
+                filter,
+            );
+            raster_textured_triangle_clip(
+                &mut local,
+                lw,
+                lh,
+                gx0,
+                gy0,
+                lod,
+                pts[i00],
+                pts[i11],
+                pts[i01],
+                srcs[i00],
+                srcs[i11],
+                srcs[i01],
+                src,
+                sw,
+                sh,
+                filter,
+            );
+        }
+    }
+    let tx = (gx0 - clip_x0) / lod_i;
+    let ty = (gy0 - clip_y0) / lod_i;
+    (local, lw, lh, tx, ty)
+}
+
+fn raster_textured_triangle_clip(
+    out: &mut [u8],
+    ow: u32,
+    oh: u32,
+    origin_x: i32,
+    origin_y: i32,
+    lod: u32,
+    p0: (f32, f32),
+    p1: (f32, f32),
+    p2: (f32, f32),
+    s0: (f32, f32),
+    s1: (f32, f32),
+    s2: (f32, f32),
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    filter: ResampleFilter,
+) {
+    let lod_i = lod.max(1) as i32;
+    let min_x = p0.0.min(p1.0).min(p2.0).floor() as i32;
+    let max_x = p0.0.max(p1.0).max(p2.0).ceil() as i32;
+    let min_y = p0.1.min(p1.1).min(p2.1).floor() as i32;
+    let max_y = p0.1.max(p1.1).max(p2.1).ceil() as i32;
+    let area = edge_fn(p0, p1, p2);
+    if area.abs() < 1e-6 {
+        return;
+    }
+    let inv_area = 1.0 / area;
+    let gx0 = first_lod_aligned(min_x.max(origin_x), origin_x, lod);
+    let gy0 = first_lod_aligned(min_y.max(origin_y), origin_y, lod);
+    let gx1 = max_x.min(origin_x + (ow as i32) * lod_i);
+    let gy1 = max_y.min(origin_y + (oh as i32) * lod_i);
+    let mut gy = gy0;
+    while gy <= gy1 {
+        let mut gx = gx0;
+        while gx <= gx1 {
+            let lx = gx as f32 + 0.5;
+            let ly = gy as f32 + 0.5;
+            let w0 = edge_fn(p1, p2, (lx, ly)) * inv_area;
+            let w1 = edge_fn(p2, p0, (lx, ly)) * inv_area;
+            let w2 = edge_fn(p0, p1, (lx, ly)) * inv_area;
+            if w0 >= -1e-4 && w1 >= -1e-4 && w2 >= -1e-4 {
+                let ox = (gx - origin_x) / lod_i;
+                let oy = (gy - origin_y) / lod_i;
+                if ox >= 0 && oy >= 0 && ox < ow as i32 && oy < oh as i32 {
+                    let sx = w0 * s0.0 + w1 * s1.0 + w2 * s2.0;
+                    let sy = w0 * s0.1 + w1 * s1.1 + w2 * s2.1;
+                    let sample = sample_with_filter(filter, src, sw, sh, sx, sy);
+                    let di = ((oy as u32 * ow + ox as u32) * 4) as usize;
+                    out[di..di + 4].copy_from_slice(&sample);
+                }
+            }
+            gx += lod_i;
+        }
+        gy += lod_i;
     }
 }
 

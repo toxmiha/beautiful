@@ -41,7 +41,7 @@ pub fn load_file_preview_max(path: &Path, max_side: u32) -> Option<FilePreview> 
     match ext.as_str() {
         "txmh" | "beautiful" => load_txmh_preview(path, max_side),
         "psd" => load_psd_preview(path, max_side),
-        "png" | "jpg" | "jpeg" | "bmp" | "webp" => load_raster_preview(path, max_side),
+        "png" | "jpg" | "jpeg" | "bmp" | "dib" | "webp" => load_raster_preview(path, max_side),
         _ => None,
     }
 }
@@ -267,12 +267,25 @@ fn decode_image_bytes(bytes: &[u8], max_side: u32) -> Option<FilePreview> {
 }
 
 fn dynamic_to_preview(img: DynamicImage, max_side: u32) -> Option<FilePreview> {
+    let w = img.width();
+    let h = img.height();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let max_side = max_side.max(1);
+    let scale = (max_side as f32 / w.max(h) as f32).min(1.0);
+    let tw = ((w as f32) * scale).round().max(1.0) as u32;
+    let th = ((h as f32) * scale).round().max(1.0) as u32;
+    let img = if tw != w || th != h {
+        img.resize(tw, th, FilterType::Triangle)
+    } else {
+        img
+    };
     let rgba = img.to_rgba8();
-    let (w, h, out) = downscale_rgba(rgba.width(), rgba.height(), rgba.as_raw(), max_side);
     Some(FilePreview {
-        width: w,
-        height: h,
-        rgba: out,
+        width: rgba.width(),
+        height: rgba.height(),
+        rgba: rgba.into_raw(),
     })
 }
 

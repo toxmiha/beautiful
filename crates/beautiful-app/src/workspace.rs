@@ -69,6 +69,8 @@ pub struct Sheet {
     pub canvas: Option<CanvasState>,
     pub snapshot: Option<SheetSnapshot>,
     pub snapshot_dirty: bool,
+    /// `document.edit_generation()` when `snapshot` was last baked.
+    pub snapshot_edit_gen: u64,
     /// Bumped whenever `snapshot` RGBA is rebuilt — egui texture cache key.
     pub snapshot_gen: u64,
     /// Last known local canvas view (kept even while focused lives on the app).
@@ -141,6 +143,36 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    pub fn from_loaded_sheets(
+        docs: Vec<Document>,
+        metas: Vec<beautiful_core::TxmhSheetMeta>,
+        focused: usize,
+    ) -> Self {
+        let mut sheets = Vec::with_capacity(docs.len());
+        for (i, doc) in docs.into_iter().enumerate() {
+            let meta = metas.get(i);
+            let rect = meta
+                .and_then(|m| m.rect)
+                .map(|r| Rect::from_min_max(Pos2::new(r[0], r[1]), Pos2::new(r[2], r[3])))
+                .unwrap_or_else(|| Sheet::frame_for_doc(&doc, Pos2::new(48.0 + i as f32 * 48.0, 48.0 + i as f32 * 40.0)));
+            sheets.push(Sheet {
+                id: SheetId((i + 1) as u64), title: meta.map(|m| m.title.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| format!("Sheet {}", i + 1)),
+                rect, z_order: 0, document: Some(doc), canvas: Some(CanvasState::new()),
+                snapshot: None, snapshot_dirty: true, snapshot_edit_gen: 0, snapshot_gen: 0,
+                view_zoom: 0.0, view_pan: Vec2::ZERO, maximized: false, restored_rect: None,
+            });
+        }
+        if sheets.is_empty() { return Self::new_with_primary("Untitled", 2000, 1500); }
+        let mut ws = Self {
+            desk: DesktopView::default(), sheets, focused: focused.min(metas.len().saturating_sub(1)),
+            next_id: 1, next_z: 1, desk_navigating: false, wheel_accum: 0.0,
+        };
+        ws.focused = focused.min(ws.sheets.len() - 1);
+        ws.next_id = ws.sheets.len() as u64 + 1;
+        ws.sync_z_from_bar_order();
+        ws
+    }
+
     pub fn new_with_primary(title: impl Into<String>, doc_w: u32, doc_h: u32) -> Self {
         let rect = Sheet::frame_for_doc(
             &Document::new(doc_w.max(1), doc_h.max(1)),
@@ -157,6 +189,7 @@ impl Workspace {
                 canvas: None,
                 snapshot: None,
                 snapshot_dirty: true,
+                snapshot_edit_gen: 0,
                 snapshot_gen: 0,
                 view_zoom: 0.0,
                 view_pan: Vec2::ZERO,
@@ -246,13 +279,13 @@ impl Workspace {
     ) -> SheetId {
         let fi = self.focused_index();
         self.sheets[fi].sync_view_from_canvas(app_canvas);
-        Self::refresh_snapshot_from_doc(&mut self.sheets[fi], app_doc);
+        Self::mark_snapshot_stale(&mut self.sheets[fi], app_doc);
         self.sheets[fi].document = Some(std::mem::replace(
             app_doc,
             Document::new(64, 64),
         ));
         self.sheets[fi].canvas = Some(std::mem::replace(app_canvas, CanvasState::new()));
-        Self::park_sheet_caches(&mut self.sheets[fi]);
+        Self::park_sheet_caches_light(&mut self.sheets[fi]);
 
         let id = SheetId(self.next_id);
         self.next_id += 1;
@@ -273,6 +306,7 @@ impl Workspace {
                 canvas: None,
                 snapshot: None,
                 snapshot_dirty: true,
+                snapshot_edit_gen: 0,
                 snapshot_gen: 0,
                 view_zoom: 0.0,
                 view_pan: Vec2::ZERO,
@@ -302,12 +336,12 @@ impl Workspace {
         }
         let fi = self.focused_index();
         self.sheets[fi].sync_view_from_canvas(app_canvas);
-        Self::refresh_snapshot_from_doc(&mut self.sheets[fi], app_doc);
+        Self::mark_snapshot_stale(&mut self.sheets[fi], app_doc);
         let old_doc = std::mem::replace(app_doc, Document::new(64, 64));
         let old_canvas = std::mem::replace(app_canvas, CanvasState::new());
         self.sheets[fi].document = Some(old_doc);
         self.sheets[fi].canvas = Some(old_canvas);
-        Self::park_sheet_caches(&mut self.sheets[fi]);
+        Self::park_sheet_caches_light(&mut self.sheets[fi]);
 
         let mut doc = self.sheets[idx]
             .document
@@ -467,13 +501,13 @@ impl Workspace {
     ) {
         let fi = self.focused_index();
         self.sheets[fi].sync_view_from_canvas(app_canvas);
-        Self::refresh_snapshot_from_doc(&mut self.sheets[fi], app_doc);
+        Self::mark_snapshot_stale(&mut self.sheets[fi], app_doc);
         self.sheets[fi].document = Some(std::mem::replace(app_doc, Document::new(64, 64)));
         self.sheets[fi].canvas = Some(std::mem::replace(app_canvas, CanvasState::new()));
-        Self::park_sheet_caches(&mut self.sheets[fi]);
+        Self::park_sheet_caches_light(&mut self.sheets[fi]);
         for (i, sheet) in self.sheets.iter_mut().enumerate() {
             if i != fi {
-                Self::park_sheet_caches(sheet);
+                Self::park_sheet_caches_light(sheet);
             }
         }
     }
@@ -503,12 +537,19 @@ impl Workspace {
         self.raise_focused();
     }
 
-    fn park_sheet_caches(sheet: &mut Sheet) {
+    fn park_sheet_caches_light(sheet: &mut Sheet) {
         if let Some(doc) = sheet.document.as_mut() {
-            doc.park_for_inactive();
+            doc.park_for_inactive_light();
         }
         if let Some(canvas) = sheet.canvas.as_mut() {
-            canvas.park_for_inactive();
+            canvas.park_for_inactive_light();
+        }
+    }
+
+    fn mark_snapshot_stale(sheet: &mut Sheet, document: &Document) {
+        let gen = document.edit_generation();
+        if sheet.snapshot.is_none() || sheet.snapshot_edit_gen != gen {
+            sheet.snapshot_dirty = true;
         }
     }
 
@@ -520,7 +561,8 @@ impl Workspace {
     }
 
     pub fn refresh_snapshot_from_doc(sheet: &mut Sheet, document: &Document) {
-        // Full-document "photo" — sharp when inactive. Cap only for huge canvases (RAM).
+        // Full-document photo for inactive sheets. 4096 is a safety cap, not a
+        // downscale target — 1280 made the canvas look half-res / soapy.
         Self::refresh_snapshot_from_doc_sized(sheet, document, 4096);
     }
 
@@ -533,12 +575,12 @@ impl Workspace {
         let (fw, fh, rgba) = document.stage_rgba_copy();
         let max_side = max_side.clamp(1024, 8192);
         let scale = (max_side as f32 / fw.max(fh).max(1) as f32).min(1.0);
-        if scale >= 0.999 {
-            sheet.snapshot = Some(SheetSnapshot {
+        let snapshot = if scale >= 0.999 {
+            SheetSnapshot {
                 width: fw,
                 height: fh,
                 rgba,
-            });
+            }
         } else {
             let nw = ((fw as f32) * scale).round().max(1.0) as u32;
             let nh = ((fh as f32) * scale).round().max(1.0) as u32;
@@ -573,33 +615,39 @@ impl Workspace {
                     out[di + 3] = (sum[3] / n) as u8;
                 }
             }
-            sheet.snapshot = Some(SheetSnapshot {
+            SheetSnapshot {
                 width: nw,
                 height: nh,
                 rgba: out,
-            });
-        }
+            }
+        };
+        sheet.snapshot = Some(snapshot);
+        sheet.snapshot_edit_gen = document.edit_generation();
         sheet.snapshot_gen = sheet.snapshot_gen.wrapping_add(1);
         sheet.snapshot_dirty = false;
     }
 
-    /// Ensure inactive sheets have a sharp photo (taken on blur / when dirty).
-    /// Does not downscale to screen size — that caused upscale "шакалка".
+    /// Idle: refresh at most one inactive sheet photo per call (no switch hitch).
     pub fn ensure_inactive_snapshots(&mut self, _desk_rect: Rect) {
         let focused = self.focused_index();
-        for (i, sheet) in self.sheets.iter_mut().enumerate() {
+        let idx = self.sheets.iter().enumerate().find_map(|(i, sheet)| {
             if i == focused {
-                continue;
+                return None;
             }
             if sheet.snapshot.is_some() && !sheet.snapshot_dirty {
-                continue;
+                return None;
             }
-            if let Some(doc) = sheet.document.take() {
-                Self::refresh_snapshot_from_doc(sheet, &doc);
-                sheet.document = Some(doc);
-                Self::park_sheet_caches(sheet);
-            }
-        }
+            sheet.document.is_some().then_some(i)
+        });
+        let Some(i) = idx else {
+            return;
+        };
+        let sheet = &mut self.sheets[i];
+        let Some(doc) = sheet.document.take() else {
+            return;
+        };
+        Self::refresh_snapshot_from_doc(sheet, &doc);
+        sheet.document = Some(doc);
     }
 
     pub fn handle_desk_input(

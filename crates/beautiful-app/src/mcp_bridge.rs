@@ -38,6 +38,13 @@ pub enum McpCommand {
     PerfSnapshot,
     PerfReset,
     GetView,
+    /// Set canvas zoom. `percent` is 100 = 1:1. `fit` resets to first-frame fit.
+    SetZoom { percent: Option<f32>, fit: bool },
+    /// Display-tile freshness vs cover (GPU + CPU flags).
+    TileStatus,
+    GradientBegin { x0: f32, y0: f32, x1: f32, y1: f32 },
+    GradientCommit,
+    GradientCancel,
     Quit,
 }
 
@@ -327,6 +334,24 @@ fn parse_cmd(req: &Value) -> Result<McpCommand, String> {
         "perf_snapshot" => Ok(McpCommand::PerfSnapshot),
         "perf_reset" => Ok(McpCommand::PerfReset),
         "get_view" => Ok(McpCommand::GetView),
+        "set_zoom" => {
+            let percent = req.get("percent").and_then(|v| v.as_f64()).map(|v| v as f32);
+            let fit = req.get("fit").and_then(|v| v.as_bool()).unwrap_or(false);
+            if percent.is_none() && !fit {
+                return Err("set_zoom needs percent or fit=true".into());
+            }
+            Ok(McpCommand::SetZoom { percent, fit })
+        }
+        "tile_status" => Ok(McpCommand::TileStatus),
+        "gradient_begin" => {
+            let x0 = req.get("x0").and_then(|v| v.as_f64()).unwrap_or(80.0) as f32;
+            let y0 = req.get("y0").and_then(|v| v.as_f64()).unwrap_or(80.0) as f32;
+            let x1 = req.get("x1").and_then(|v| v.as_f64()).unwrap_or(400.0) as f32;
+            let y1 = req.get("y1").and_then(|v| v.as_f64()).unwrap_or(80.0) as f32;
+            Ok(McpCommand::GradientBegin { x0, y0, x1, y1 })
+        }
+        "gradient_commit" => Ok(McpCommand::GradientCommit),
+        "gradient_cancel" => Ok(McpCommand::GradientCancel),
         "quit" => Ok(McpCommand::Quit),
         other => Err(format!("unknown cmd: {other}")),
     }

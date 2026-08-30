@@ -172,7 +172,7 @@ fn bench_opacity_sandwich(n: usize) -> f64 {
     })
 }
 
-/// Warm eye (spam): VisibilityBackdrop after first flip — measures memcpy path.
+/// Warm eye (spam): BelowCache after first flip — measures memcpy path.
 fn bench_eye_warm(n: usize) -> f64 {
     let paint = DirtyRect {
         x0: 100,

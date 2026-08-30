@@ -1,14 +1,25 @@
 //! System UI font enumeration and loading (Windows GDI).
 
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 /// Default UI typeface when settings are empty or the chosen face fails to load.
 pub const DEFAULT_UI_FONT: &str = "Segoe UI";
 
+static FONT_FAMILIES: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
 /// Cached list of installed font family names (sorted, unique, no vertical `@` faces).
-pub fn list_system_font_families() -> &'static [String] {
-    static LIST: OnceLock<Vec<String>> = OnceLock::new();
-    LIST.get_or_init(enumerate_font_families)
+pub fn list_system_font_families() -> Vec<String> {
+    let mut guard = FONT_FAMILIES.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Some(enumerate_font_families());
+    }
+    guard.clone().unwrap_or_default()
+}
+
+/// Re-enumerate system fonts (newly installed faces appear without restart).
+pub fn refresh_system_font_families() {
+    let mut guard = FONT_FAMILIES.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(enumerate_font_families());
 }
 
 pub fn normalize_ui_font_name(preferred: &str) -> String {

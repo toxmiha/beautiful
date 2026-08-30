@@ -2,7 +2,7 @@
 
 # Beautiful
 
-**Beautiful** is an open-source digital painting app (MIT).
+**Beautiful** is an open-source digital painting app ([GPL-3.0](LICENSE)).
 
 > **Alpha** — not stable. Expect bugs and unfinished tools. Published on GitHub for **beta testers**.
 
@@ -11,16 +11,16 @@ A **beta** release is planned later.
 ## Download
 
 Get the latest builds from **[Releases](https://github.com/toxmiha/beautiful/releases)**  
-(e.g. `Beautiful-0.4.8.exe` for Windows, Linux x64 when attached). Source archives are attached to each release as usual.
+Windows: unpack `Beautiful-0.4.9-windows-x64.zip` and run `Beautiful.exe` **from that folder** (CPython DLLs must sit next to the exe — a lone `.exe` will not start). Linux x64 is attached when available. Source archives are attached to each release as usual.
 
 ## Status
 
 | | |
 |---|---|
-| Stage | **Alpha 0.4.8** |
+| Stage | **Alpha 0.4.9** |
 | Stability | Unstable — bugs are expected |
 | Tools progress | About **~70%** of planned tools implemented |
-| License | [MIT](LICENSE) |
+| License | [GPL-3.0](LICENSE) |
 | Audience | Early / beta testers |
 
 ## What it is
@@ -28,7 +28,17 @@ Get the latest builds from **[Releases](https://github.com/toxmiha/beautiful/rel
 - A program for **drawing and painting**
 - **Full UI customization** — rearrange and personalize the interface
 - **Addons** supported
-- **Open source** (MIT)
+- **Open source** ([GPL-3.0](LICENSE))
+
+## What’s new in 0.4.9
+
+- Text tool (live layout + raster on the canvas)
+- Python add-ons with sidecar CPython (Windows `python3.dll`, Linux `libpython3.12.so`) + Music Player add-on
+- Gamepad / Steam Deck input, UI language (i18n)
+- Preset library / browser, ABR + brush asset folders
+- Display-tile present path (replaces the old full-canvas mip)
+- Export Studio, demo record/replay
+- PSD / file IO, filters, live transform, and multilayer composite work
 
 ## What’s new in 0.4.8
 
@@ -81,4 +91,4 @@ Needs [Rust](https://rustup.rs/) (stable).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GNU General Public License v3.0 or later — see [LICENSE](LICENSE).

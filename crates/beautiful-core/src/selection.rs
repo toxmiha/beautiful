@@ -1,5 +1,7 @@
 //! Selection: rect / mask / floating affine transform.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::composite::DirtyRect;
@@ -8,7 +10,7 @@ use crate::resample::{
     blit_layer, blit_layer_buf, flip_pixels_h, flip_pixels_v, resample_rgba, rotate_rgba,
     ResampleFilter,
 };
-use crate::tiles::TileBuffer;
+use crate::tiles::{TileBuffer, TILE_SIZE};
 use crate::warp::mesh_warp_rgba_ex;
 use crate::Layer;
 
@@ -18,9 +20,10 @@ pub struct Selection {
     /// Soft / wand / lasso alpha mask (document-local bbox).
     #[serde(default)]
     pub mask: Option<SelectionMask>,
-    /// Polygon outline for lasso display (document space).
-    #[serde(default)]
-    pub outline: Vec<(f32, f32)>,
+    /// Closed rings of marching-ants (document-space pixel edges).
+    /// Derived from the raster mask — the selection itself is not a path.
+    #[serde(default, deserialize_with = "deserialize_outline")]
+    pub outline: SelectionOutline,
     pub floating: Option<FloatingSelection>,
     /// Stack index of the layer that owns [`Self::floating`] (for in-stack composite).
     #[serde(skip)]
@@ -28,6 +31,9 @@ pub struct Selection {
     /// In-progress lasso polygon (UI); not persisted.
     #[serde(skip)]
     pub lasso_points: Vec<(f32, f32)>,
+    /// Dabs since last marching-ants rebuild (selection brush).
+    #[serde(skip)]
+    outline_dabs: u32,
     /// Floating exists but is drawn by the UI/GPU overlay (live transform).
     /// Underlay composites the holed layer only — no per-frame float bake.
     #[serde(skip)]
@@ -41,18 +47,75 @@ pub enum SelectionCombine {
     Replace,
     Add,
     Subtract,
+    /// Symmetric difference (XOR): overlap is dropped, the rest is kept.
+    Invert,
 }
 
 impl SelectionCombine {
-    pub fn from_modifiers(shift: bool, alt: bool) -> Self {
-        if alt {
-            Self::Subtract
-        } else if shift {
-            Self::Add
-        } else {
-            Self::Replace
+    pub const ALL: [Self; 4] = [Self::Replace, Self::Add, Self::Subtract, Self::Invert];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Replace => "Replace",
+            Self::Add => "Add",
+            Self::Subtract => "Subtract",
+            Self::Invert => "Invert",
         }
     }
+
+    pub fn tip(self) -> &'static str {
+        match self {
+            Self::Replace => "New selection replaces the current one",
+            Self::Add => "Union with the current selection (Shift)",
+            Self::Subtract => "Remove from the current selection (Alt)",
+            Self::Invert => "Symmetric difference with the current selection",
+        }
+    }
+
+    /// Sticky tool option, with modifier overrides (Shift = add, Alt = subtract).
+    pub fn resolve(sticky: Self, shift: bool, alt: bool, has_selection: bool) -> Self {
+        if alt {
+            Self::Subtract
+        } else if shift && has_selection {
+            Self::Add
+        } else {
+            sticky
+        }
+    }
+
+    pub fn from_modifiers(shift: bool, alt: bool) -> Self {
+        Self::resolve(Self::Replace, shift, alt, true)
+    }
+}
+
+/// Closed contour rings in document space (pixel-grid vertices).
+/// Display only — the selection source of truth is the raster mask.
+pub type SelectionOutline = Vec<Vec<(f32, f32)>>;
+
+pub fn outline_is_ready(outline: &SelectionOutline) -> bool {
+    outline.iter().any(|ring| ring.len() >= 3)
+}
+
+fn deserialize_outline<'de, D>(deserializer: D) -> Result<SelectionOutline, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OutlineDe {
+        Rings(Vec<Vec<(f32, f32)>>),
+        Legacy(Vec<(f32, f32)>),
+    }
+    Ok(match OutlineDe::deserialize(deserializer)? {
+        OutlineDe::Rings(rings) => rings,
+        OutlineDe::Legacy(pts) => {
+            if pts.len() >= 3 {
+                vec![pts]
+            } else {
+                Vec::new()
+            }
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -244,6 +307,77 @@ impl SelectionMask {
     pub fn is_empty(&self) -> bool {
         self.width == 0 || self.height == 0 || self.alpha.is_empty()
     }
+
+    /// Tight selection of every painted pixel (α > 0), no empty padding.
+    ///
+    /// Coverage is **255** for any present sample — not the pixel's own alpha.
+    /// Copying α into the mask double-applied it on lift, and marching-ants
+    /// uses a 128 cutoff, which clipped soft brush fringes.
+    pub fn from_layer_pixels(layer: &Layer) -> Option<Self> {
+        let ts = TILE_SIZE as i32;
+        let doc_w = layer.tiles.width as i32;
+        let doc_h = layer.tiles.height as i32;
+        if doc_w <= 0 || doc_h <= 0 {
+            return None;
+        }
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        let mut any = false;
+        layer.tiles.for_each_rgba_tile(|tx, ty, buf| {
+            let ox = tx * ts;
+            let oy = ty * ts;
+            for i in 0..(TILE_SIZE as usize * TILE_SIZE as usize) {
+                if buf[i * 4 + 3] == 0 {
+                    continue;
+                }
+                let x = ox + (i % TILE_SIZE as usize) as i32;
+                let y = oy + (i / TILE_SIZE as usize) as i32;
+                if x < 0 || y < 0 || x >= doc_w || y >= doc_h {
+                    continue;
+                }
+                any = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x + 1);
+                max_y = max_y.max(y + 1);
+            }
+        });
+        if !any || max_x <= min_x || max_y <= min_y {
+            return None;
+        }
+        let w = (max_x - min_x) as u32;
+        let h = (max_y - min_y) as u32;
+        let mut alpha = vec![0u8; (w as usize).saturating_mul(h as usize)];
+        layer.tiles.for_each_rgba_tile(|tx, ty, buf| {
+            let ox = tx * ts;
+            let oy = ty * ts;
+            if ox + ts <= min_x || oy + ts <= min_y || ox >= max_x || oy >= max_y {
+                return;
+            }
+            for i in 0..(TILE_SIZE as usize * TILE_SIZE as usize) {
+                if buf[i * 4 + 3] == 0 {
+                    continue;
+                }
+                let x = ox + (i % TILE_SIZE as usize) as i32;
+                let y = oy + (i / TILE_SIZE as usize) as i32;
+                if x < min_x || y < min_y || x >= max_x || y >= max_y {
+                    continue;
+                }
+                let mx = (x - min_x) as u32;
+                let my = (y - min_y) as u32;
+                alpha[(my * w + mx) as usize] = 255;
+            }
+        });
+        Some(Self {
+            x: min_x as f32,
+            y: min_y as f32,
+            width: w,
+            height: h,
+            alpha,
+        })
+    }
 }
 
 /// Union of two soft masks (max coverage).
@@ -290,6 +424,41 @@ pub fn subtract_masks(a: &SelectionMask, b: &SelectionMask) -> Option<SelectionM
             let va = a.sample(dx, dy) as u32;
             let vb = b.sample(dx, dy) as u32;
             let out = (va * (255 - vb) / 255) as u8;
+            if out > 0 {
+                any = true;
+            }
+            alpha[(py * w + px) as usize] = out;
+        }
+    }
+    if !any {
+        return None;
+    }
+    Some(SelectionMask {
+        x: x0,
+        y: y0,
+        width: w,
+        height: h,
+        alpha,
+    })
+}
+
+/// Symmetric difference of two soft masks. Returns `None` if the result is empty.
+pub fn xor_masks(a: &SelectionMask, b: &SelectionMask) -> Option<SelectionMask> {
+    let x0 = a.x.min(b.x).floor();
+    let y0 = a.y.min(b.y).floor();
+    let x1 = (a.x + a.width as f32).max(b.x + b.width as f32).ceil();
+    let y1 = (a.y + a.height as f32).max(b.y + b.height as f32).ceil();
+    let w = ((x1 - x0) as u32).max(1);
+    let h = ((y1 - y0) as u32).max(1);
+    let mut alpha = vec![0u8; (w * h) as usize];
+    let mut any = false;
+    for py in 0..h {
+        for px in 0..w {
+            let dx = x0 + px as f32 + 0.5;
+            let dy = y0 + py as f32 + 0.5;
+            let va = a.sample(dx, dy) as u32;
+            let vb = b.sample(dx, dy) as u32;
+            let out = ((va * (255 - vb) + vb * (255 - va)) / 255) as u8;
             if out > 0 {
                 any = true;
             }
@@ -394,6 +563,7 @@ impl Default for Selection {
             floating: None,
             floating_layer: None,
             lasso_points: Vec::new(),
+            outline_dabs: 0,
             floating_overlay_only: false,
         }
     }
@@ -408,6 +578,7 @@ impl Selection {
         self.floating_layer = None;
         self.floating_overlay_only = false;
         self.lasso_points.clear();
+        self.outline_dabs = 0;
     }
 
     pub fn clear_floating(&mut self) {
@@ -421,8 +592,9 @@ impl Selection {
             return;
         }
         self.rect = Some(rect);
-        self.mask = Some(SelectionMask::from_rect(rect));
-        self.outline.clear();
+        let mask = SelectionMask::from_rect(rect);
+        self.outline = outline_from_mask(&mask);
+        self.mask = Some(mask);
         self.floating = None;
         self.lasso_points.clear();
     }
@@ -486,20 +658,18 @@ impl Selection {
     }
 
     pub fn set_mask(&mut self, rect: SelectionRect, mask: SelectionMask) {
-        // Solid filled AABB → no polyline (pixel contours look broken / leave dirt).
-        // Irregular / soft masks keep a contour for marching ants.
-        if mask_is_solid_filled(&mask) {
-            self.outline.clear();
-        } else {
-            self.outline = outline_from_mask(&mask);
-        }
+        self.outline = outline_from_mask(&mask);
         self.rect = Some(rect);
         self.mask = Some(mask);
         self.floating = None;
         self.lasso_points.clear();
     }
 
-    /// Apply `incoming` with Replace / Add / Subtract against the current mask.
+    pub fn is_active(&self) -> bool {
+        self.mask.is_some() || self.rect.is_some()
+    }
+
+    /// Apply `incoming` with Replace / Add / Subtract / Invert against the current mask.
     pub fn apply_combine(&mut self, op: SelectionCombine, incoming: SelectionMask) {
         if incoming.is_empty() {
             return;
@@ -527,6 +697,19 @@ impl Selection {
                     } else {
                         self.clear();
                     }
+                }
+            }
+            SelectionCombine::Invert => {
+                if let Some(cur) = self.mask.clone() {
+                    if let Some(merged) = xor_masks(&cur, &incoming) {
+                        let rect = merged.rect();
+                        self.set_mask(rect, merged);
+                    } else {
+                        self.clear();
+                    }
+                } else {
+                    let rect = incoming.rect();
+                    self.set_mask(rect, incoming);
                 }
             }
         }
@@ -562,6 +745,19 @@ impl Selection {
                     } else {
                         self.clear();
                     }
+                }
+            }
+            SelectionCombine::Invert => {
+                if let Some(base) = base {
+                    if let Some(merged) = xor_masks(base, &incoming) {
+                        let rect = merged.rect();
+                        self.set_mask(rect, merged);
+                    } else {
+                        self.clear();
+                    }
+                } else {
+                    let rect = incoming.rect();
+                    self.set_mask(rect, incoming);
                 }
             }
         }
@@ -629,7 +825,7 @@ impl Selection {
             height: mh,
             alpha,
         });
-        self.outline = pts.clone();
+        self.outline = outline_from_mask(self.mask.as_ref().unwrap());
         self.floating = None;
         self.lasso_points.clear();
     }
@@ -792,20 +988,20 @@ impl Selection {
             }
         }
         self.sync_rect_from_mask();
-        // Defer contour rebuild to stroke end — `outline_from_mask` is O(perimeter)
-        // and was called per dab, freezing selection brush on large masks.
-        self.outline.clear();
         self.lasso_points.clear();
+        // Keep the last contour while painting. Clearing it made the overlay fall
+        // back to the AABB (looks like a square until mouse-up). Rebuild every
+        // few dabs so ants follow the mask without a per-dab freeze.
+        self.outline_dabs = self.outline_dabs.wrapping_add(1);
+        if self.outline.is_empty() || self.outline_dabs % 6 == 0 {
+            self.refresh_outline();
+        }
     }
 
     /// Rebuild marching-ants polyline after a selection-brush stroke.
     pub fn refresh_outline(&mut self) {
         if let Some(m) = &self.mask {
-            if mask_is_solid_filled(m) {
-                self.outline.clear();
-            } else {
-                self.outline = outline_from_mask(m);
-            }
+            self.outline = outline_from_mask(m);
         } else {
             self.outline.clear();
         }
@@ -886,6 +1082,14 @@ impl Selection {
             f.trim_transparent_borders();
         }
         self.floating_layer = Some(layer_idx);
+        // Selection shape follows opaque pixels (ants must not keep transparent padding).
+        if self
+            .floating
+            .as_ref()
+            .is_some_and(|f| !f.is_visually_empty())
+        {
+            self.resync_mask_from_floating();
+        }
     }
 
     pub fn move_floating(&mut self, dx: f32, dy: f32) {
@@ -901,6 +1105,13 @@ impl Selection {
             if let Some(m) = &mut self.mask {
                 m.x += dx;
                 m.y += dy;
+            }
+            // Keep marching-ants rings glued to the float.
+            for ring in &mut self.outline {
+                for p in ring.iter_mut() {
+                    p.0 += dx;
+                    p.1 += dy;
+                }
             }
         }
     }
@@ -1112,7 +1323,7 @@ impl Selection {
     /// Snapshot selection shape from floating before commit (mask + outline + rect).
     pub fn take_shape_from_floating(
         &mut self,
-    ) -> Option<(SelectionRect, SelectionMask, Vec<(f32, f32)>)> {
+    ) -> Option<(SelectionRect, SelectionMask, SelectionOutline)> {
         let f = self.floating.as_ref()?;
         let stale = self.mask.as_ref().map_or(true, |m| {
             m.width != f.width
@@ -1120,7 +1331,7 @@ impl Selection {
                 || (m.x - f.x).abs() > 0.01
                 || (m.y - f.y).abs() > 0.01
         });
-        if stale || self.outline.len() < 3 {
+        if stale || !outline_is_ready(&self.outline) {
             self.resync_mask_from_floating();
         } else {
             self.rect = Some(SelectionRect {
@@ -1165,6 +1376,9 @@ impl Selection {
 fn point_in_poly(x: f32, y: f32, pts: &[(f32, f32)]) -> bool {
     let mut inside = false;
     let n = pts.len();
+    if n < 3 {
+        return false;
+    }
     let mut j = n - 1;
     for i in 0..n {
         let (xi, yi) = pts[i];
@@ -1177,12 +1391,9 @@ fn point_in_poly(x: f32, y: f32, pts: &[(f32, f32)]) -> bool {
     inside
 }
 
-fn mask_is_solid_filled(mask: &SelectionMask) -> bool {
-    !mask.alpha.is_empty() && mask.alpha.iter().all(|&a| a == 255)
-}
-
-/// Exterior contour of a binary-ish mask, in document space (pixel centers).
-pub fn outline_from_mask(mask: &SelectionMask) -> Vec<(f32, f32)> {
+/// Exterior + hole contours of a thresholded mask, as closed vector rings
+/// along pixel *edges* (not pixel centers). Multiple components → multiple rings.
+pub fn outline_from_mask(mask: &SelectionMask) -> SelectionOutline {
     const THRESH: u8 = 128;
     let w = mask.width as i32;
     let h = mask.height as i32;
@@ -1196,72 +1407,180 @@ pub fn outline_from_mask(mask: &SelectionMask) -> Vec<(f32, f32)> {
         mask.alpha[(y as u32 * mask.width + x as u32) as usize] >= THRESH
     };
 
-    let mut start = None;
-    'find: for y in 0..h {
+    // Directed unit-grid edges: interior of the selection stays on the right
+    // (clockwise outer rings, counter-clockwise holes).
+    let mut outgoing: HashMap<(i32, i32), Vec<(i32, i32)>> = HashMap::new();
+    let mut push = |a: (i32, i32), b: (i32, i32)| {
+        if a != b {
+            outgoing.entry(a).or_default().push(b);
+        }
+    };
+    for y in 0..h {
         for x in 0..w {
-            if inside(x, y) && !inside(x, y - 1) {
-                start = Some((x, y));
-                break 'find;
+            if !inside(x, y) {
+                continue;
+            }
+            if !inside(x, y - 1) {
+                push((x, y), (x + 1, y));
+            }
+            if !inside(x + 1, y) {
+                push((x + 1, y), (x + 1, y + 1));
+            }
+            if !inside(x, y + 1) {
+                push((x + 1, y + 1), (x, y + 1));
+            }
+            if !inside(x - 1, y) {
+                push((x, y + 1), (x, y));
             }
         }
     }
-    let Some((sx, sy)) = start else {
-        return Vec::new();
-    };
 
-    // Clockwise from North.
-    const DIRS: [(i32, i32); 8] = [
-        (0, -1),
-        (1, -1),
-        (1, 0),
-        (1, 1),
-        (0, 1),
-        (-1, 1),
-        (-1, 0),
-        (-1, -1),
-    ];
-
-    let mut outline = Vec::with_capacity((w + h) as usize * 2);
-    let mut cx = sx;
-    let mut cy = sy;
-    // Arrived moving south into the start pixel from the empty cell above.
-    let mut back_dir = 0usize;
-    let max_steps = ((w * h) as usize).saturating_mul(2).max(8);
-    for _ in 0..max_steps {
-        outline.push((mask.x + cx as f32 + 0.5, mask.y + cy as f32 + 0.5));
-        let mut found = None;
-        for k in 0..8 {
-            let dir = (back_dir + 6 + k) % 8;
-            let nx = cx + DIRS[dir].0;
-            let ny = cy + DIRS[dir].1;
-            if inside(nx, ny) {
-                found = Some((nx, ny, dir));
+    let mut rings: SelectionOutline = Vec::new();
+    let max_verts = ((w + 1) * (h + 1) * 2).max(8) as usize;
+    while let Some((&start, _)) = outgoing.iter().find(|(_, v)| !v.is_empty()) {
+        let mut ring_i: Vec<(i32, i32)> = Vec::new();
+        let mut cur = start;
+        // Arrival direction into `start` is unknown — seed with first hop.
+        let mut prev = start;
+        for step in 0..max_verts {
+            ring_i.push(cur);
+            let Some(nexts) = outgoing.get_mut(&cur) else {
+                break;
+            };
+            if nexts.is_empty() {
+                outgoing.remove(&cur);
                 break;
             }
+            // Prefer sharpest left turn so XOR / hole junctions stay one ring.
+            let next = if nexts.len() == 1 || step == 0 {
+                nexts.pop().unwrap()
+            } else {
+                let inx = cur.0 - prev.0;
+                let iny = cur.1 - prev.1;
+                let mut best_i = 0usize;
+                let mut best_score = i32::MIN;
+                for (i, &(nx, ny)) in nexts.iter().enumerate() {
+                    let ox = nx - cur.0;
+                    let oy = ny - cur.1;
+                    // Cross product: left turn scores higher.
+                    let cross = inx * oy - iny * ox;
+                    let dot = inx * ox + iny * oy;
+                    let score = cross.saturating_mul(4) - dot;
+                    if score > best_score {
+                        best_score = score;
+                        best_i = i;
+                    }
+                }
+                nexts.swap_remove(best_i)
+            };
+            if nexts.is_empty() {
+                outgoing.remove(&cur);
+            }
+            if next == start {
+                break;
+            }
+            prev = cur;
+            cur = next;
         }
-        let Some((nx, ny, dir)) = found else {
-            break;
-        };
-        back_dir = (dir + 4) % 8;
-        cx = nx;
-        cy = ny;
-        if cx == sx && cy == sy && outline.len() > 1 {
-            break;
+        collapse_collinear(&mut ring_i);
+        if ring_i.len() >= 3 {
+            rings.push(
+                ring_i
+                    .into_iter()
+                    .map(|(px, py)| (mask.x + px as f32, mask.y + py as f32))
+                    .collect(),
+            );
+        }
+    }
+    rings
+}
+
+fn collapse_collinear(ring: &mut Vec<(i32, i32)>) {
+    let n = ring.len();
+    if n < 3 {
+        return;
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let (px, py) = ring[(i + n - 1) % n];
+        let (cx, cy) = ring[i];
+        let (nx, ny) = ring[(i + 1) % n];
+        let dx1 = cx - px;
+        let dy1 = cy - py;
+        let dx2 = nx - cx;
+        let dy2 = ny - cy;
+        if dx1 * dy2 - dy1 * dx2 != 0 {
+            out.push((cx, cy));
+        }
+    }
+    if out.len() >= 3 {
+        *ring = out;
+    }
+}
+
+#[cfg(test)]
+mod outline_tests {
+    use super::*;
+
+    fn solid(x: f32, y: f32, w: u32, h: u32) -> SelectionMask {
+        SelectionMask {
+            x,
+            y,
+            width: w,
+            height: h,
+            alpha: vec![255; (w * h) as usize],
         }
     }
 
-    const MAX_PTS: usize = 1600;
-    if outline.len() <= MAX_PTS {
-        return outline;
+    #[test]
+    fn rect_is_four_corners() {
+        let rings = outline_from_mask(&solid(10.0, 20.0, 5, 3));
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].len(), 4);
+        let mut pts = rings[0].clone();
+        pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.partial_cmp(&b.1).unwrap()));
+        assert!(pts.contains(&(10.0, 20.0)));
+        assert!(pts.contains(&(15.0, 20.0)));
+        assert!(pts.contains(&(10.0, 23.0)));
+        assert!(pts.contains(&(15.0, 23.0)));
     }
-    let step = outline.len().div_ceil(MAX_PTS).max(1);
-    let mut slim: Vec<(f32, f32)> = outline.into_iter().step_by(step).collect();
-    if let Some(&first) = slim.first() {
-        if slim.last() != Some(&first) {
-            slim.push(first);
-        }
+
+    #[test]
+    fn disjoint_rects_two_rings() {
+        let a = solid(0.0, 0.0, 2, 2);
+        let b = solid(4.0, 0.0, 2, 2);
+        let u = union_masks(&a, &b);
+        let rings = outline_from_mask(&u);
+        assert_eq!(rings.len(), 2);
+        assert!(rings.iter().all(|r| r.len() == 4));
     }
-    slim
+
+    #[test]
+    fn overlapping_union_one_ring() {
+        let a = solid(0.0, 0.0, 4, 2);
+        let b = solid(2.0, 0.0, 4, 2);
+        let u = union_masks(&a, &b);
+        let rings = outline_from_mask(&u);
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].len(), 4);
+        let mut pts = rings[0].clone();
+        pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.partial_cmp(&b.1).unwrap()));
+        assert!(pts.contains(&(0.0, 0.0)));
+        assert!(pts.contains(&(6.0, 0.0)));
+        assert!(pts.contains(&(0.0, 2.0)));
+        assert!(pts.contains(&(6.0, 2.0)));
+    }
+
+    #[test]
+    fn hole_has_inner_ring() {
+        let mut m = solid(0.0, 0.0, 5, 5);
+        m.alpha[(2 * 5 + 2) as usize] = 0;
+        let rings = outline_from_mask(&m);
+        assert_eq!(rings.len(), 2);
+        let lens: Vec<usize> = rings.iter().map(|r| r.len()).collect();
+        assert!(lens.contains(&4));
+        assert!(lens.iter().any(|&n| n == 4));
+    }
 }
 
 #[cfg(test)]
@@ -1309,6 +1628,41 @@ mod float_trim_tests {
         assert_eq!(f.height, 4);
         assert_eq!(f.x, 100.0 + 7.0);
         assert_eq!(f.y, 200.0 + 8.0);
+    }
+
+    #[test]
+    fn layer_alpha_mask_trims_empty_pixels() {
+        let mut layer = crate::Layer::new("paint", 48, 48);
+        let mut px = vec![0u8; 48 * 48 * 4];
+        for y in 10..14 {
+            for x in 20..26 {
+                let i = (y * 48 + x) * 4;
+                px[i] = 40;
+                px[i + 1] = 50;
+                px[i + 2] = 60;
+                px[i + 3] = 200;
+            }
+        }
+        layer.set_pixels_dense(px);
+        let mask = super::SelectionMask::from_layer_pixels(&layer).expect("opaque island");
+        assert_eq!(mask.width, 6);
+        assert_eq!(mask.height, 4);
+        assert_eq!(mask.x, 20.0);
+        assert_eq!(mask.y, 10.0);
+        assert!(mask.alpha.iter().all(|&a| a == 255));
+    }
+
+    #[test]
+    fn faint_pixels_are_fully_selected() {
+        let mut layer = crate::Layer::new("paint", 32, 32);
+        let mut px = vec![0u8; 32 * 32 * 4];
+        let i = (8 * 32 + 8) * 4;
+        px[i + 3] = 40;
+        layer.set_pixels_dense(px);
+        let mask = super::SelectionMask::from_layer_pixels(&layer).expect("faint");
+        assert_eq!(mask.width, 1);
+        assert_eq!(mask.height, 1);
+        assert_eq!(mask.alpha[0], 255);
     }
 }
 

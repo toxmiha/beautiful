@@ -2,6 +2,9 @@
 //!
 //! Progress is **work-unit based**, not a timer: the bar only advances when a boot
 //! step finishes. Weights reflect relative cost (GPU pipelines dominate).
+//!
+//! Splash ends right after Warmup — do not keep a second full-screen “preparing”
+//! phase over the gallery/editor (that felt like a fake canvas loading screen).
 
 use eframe::egui;
 

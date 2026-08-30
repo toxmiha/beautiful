@@ -16,3 +16,12 @@ Thumbs.db
 .env.*
 *.pem
 tools/beautiful-mcp/
+.cache/
+/_*.txt
+/_*.py
+/_*.rs
+
+# Official Windows embeddable CPython (downloaded by tools/ensure-python-embed.ps1)
+/vendor/python-windows/
+# Portable Linux CPython + libpython3.12.so (tools/ensure-python-linux.sh)
+/vendor/python-linux/

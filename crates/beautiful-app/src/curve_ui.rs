@@ -12,6 +12,17 @@ pub struct CurveEditorOpts {
     /// Live mapped output 0..1 (dot on curve). None = hide.
     pub live_mapped: Option<f32>,
     pub size: f32,
+    pub curve_color: egui::Color32,
+}
+
+impl CurveEditorOpts {
+    fn stroke_color(self) -> egui::Color32 {
+        if self.curve_color.a() == 0 {
+            egui::Color32::from_rgb(230, 230, 235)
+        } else {
+            self.curve_color
+        }
+    }
 }
 
 /// Draw an interactive transfer curve. Returns true if the curve changed.
@@ -21,7 +32,11 @@ pub fn transfer_curve_editor(
     opts: CurveEditorOpts,
 ) -> bool {
     let mut changed = false;
-    let size = opts.size.clamp(180.0, 360.0);
+    let size = if opts.size > 1.0 {
+        opts.size.clamp(140.0, 360.0)
+    } else {
+        240.0
+    };
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click_and_drag());
     let painter = ui.painter_at(rect);
@@ -29,7 +44,7 @@ pub fn transfer_curve_editor(
     let bg = egui::Color32::from_rgb(22, 22, 28);
     let grid = egui::Color32::from_rgb(48, 48, 56);
     let ghost = egui::Color32::from_rgba_unmultiplied(180, 80, 80, 90);
-    let curve_col = egui::Color32::from_rgb(230, 230, 235);
+    let curve_col = opts.stroke_color();
     let handle = theme::accent();
     let handle_fill = egui::Color32::from_rgb(40, 40, 48);
     let live_col = egui::Color32::from_rgb(90, 170, 255);
@@ -228,6 +243,7 @@ pub fn pressure_curve_panel(
             live_raw,
             live_mapped,
             size: 240.0,
+            ..Default::default()
         },
     );
     if edited {

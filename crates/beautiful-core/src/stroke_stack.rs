@@ -9,8 +9,9 @@
 
 use crate::composite::{composite_region_packed_into, DirtyRect};
 use crate::layer::{
-    ancestor_folder_mask_cov, ancestor_folder_opacity, blend_over, blend_over_normal,
-    effective_blend_mode, BlendMode, Layer,
+    ancestor_folder_mask_cov_span, ancestor_folder_opacity, ancestor_has_folder_mask, blend_over,
+    blend_over_normal, clip_base_alpha, effective_blend_mode, layer_effectively_visible, BlendMode,
+    Layer,
 };
 use crate::tiles::{TileBuffer, TILE_SIZE};
 use crate::Rgba;
@@ -24,6 +25,8 @@ pub struct StrokeStack {
     pub above: Vec<u8>,
     /// Reused row scratch for layer spans (avoids per-dab alloc).
     scratch: Vec<u8>,
+    /// Reused mask coverage row (own + folder).
+    mask_scratch: Vec<u8>,
     /// Reused tile-key list for [`Self::blend_layer_rect`] (avoids per-call Vec).
     tile_keys: Vec<(i32, i32)>,
     pub origin_x: u32,
@@ -48,6 +51,54 @@ impl StrokeStack {
         self.above_live_from = 0;
     }
 
+    /// True when `above` is the full Normal stack above `active` (safe to share
+    /// with BelowCache leaf tiles). Partial prefix plates must not be treated
+    /// as a complete above blit.
+    pub fn above_fully_baked(&self, n_layers: usize) -> bool {
+        self.valid && self.above_usable && self.above_live_from >= n_layers
+    }
+
+    /// Install a packed below/above ROI without compositing (shared plate store).
+    pub fn install_from_plates(
+        &mut self,
+        below: Vec<u8>,
+        above: Vec<u8>,
+        origin_x: u32,
+        origin_y: u32,
+        roi_w: u32,
+        roi_h: u32,
+        doc_w: u32,
+        doc_h: u32,
+        active: usize,
+        above_usable: bool,
+        n_layers: usize,
+    ) -> bool {
+        let len = (roi_w as usize)
+            .saturating_mul(roi_h as usize)
+            .saturating_mul(4);
+        if roi_w == 0 || roi_h == 0 || below.len() != len {
+            self.invalidate();
+            return false;
+        }
+        self.below = below;
+        self.above = above;
+        self.origin_x = origin_x;
+        self.origin_y = origin_y;
+        self.roi_w = roi_w;
+        self.roi_h = roi_h;
+        self.doc_w = doc_w;
+        self.doc_h = doc_h;
+        self.active = active;
+        self.valid = true;
+        self.above_usable = above_usable;
+        self.above_live_from = if above_usable {
+            n_layers
+        } else {
+            active.saturating_add(1)
+        };
+        true
+    }
+
     /// Drop packed caches (call on stroke end to reclaim RAM).
     pub fn release(&mut self) {
         self.valid = false;
@@ -59,6 +110,8 @@ impl StrokeStack {
         self.above.shrink_to_fit();
         self.scratch.clear();
         self.scratch.shrink_to_fit();
+        self.mask_scratch.clear();
+        self.mask_scratch.shrink_to_fit();
         self.tile_keys.clear();
         self.tile_keys.shrink_to_fit();
         self.origin_x = 0;
@@ -182,6 +235,9 @@ impl StrokeStack {
         self.valid = true;
     }
 
+    /// Viewport pad shared with BelowCache warm so first stroke does not rebake.
+    pub const VIEW_PAD: u32 = 1024;
+
     /// Pin / expand below-cache to cover a viewport (call at stroke begin).
     pub fn ensure_view(
         &mut self,
@@ -192,8 +248,21 @@ impl StrokeStack {
         active: usize,
         view: DirtyRect,
     ) {
-        let view = view.padded(1024, doc_w, doc_h);
+        let view = view.padded(Self::VIEW_PAD, doc_w, doc_h);
         self.ensure_covers(doc_w, doc_h, background, layers, active, view);
+    }
+
+    pub fn covers_view(&self, view: DirtyRect) -> bool {
+        if !self.valid || self.roi_w == 0 || self.roi_h == 0 {
+            return false;
+        }
+        let covered = DirtyRect {
+            x0: self.origin_x,
+            y0: self.origin_y,
+            x1: self.origin_x.saturating_add(self.roi_w),
+            y1: self.origin_y.saturating_add(self.roi_h),
+        };
+        covered.contains_rect(view)
     }
 
     pub fn refresh_display(
@@ -322,7 +391,7 @@ impl StrokeStack {
         };
 
         for (li, layer) in layers.iter().enumerate().take(first_live_end).skip(active) {
-            if !layer_contributes(layer, li, contrib_rect) {
+            if !layer_contributes(layers, layer, li, contrib_rect) {
                 continue;
             }
             self.blend_layer_rect(out, w, ox, oy, x0, x1, y0, y1, layers, li, layer);
@@ -334,7 +403,7 @@ impl StrokeStack {
 
         if sandwich && live_from < layers.len() {
             for (li, layer) in layers.iter().enumerate().skip(live_from) {
-                if !layer_contributes(layer, li, contrib_rect) {
+                if !layer_contributes(layers, layer, li, contrib_rect) {
                     continue;
                 }
                 self.blend_layer_rect(out, w, ox, oy, x0, x1, y0, y1, layers, li, layer);
@@ -380,7 +449,7 @@ impl StrokeStack {
             (layer.opacity.clamp(0.0, 1.0) * ancestor_folder_opacity(layers, li)).clamp(0.0, 1.0);
         let mode = effective_blend_mode(layers, li);
         let clip = layer.clip_to_below && li > 0;
-        let has_mask = layer.mask.is_some();
+        let has_mask = layer.mask_modulates();
         let folder_mask = ancestor_has_folder_mask(layers, li);
         let stride = w * 4;
         let ts = TILE_SIZE as i32;
@@ -398,6 +467,7 @@ impl StrokeStack {
         // Hot paint path: Normal, no clip/mask/folder-mask — fewer branches per pixel.
         let simple_normal =
             mode == BlendMode::Normal && !clip && !has_mask && !folder_mask && opacity > 0.0;
+        let need_mask_rows = has_mask || folder_mask;
 
         for &(tx, ty) in &self.tile_keys {
             let (tox, toy) = TileBuffer::tile_origin(tx, ty);
@@ -419,6 +489,7 @@ impl StrokeStack {
                     tx1 as u32,
                     &mut self.scratch[..need],
                 );
+                let span_n = tx1 - tx0;
                 let row = (y - oy) * stride;
                 if simple_normal {
                     for x in tx0..tx1 {
@@ -438,32 +509,50 @@ impl StrokeStack {
                             sa,
                         );
                     }
-                } else {
-                    for x in tx0..tx1 {
-                        let si = (x - tx0) * 4;
-                        let mut sa = self.scratch[si + 3] as f32 / 255.0 * opacity;
-                        if clip {
-                            if let Some(j) = (0..li).rev().find(|&j| !layers[j].is_folder) {
-                                sa *= layers[j].effective_alpha(x as i32, y as i32);
-                            }
-                        }
-                        if has_mask {
-                            sa *= layer.mask_sample(x, y) as f32 / 255.0;
-                        }
-                        if folder_mask {
-                            sa *= ancestor_folder_mask_cov(layers, li, x, y);
-                        }
-                        if sa <= 0.001 {
-                            continue;
-                        }
-                        let pi = row + (x - ox) * 4;
-                        blend_pixel_mode(
-                            &mut out[pi..pi + 4],
-                            &self.scratch[si..si + 4],
-                            sa,
-                            mode,
-                        );
+                    continue;
+                }
+                if need_mask_rows && self.mask_scratch.len() < span_n * 2 {
+                    self.mask_scratch.resize(span_n * 2, 255);
+                }
+                let (own_m, folder_m) = if need_mask_rows {
+                    let (own_m, folder_m) = self.mask_scratch.split_at_mut(span_n);
+                    if has_mask {
+                        layer.copy_mask_span(y as u32, tx0 as u32, tx1 as u32, own_m);
+                    } else {
+                        own_m.fill(255);
                     }
+                    if folder_mask {
+                        ancestor_folder_mask_cov_span(layers, li, y, tx0, tx1, folder_m);
+                    } else {
+                        folder_m.fill(255);
+                    }
+                    (own_m as &[u8], folder_m as &[u8])
+                } else {
+                    (&[][..], &[][..])
+                };
+                for x in tx0..tx1 {
+                    let si = (x - tx0) * 4;
+                    let mi = x - tx0;
+                    let mut sa = self.scratch[si + 3] as f32 / 255.0 * opacity;
+                    if clip {
+                        sa *= clip_base_alpha(layers, li, x as i32, y as i32);
+                    }
+                    if has_mask {
+                        sa *= own_m[mi] as f32 / 255.0;
+                    }
+                    if folder_mask {
+                        sa *= folder_m[mi] as f32 / 255.0;
+                    }
+                    if sa <= 0.001 {
+                        continue;
+                    }
+                    let pi = row + (x - ox) * 4;
+                    blend_pixel_mode(
+                        &mut out[pi..pi + 4],
+                        &self.scratch[si..si + 4],
+                        sa,
+                        mode,
+                    );
                 }
             }
         }
@@ -716,7 +805,7 @@ fn above_sandwich_plan(layers: &[Layer], active: usize) -> AbovePlan {
     let active = active.min(layers.len().saturating_sub(1));
     let mut live_from = layers.len();
     for (li, layer) in layers.iter().enumerate().skip(active.saturating_add(1)) {
-        if !layer.visible || layer.is_folder {
+        if !layer_effectively_visible(layers, li) || layer.is_folder {
             continue;
         }
         if (layer.opacity.clamp(0.0, 1.0) * ancestor_folder_opacity(layers, li)).clamp(0.0, 1.0)
@@ -746,8 +835,8 @@ fn above_cache_ok(layers: &[Layer], active: usize) -> bool {
 }
 
 #[inline]
-fn layer_contributes(layer: &Layer, li: usize, rect: DirtyRect) -> bool {
-    if !layer.visible || layer.is_folder {
+fn layer_contributes(layers: &[Layer], layer: &Layer, li: usize, rect: DirtyRect) -> bool {
+    if !layer_effectively_visible(layers, li) || layer.is_folder {
         return false;
     }
     let opacity = layer.opacity.clamp(0.0, 1.0);
@@ -762,30 +851,6 @@ fn layer_contributes(layer: &Layer, li: usize, rect: DirtyRect) -> bool {
         Some(bounds) => bounds.intersects(rect),
         None => false, // empty tiles — skip
     }
-}
-
-#[inline]
-fn ancestor_has_folder_mask(layers: &[Layer], li: usize) -> bool {
-    let Some(layer) = layers.get(li) else {
-        return false;
-    };
-    let mut parent = layer.parent_id();
-    for _ in 0..layers.len() {
-        let Some(parent_id) = parent else {
-            return false;
-        };
-        let Some(folder) = layers
-            .iter()
-            .find(|c| c.is_folder && c.group_id == Some(parent_id))
-        else {
-            return false;
-        };
-        if folder.mask_enabled {
-            return true;
-        }
-        parent = folder.parent_folder;
-    }
-    false
 }
 
 #[inline]

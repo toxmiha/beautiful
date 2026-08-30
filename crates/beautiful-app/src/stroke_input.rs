@@ -65,6 +65,11 @@ pub struct MotionCalibrator {
     scale: Option<Vec2>,
     /// Float tip in screen space while stroking (sub-pixel between OS snaps).
     float_screen: Option<Pos2>,
+    /// Last applied screen-space step (from `MouseMoved` deltas, or equivalent).
+    /// Used to avoid snapping *backward* to a newer absolute pointer lattice point.
+    last_step: Option<Vec2>,
+    /// Relative raw motion has driven this stroke at least once.
+    saw_relative_this_stroke: bool,
 }
 
 impl MotionCalibrator {
@@ -72,12 +77,40 @@ impl MotionCalibrator {
         self.anchor = None;
         self.raw_since = Vec2::ZERO;
         self.float_screen = None;
+        self.last_step = None;
+        self.saw_relative_this_stroke = false;
         // Keep `scale` — device units are stable across strokes.
     }
 
     fn on_absolute(&mut self, p: Pos2) {
+        self.on_absolute_ex(p, true);
+    }
+
+    /// `snap_float`: down/click and absolute-only mice must lock the tip to OS
+    /// pointer. Mid-stroke with relative `MouseMoved` must **not** — WM_MOUSEMOVE
+    /// is integer lattice and often lags raw deltas, so a hard snap walks the
+    /// polyline backward (dark overlap spots) then jumps (visible stairs).
+    ///
+    /// For absolute snaps we also do "forward-only": if the new absolute target
+    /// would require moving the float tip backward along the last motion step,
+    /// we keep the current float tip to avoid overlap clusters.
+    fn on_absolute_ex(&mut self, p: Pos2, snap_float: bool) {
         if let Some(anchor) = self.anchor {
             let d = p - anchor;
+            // Even for absolute-only input (common for stylus), we want a motion
+            // direction so snap-back prevention can work.
+            if d.length_sq() > 0.25 {
+                // Keep last_step as the real travel direction. A late lattice
+                // PointerMoved that sits *behind* the float tip must not flip
+                // last_step — that made "forward-only" snap actually go backward.
+                let keep = match self.last_step {
+                    Some(step) if step.length_sq() > 1e-8 => step.dot(d) >= 0.0,
+                    _ => true,
+                };
+                if keep {
+                    self.last_step = Some(d);
+                }
+            }
             let r = self.raw_since;
             if d.length_sq() > 0.25 && r.length_sq() > 1e-6 {
                 let sx = if r.x.abs() > 1e-4 {
@@ -97,10 +130,32 @@ impl MotionCalibrator {
         }
         self.anchor = Some(p);
         self.raw_since = Vec2::ZERO;
-        // Hard-snap float tip to absolute pointer. Soft blend (0.35→0.65) left the
-        // painted tip visibly behind the OS cursor — felt like early v1 lag.
-        // Sub-pixel continuity still comes from relative `MouseMoved` estimates.
-        self.float_screen = Some(p);
+        if snap_float {
+            if let (Some(tip), Some(step)) = (self.float_screen, self.last_step) {
+                let step_len_sq = step.length_sq();
+                if step_len_sq > 1e-10 {
+                    let dir = step / step_len_sq.sqrt();
+                    let to_target = p - tip;
+                    let proj = to_target.x * dir.x + to_target.y * dir.y;
+                    // If the absolute point is behind our current motion direction,
+                    // don't snap the float tip backward.
+                    if proj < -0.01 {
+                        return;
+                    }
+                }
+            }
+            self.float_screen = Some(p);
+            return;
+        }
+        match self.float_screen {
+            None => self.float_screen = Some(p),
+            Some(tip) => {
+                // Lost relative tracking (DPI glitch / dropped DeviceEvent).
+                if (p - tip).length_sq() > 36.0 {
+                    self.float_screen = Some(p);
+                }
+            }
+        }
     }
 
     fn estimate_after_raw(&mut self, delta: Vec2) -> Option<Pos2> {
@@ -110,7 +165,32 @@ impl MotionCalibrator {
         let tip = self.float_screen.or(self.anchor)?;
         let next = tip + d;
         self.float_screen = Some(next);
+        self.last_step = Some(d);
+        self.saw_relative_this_stroke = true;
         Some(next)
+    }
+
+    /// If the OS/stylus pointer is *ahead* of the float tip, snap the tip
+    /// forward so this frame's ink meets the hardware cursor.
+    /// Never walks backward (that was the overlap-spot polyline).
+    /// Returns `Some(p)` whenever `p` is safe to stamp, even if float was
+    /// already snapped there (lost-tracking threshold) without a sample.
+    pub(crate) fn catch_up_forward(&mut self, p: Pos2) -> Option<Pos2> {
+        let tip = self.float_screen.or(self.anchor)?;
+        let to = p - tip;
+        if to.length_sq() > 1e-6 {
+            if let Some(step) = self.last_step {
+                // Ignore tiny backward lattice corners. Large jumps are lost
+                // tracking — always snap forward or the stroke tears.
+                const LOST_PX: f32 = 64.0 * 64.0;
+                if step.length_sq() > 1e-8 && to.dot(step) < 0.0 && to.length_sq() < LOST_PX {
+                    return None;
+                }
+            }
+            self.float_screen = Some(p);
+            self.last_step = Some(to);
+        }
+        Some(p)
     }
 }
 
@@ -199,18 +279,24 @@ fn collect_from_events(
     stroke_active: bool,
     samples: &mut Vec<(f32, f32, f32)>,
 ) {
-    // Windows mouse often lacks relative `MouseMoved`. Always accept absolute
-    // pointer samples so brush works with a regular mouse (user testing).
-    let _has_relative = events.iter().any(|e| matches!(e, Event::MouseMoved(_)));
+    // Windows mouse sometimes lacks relative `MouseMoved`. Then absolute
+    // PointerMoved *is* the path. When both fire in one batch, lattice corners
+    // must not enter the polyline — they snap behind the float tip.
+    let has_relative = events.iter().any(|e| matches!(e, Event::MouseMoved(_)));
+    let paint_absolute = !stroke_active || (!has_relative && !motion.saw_relative_this_stroke);
+    let mut latest_abs: Option<Pos2> = None;
 
     for ev in events {
         match ev {
             Event::PointerMoved(p) => {
-                motion.on_absolute(*p);
-                if let Some((x, y)) =
-                    screen_to_doc(*p, canvas_rect, doc_w, doc_h, rotation_deg, flip_h, false)
-                {
-                    push_sample(samples, x, y, pressure);
+                latest_abs = Some(*p);
+                motion.on_absolute_ex(*p, paint_absolute);
+                if paint_absolute {
+                    if let Some((x, y)) =
+                        screen_to_doc(*p, canvas_rect, doc_w, doc_h, rotation_deg, flip_h, false)
+                    {
+                        push_sample(samples, x, y, pressure);
+                    }
                 }
             }
             Event::PointerButton {
@@ -230,6 +316,7 @@ fn collect_from_events(
                 }
             }
             Event::Touch { pos, phase, .. } if !matches!(phase, egui::TouchPhase::Cancel) => {
+                latest_abs = Some(*pos);
                 motion.on_absolute(*pos);
                 if !stroke_active || matches!(phase, egui::TouchPhase::Start) {
                     if let Some((x, y)) =
@@ -252,13 +339,26 @@ fn collect_from_events(
         }
     }
 
-    // End of batch mid-stroke: emit corrected float tip once (smooth, not lattice).
+    // Mid-stroke: relative MouseMoved densifies the interior. A *behind*
+    // PointerMoved must not enter the polyline (overlap spots). If the OS
+    // pointer is *ahead* of the float tip, catch up so ink meets the cursor
+    // this frame instead of trailing until the next relative burst.
     if stroke_active {
-        if let Some(est) = motion.float_screen {
-            if let Some((x, y)) =
-                screen_to_doc(est, canvas_rect, doc_w, doc_h, rotation_deg, flip_h, false)
-            {
-                push_sample(samples, x, y, pressure);
+        if let Some(p) = latest_abs {
+            if let Some(est) = motion.catch_up_forward(p) {
+                if let Some((x, y)) =
+                    screen_to_doc(est, canvas_rect, doc_w, doc_h, rotation_deg, flip_h, false)
+                {
+                    push_sample(samples, x, y, pressure);
+                }
+            }
+        } else if samples.is_empty() && !motion.saw_relative_this_stroke {
+            if let Some(est) = motion.float_screen {
+                if let Some((x, y)) =
+                    screen_to_doc(est, canvas_rect, doc_w, doc_h, rotation_deg, flip_h, false)
+                {
+                    push_sample(samples, x, y, pressure);
+                }
             }
         }
     }
@@ -353,6 +453,12 @@ impl TrajectoryBuilder {
         *self = Self::default();
     }
 
+    /// Drop tip without ending the stroke — used when the pointer leaves the
+    /// canvas mid-stroke so re-entry does not weld a straight chord.
+    pub fn clear_tip(&mut self) {
+        self.tip = None;
+    }
+
     pub fn tip(&self) -> Option<(f32, f32, f32)> {
         self.tip
     }
@@ -360,6 +466,22 @@ impl TrajectoryBuilder {
     pub fn flush(&mut self, _document: &mut Document, _smudge: bool) -> bool {
         false
     }
+}
+
+#[derive(Clone, Copy)]
+pub enum PaintMode {
+    Layer { kind: LayerStrokeKind },
+    Selection { erase: bool },
+    /// Sparse AlphaTileMap stamp (layer / adjustment mask).
+    Mask { erase: bool },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LayerStrokeKind {
+    Paint,
+    Smudge,
+    Blur,
+    Clone,
 }
 
 /// Paint all samples in one commit (batch path samples, then dab).
@@ -372,15 +494,12 @@ pub fn paint_samples(
     trajectory: &mut TrajectoryBuilder,
     smudge: bool,
 ) -> bool {
-    paint_samples_mode(document, samples, trajectory, PaintMode::Layer { smudge })
-}
-
-#[derive(Clone, Copy)]
-pub enum PaintMode {
-    Layer { smudge: bool },
-    Selection { erase: bool },
-    /// Sparse AlphaTileMap stamp (layer / adjustment mask).
-    Mask { erase: bool },
+    let kind = if smudge {
+        LayerStrokeKind::Smudge
+    } else {
+        LayerStrokeKind::Paint
+    };
+    paint_samples_mode(document, samples, trajectory, PaintMode::Layer { kind })
 }
 
 pub fn paint_samples_mode(
@@ -440,25 +559,35 @@ pub fn paint_samples_mode_ex(
     }
 
     let painted = match mode {
-        PaintMode::Layer { smudge } => {
+        PaintMode::Layer { kind } => {
             if chain.len() == 1 {
                 if trajectory.tip.is_some() {
                     false
                 } else {
                     let c = chain[0];
-                    if smudge {
-                        document.smudge_stamp(c.0, c.1, c.2);
-                    } else {
-                        document.paint_stamp(c.0, c.1, c.2);
+                    match kind {
+                        LayerStrokeKind::Smudge => {
+                            document.smudge_stamp(c.0, c.1, c.2);
+                            true
+                        }
+                        LayerStrokeKind::Blur => document.blur_polyline(&[(c.0, c.1, c.2)]),
+                        LayerStrokeKind::Clone => document.clone_brush_polyline(&[(c.0, c.1, c.2)], false),
+                        LayerStrokeKind::Paint => {
+                            document.paint_stamp(c.0, c.1, c.2);
+                            true
+                        }
                     }
-                    true
                 }
-            } else if smudge {
-                document.smudge_polyline(&chain);
-                true
             } else {
-                document.paint_polyline_ex(&chain, stroke_ending);
-                true
+                match kind {
+                    LayerStrokeKind::Smudge => document.smudge_polyline(&chain),
+                    LayerStrokeKind::Blur => document.blur_polyline(&chain),
+                    LayerStrokeKind::Clone => document.clone_brush_polyline(&chain, stroke_ending),
+                    LayerStrokeKind::Paint => {
+                        document.paint_polyline_ex(&chain, stroke_ending);
+                        true
+                    }
+                }
             }
         }
         PaintMode::Selection { erase } => {
@@ -597,6 +726,28 @@ mod tests {
     }
 
     #[test]
+    fn clear_tip_then_reenter_does_not_weld_polyline() {
+        let mut doc = Document::new(64, 64);
+        let mut traj = TrajectoryBuilder::default();
+        assert!(paint_samples(
+            &mut doc,
+            &[(8.0_f32, 8.0, 1.0), (16.0, 8.0, 1.0)],
+            &mut traj,
+            false
+        ));
+        assert!(traj.tip().is_some());
+        traj.clear_tip();
+        assert!(traj.tip().is_none());
+        // Far re-entry: with tip cleared this is a stamp, not a chord from (16,8).
+        assert!(paint_samples(&mut doc, &[(56.0, 56.0, 1.0)], &mut traj, false));
+        let tip = traj.tip().unwrap();
+        assert!((tip.0 - 56.0).abs() < 1e-3 && (tip.1 - 56.0).abs() < 1e-3);
+        // Midpoint of the would-be weld must stay empty (no straight line).
+        let mid = doc.layers[0].tiles.get_rgba(36, 32);
+        assert_eq!(mid[3], 0, "weld chord must not paint across off-canvas gap");
+    }
+
+    #[test]
     fn screen_to_doc_no_edge_weld_without_clamp() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 75.0));
         // Far outside → None (not clamped to 0).
@@ -645,5 +796,162 @@ mod tests {
         let b = m.estimate_after_raw(egui::vec2(0.5, 0.0)).unwrap();
         assert!(a.x > 10.0 && a.x < 11.0);
         assert!(b.x > a.x);
+    }
+
+    #[test]
+    fn mid_stroke_mixed_events_do_not_reverse() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let mut motion = MotionCalibrator::default();
+        motion.on_absolute(egui::pos2(10.0, 50.0));
+        let _ = motion.estimate_after_raw(egui::vec2(0.8, 0.0));
+        let events = [
+            Event::MouseMoved(egui::vec2(0.4, 0.0)),
+            Event::PointerMoved(egui::pos2(10.0, 50.0)),
+            Event::MouseMoved(egui::vec2(0.4, 0.0)),
+        ];
+        let mut samples = Vec::new();
+        collect_from_events(
+            &events,
+            rect,
+            100.0,
+            100.0,
+            0.0,
+            false,
+            1.0,
+            &mut motion,
+            true,
+            &mut samples,
+        );
+        assert!(!samples.is_empty());
+        for w in samples.windows(2) {
+            assert!(
+                w[1].0 + 1e-4 >= w[0].0,
+                "polyline reversed (spots/stairs): {samples:?}"
+            );
+        }
+        assert!(
+            samples.last().unwrap().0 > 10.5,
+            "lattice snap ate relative advance: {samples:?}"
+        );
+    }
+
+    #[test]
+    fn mid_stroke_absolute_only_still_paints() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let mut motion = MotionCalibrator::default();
+        let events = [
+            Event::PointerMoved(egui::pos2(10.0, 50.0)),
+            Event::PointerMoved(egui::pos2(20.0, 50.0)),
+        ];
+        let mut samples = Vec::new();
+        collect_from_events(
+            &events,
+            rect,
+            100.0,
+            100.0,
+            0.0,
+            false,
+            1.0,
+            &mut motion,
+            true,
+            &mut samples,
+        );
+        assert_eq!(samples.len(), 2);
+        assert!((samples[0].0 - 10.0).abs() < 0.01);
+        assert!((samples[1].0 - 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn absolute_snap_is_forward_only() {
+        let mut m = MotionCalibrator::default();
+        // Seed float tip.
+        m.on_absolute(egui::pos2(10.0, 10.0));
+        // Move it forward using relative delta so we have a motion direction.
+        let _ = m.estimate_after_raw(egui::vec2(1.0, 0.0)).unwrap();
+        let tip_before = m.float_screen.unwrap();
+        // Feed an absolute point "behind" the last motion direction.
+        // It must not walk the float tip backward.
+        m.on_absolute(egui::pos2(9.0, 10.0));
+        let tip_after = m.float_screen.unwrap();
+        assert!(
+            tip_after.x + 1e-4 >= tip_before.x,
+            "snap moved backward: before={tip_before:?} after={tip_after:?}"
+        );
+    }
+
+    #[test]
+    fn late_absolute_batch_does_not_reenter_relative_stroke() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let mut motion = MotionCalibrator::default();
+        motion.on_absolute(egui::pos2(10.0, 50.0));
+
+        let mut first = Vec::new();
+        collect_from_events(
+            &[Event::MouseMoved(egui::vec2(2.0, 0.0))],
+            rect,
+            100.0,
+            100.0,
+            0.0,
+            false,
+            1.0,
+            &mut motion,
+            true,
+            &mut first,
+        );
+        assert!(!first.is_empty());
+        assert!(motion.saw_relative_this_stroke);
+
+        let mut second = Vec::new();
+        collect_from_events(
+            &[Event::PointerMoved(egui::pos2(11.0, 50.0))],
+            rect,
+            100.0,
+            100.0,
+            0.0,
+            false,
+            1.0,
+            &mut motion,
+            true,
+            &mut second,
+        );
+        assert!(
+            second.is_empty(),
+            "late absolute batch re-entered painted path: {second:?}"
+        );
+    }
+
+    #[test]
+    fn forward_absolute_catches_up_lagging_relative() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(100.0, 100.0));
+        let mut motion = MotionCalibrator::default();
+        motion.on_absolute(egui::pos2(10.0, 50.0));
+        let events = [
+            Event::MouseMoved(egui::vec2(0.4, 0.0)),
+            Event::PointerMoved(egui::pos2(18.0, 50.0)),
+        ];
+        let mut samples = Vec::new();
+        collect_from_events(
+            &events,
+            rect,
+            100.0,
+            100.0,
+            0.0,
+            false,
+            1.0,
+            &mut motion,
+            true,
+            &mut samples,
+        );
+        assert!(!samples.is_empty(), "{samples:?}");
+        for w in samples.windows(2) {
+            assert!(
+                w[1].0 + 1e-4 >= w[0].0,
+                "catch-up reversed polyline: {samples:?}"
+            );
+        }
+        assert!(
+            samples.last().unwrap().0 > 17.0,
+            "ink did not catch the OS pointer: {samples:?}"
+        );
     }
 }

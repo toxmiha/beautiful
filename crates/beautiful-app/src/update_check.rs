@@ -147,7 +147,7 @@ fn fetch_latest_offer() -> Option<UpdateOffer> {
     })
 }
 
-/// Compare semver-ish tags (`v0.4.8` / `0.4.8`) against `CARGO_PKG_VERSION`.
+/// Compare semver-ish tags (`v0.4.9` / `0.4.9`) against `CARGO_PKG_VERSION`.
 pub fn version_is_newer(remote_tag: &str, local: &str) -> bool {
     let r = parse_ver(remote_tag);
     let l = parse_ver(local);
@@ -169,6 +169,7 @@ mod tests {
 
     #[test]
     fn newer_tag() {
+        assert!(version_is_newer("v0.4.9", "0.4.8"));
         assert!(version_is_newer("v0.4.8", "0.4.7"));
         assert!(!version_is_newer("v0.4.7", "0.4.7"));
         assert!(!version_is_newer("0.4.6", "0.4.7"));

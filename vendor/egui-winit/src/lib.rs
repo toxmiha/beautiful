@@ -576,16 +576,31 @@ impl State {
             }
 
             WindowEvent::PanGesture { delta, .. } => {
-                let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
+                // Windows: stylus hover / Direct Manipulation arrives as
+                // PanGesture. Mapping that to MouseWheel Point made the canvas
+                // follow the cursor with no button down. Ignore it here; pan is
+                // MMB, Space+LMB, or two-finger touch.
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = delta;
+                    EventResponse {
+                        repaint: false,
+                        consumed: false,
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
 
-                self.egui_input.events.push(egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Point,
-                    delta: Vec2::new(delta.x, delta.y) / pixels_per_point,
-                    modifiers: self.egui_input.modifiers,
-                });
-                EventResponse {
-                    repaint: true,
-                    consumed: self.egui_ctx.wants_pointer_input(),
+                    self.egui_input.events.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: Vec2::new(delta.x, delta.y) / pixels_per_point,
+                        modifiers: self.egui_input.modifiers,
+                    });
+                    EventResponse {
+                        repaint: true,
+                        consumed: self.egui_ctx.wants_pointer_input(),
+                    }
                 }
             }
         }
@@ -1485,7 +1500,10 @@ fn process_viewport_command(
         ViewportCommand::Title(title) => {
             window.set_title(&title);
         }
-        ViewportCommand::Transparent(v) => window.set_transparent(v),
+        ViewportCommand::Transparent(v) => {
+            window.set_transparent(v);
+            window.set_blur(v);
+        }
         ViewportCommand::Visible(v) => window.set_visible(v),
         ViewportCommand::OuterPosition(pos) => {
             window.set_outer_position(PhysicalPosition::new(
@@ -1693,6 +1711,7 @@ pub fn create_winit_window_attributes(
     let mut window_attributes = winit::window::WindowAttributes::default()
         .with_title(title.unwrap_or_else(|| "egui window".to_owned()))
         .with_transparent(transparent.unwrap_or(false))
+        .with_blur(transparent.unwrap_or(false))
         .with_decorations(decorations.unwrap_or(true))
         .with_resizable(resizable.unwrap_or(true))
         .with_visible(visible.unwrap_or(true))
@@ -1902,6 +1921,9 @@ pub fn apply_viewport_builder_to_window(
         }
         if let Some(maximized) = builder.maximized {
             window.set_maximized(maximized);
+        }
+        if builder.transparent.unwrap_or(false) {
+            window.set_blur(true);
         }
     }
 }

@@ -93,6 +93,11 @@ pub struct Viewport {
 
     /// `window` and `egui_winit` are initialized together.
     egui_winit: Option<egui_winit::State>,
+
+    /// Last physical size the wgpu surface was created/resized for.
+    /// Windows + DxgiFromVisual: ResizeBuffers is not enough; we recreate the
+    /// surface when this drifts from `window.inner_size()`.
+    last_wgpu_px: Option<(u32, u32)>,
 }
 
 // ----------------------------------------------------------------------------
@@ -294,6 +299,7 @@ impl<'app> WgpuWinitApp<'app> {
         let mut viewport_from_window = HashMap::default();
         viewport_from_window.insert(window.id(), ViewportId::ROOT);
 
+        let init_px = (window.inner_size().width, window.inner_size().height);
         let mut viewports = Viewports::default();
         viewports.insert(
             ViewportId::ROOT,
@@ -307,6 +313,7 @@ impl<'app> WgpuWinitApp<'app> {
                 viewport_ui_cb: None,
                 window: Some(window),
                 egui_winit: Some(egui_winit),
+                last_wgpu_px: Some(init_px),
             },
         );
 
@@ -671,6 +678,7 @@ impl WgpuWinitRunning<'_> {
         };
 
         viewport.info.events.clear(); // they should have been processed
+        sync_wgpu_surface(painter, viewport, viewport_id);
 
         let Viewport {
             window: Some(window),
@@ -836,16 +844,19 @@ impl WgpuWinitRunning<'_> {
                 // See: https://github.com/rust-windowing/winit/issues/208
                 // This solves an issue where the app would panic when minimizing on Windows.
                 if let Some(id) = viewport_id
-                    && let (Some(width), Some(height)) = (
-                        NonZeroU32::new(physical_size.width),
-                        NonZeroU32::new(physical_size.height),
-                    )
+                    && NonZeroU32::new(physical_size.width).is_some()
+                    && NonZeroU32::new(physical_size.height).is_some()
                 {
                     if shared.resized_viewport != viewport_id {
                         shared.resized_viewport = viewport_id;
                         shared.painter.on_window_resize_state_change(id, true);
                     }
-                    shared.painter.on_window_resized(id, width, height);
+                    let SharedState {
+                        painter, viewports, ..
+                    } = &mut *shared;
+                    if let Some(viewport) = viewports.get_mut(&id) {
+                        sync_wgpu_surface(painter, viewport, id);
+                    }
                     repaint_asap = true;
                 }
             }
@@ -902,6 +913,57 @@ impl WgpuWinitRunning<'_> {
     }
 }
 
+/// Keep the wgpu surface at `window.inner_size()`.
+///
+/// Live drag-resize must stay on `on_window_resized` / `ResizeBuffers` — recreating
+/// the DxgiFromVisual surface every WM_SIZE flickers. Tab hide-UI jumps to the
+/// full monitor; that path needs a new composition visual (`set_window` None/Some)
+/// because ResizeBuffers does not `SetContent`+`Commit`.
+fn sync_wgpu_surface(
+    painter: &mut egui_wgpu::winit::Painter,
+    viewport: &mut Viewport,
+    viewport_id: ViewportId,
+) {
+    let Some(window) = viewport.window.clone() else {
+        return;
+    };
+    let size = window.inner_size();
+    let px = (size.width, size.height);
+    if viewport.last_wgpu_px == Some(px) {
+        return;
+    }
+    let Some(width) = NonZeroU32::new(px.0) else {
+        return;
+    };
+    let Some(height) = NonZeroU32::new(px.1) else {
+        return;
+    };
+
+    let recreate = cfg!(target_os = "windows")
+        && viewport.last_wgpu_px.is_some_and(|old| {
+            let jump = old.0.abs_diff(px.0) >= 64 || old.1.abs_diff(px.1) >= 64;
+            jump || size_matches_monitor(&window, old) || size_matches_monitor(&window, px)
+        });
+    if recreate {
+        if let Err(err) = pollster::block_on(painter.set_window(viewport_id, None)) {
+            log::error!("wgpu surface drop on resize: {err}");
+        }
+        if let Err(err) = pollster::block_on(painter.set_window(viewport_id, Some(window))) {
+            log::error!("wgpu surface recreate on resize: {err}");
+        }
+    } else {
+        painter.on_window_resized(viewport_id, width, height);
+    }
+    viewport.last_wgpu_px = Some(px);
+}
+
+fn size_matches_monitor(window: &winit::window::Window, px: (u32, u32)) -> bool {
+    window.current_monitor().is_some_and(|m| {
+        let s = m.size();
+        s.width.abs_diff(px.0) <= 8 && s.height.abs_diff(px.1) <= 8
+    })
+}
+
 impl Viewport {
     /// Create winit window, if needed.
     fn initialize_window(
@@ -941,6 +1003,8 @@ impl Viewport {
                 ));
 
                 egui_winit::update_viewport_info(&mut self.info, egui_ctx, &window, true);
+                self.last_wgpu_px =
+                    Some((window.inner_size().width, window.inner_size().height));
                 self.window = Some(window);
             }
             Err(err) => {
@@ -1052,6 +1116,7 @@ fn render_immediate_viewport(
         return;
     };
     viewport.info.events.clear(); // they should have been processed
+    sync_wgpu_surface(painter, viewport, ids.this);
     let (Some(egui_winit), Some(window)) = (&mut viewport.egui_winit, &viewport.window) else {
         return;
     };
@@ -1126,31 +1191,20 @@ fn handle_viewport_output(
         let viewport =
             initialize_or_update_viewport(viewports, ids, class, builder, viewport_ui_cb, painter);
 
-        if let Some(window) = viewport.window.as_ref() {
-            let old_inner_size = window.inner_size();
-
+        if viewport.window.is_some() {
             viewport.deferred_commands.append(&mut commands);
 
             egui_winit::process_viewport_commands(
                 egui_ctx,
                 &mut viewport.info,
                 std::mem::take(&mut viewport.deferred_commands),
-                window,
+                viewport.window.as_ref().unwrap(),
                 &mut viewport.actions_requested,
             );
 
-            // For Wayland : https://github.com/emilk/egui/issues/4196
-            if cfg!(target_os = "linux") {
-                let new_inner_size = window.inner_size();
-                if new_inner_size != old_inner_size
-                    && let (Some(width), Some(height)) = (
-                        NonZeroU32::new(new_inner_size.width),
-                        NonZeroU32::new(new_inner_size.height),
-                    )
-                {
-                    painter.on_window_resized(viewport_id, width, height);
-                }
-            }
+            // Wayland (egui#4196) and Windows DxgiFromVisual: size may update
+            // asynchronously after Fullscreen. Recreate/resize if inner_size moved.
+            sync_wgpu_surface(painter, viewport, viewport_id);
         }
     }
 
@@ -1190,6 +1244,7 @@ fn initialize_or_update_viewport<'a>(
                 viewport_ui_cb,
                 window: None,
                 egui_winit: None,
+                last_wgpu_px: None,
             })
         }
 
@@ -1211,6 +1266,7 @@ fn initialize_or_update_viewport<'a>(
                 );
                 viewport.window = None;
                 viewport.egui_winit = None;
+                viewport.last_wgpu_px = None;
                 if let Err(err) = pollster::block_on(painter.set_window(viewport.ids.this, None)) {
                     log::error!(
                         "when rendering viewport_id={:?}, set_window Error {err}",

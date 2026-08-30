@@ -36,6 +36,18 @@ pub fn preview_key(brush: &BrushSettings) -> u64 {
         brush.dilution.to_bits(),
         brush.persistence.to_bits(),
         brush.spacing.to_bits(),
+        brush.scatter.to_bits(),
+        brush.jitter.to_bits(),
+        brush.taper_in.to_bits(),
+        brush.taper_out.to_bits(),
+        brush.fuzzy.to_bits(),
+        brush.roundness.to_bits(),
+        brush.angle.to_bits(),
+        brush.dual_size_pct.to_bits(),
+        brush.dual_opacity.to_bits(),
+        brush.dual_scatter.to_bits(),
+        brush.color_jitter.to_bits(),
+        brush.wet_rate.to_bits(),
         brush.shape_size.to_bits(),
         brush.shape_sharpen.to_bits(),
         brush.hair.to_bits(),
@@ -49,6 +61,11 @@ pub fn preview_key(brush: &BrushSettings) -> u64 {
     ] {
         bits.hash(&mut h);
     }
+    brush.scatter_count.hash(&mut h);
+    brush.follow_stroke.hash(&mut h);
+    brush.dual_enabled.hash(&mut h);
+    brush.tip_flip_x.hash(&mut h);
+    brush.tip_flip_y.hash(&mut h);
     brush.pressure_size.hash(&mut h);
     brush.pressure_density.hash(&mut h);
     brush.pressure_flow.hash(&mut h);
@@ -63,6 +80,9 @@ pub fn preview_key(brush: &BrushSettings) -> u64 {
     brush.texture_invert.hash(&mut h);
     brush.texture_invert_transparency.hash(&mut h);
     brush.texture_move_with_stroke.hash(&mut h);
+    brush.shape_path.hash(&mut h);
+    brush.paper_path.hash(&mut h);
+    brush.pattern_path.hash(&mut h);
     h.finish()
 }
 

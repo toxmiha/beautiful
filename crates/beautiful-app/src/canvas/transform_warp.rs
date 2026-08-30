@@ -347,12 +347,13 @@ pub(crate) fn drag_warp_point(
     }
     if moved {
         snap_warp_geometry_to_pixels(state, origin_x, origin_y);
-        // Pixel path: bake floating with Dragging filter, then 1:1 blit.
-        let keep_overlay = document.selection.floating_overlay_only;
-        refresh_warp_preview(state, document);
-        if keep_overlay {
-            document.selection.floating_overlay_only = true;
+        // Overlay: viewport dest pixels raster once per frame (rebuild_xform_pixel_live).
+        // Confirm still bakes the full AABB with the Final resample filter.
+        if document.selection.floating_overlay_only {
+            state.xform_pixel_key = None;
+            return;
         }
+        refresh_warp_preview(state, document);
         state.xform_live_stale = true;
     }
 }
@@ -499,7 +500,9 @@ pub(crate) fn try_split_warp_crosswise(
     state.warp_drag = Some(WarpDragTarget::SplitLock);
     state.warp_selected.clear();
     state.warp_proxy = None;
-    refresh_warp_preview_full(state, document);
+    if !document.selection.floating_overlay_only {
+        refresh_warp_preview_full(state, document);
+    }
     true
 }
 

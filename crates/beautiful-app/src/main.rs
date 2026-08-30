@@ -4,37 +4,52 @@
 mod action_log;
 mod addons;
 mod app;
+mod asset_browser;
+mod audio;
 mod autosave;
 mod brush_nodes;
 mod brush_stroke_preview;
+mod brush_library;
 mod canvas;
 mod canvas_gpu;
 mod clipboard_image;
 mod curve_ui;
 mod debug_flags;
+mod demo_player;
+mod demo_export;
 mod discord_rpc;
 mod dock;
+mod export_studio;
 mod file;
 mod file_browser;
 mod file_drop;
 mod filter_studio;
 mod gallery;
+mod gamepad;
+mod i18n;
 mod icons;
 mod keymap;
+mod media_chrome;
 mod mcp_bridge;
 mod navigator;
 mod new_canvas;
 mod open_canvas;
 mod os_win;
+#[cfg(target_os = "linux")]
+mod os_linux_blur;
 mod palette;
 mod pen_input;
 mod perf;
 mod perf_ui;
 mod prefs_ui;
+mod preset_browser;
+mod preset_library;
 mod resources;
 mod settings;
 mod splash;
 mod stroke_input;
+mod text_edit;
+mod text_live;
 mod theme;
 mod tool_session;
 mod ui;
@@ -61,7 +76,10 @@ fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
     let mcp = mcp_bridge::McpBridge::maybe_start(&args);
 
-    let opaque = debug_flags::opaque_window() || !os_win::dwm_backdrop_supported();
+    let boot = settings::AppSettings::load();
+    let opaque = debug_flags::opaque_window()
+        || !os_win::backdrop_supported()
+        || !boot.material.uses_dwm_backdrop();
 
     // Stack: winit event loop (via eframe) → egui → wgpu.
     // Brush stamps run in `App::raw_input_hook` at the start of each frame.
@@ -91,14 +109,25 @@ fn main() -> eframe::Result {
             },
         );
     }
+    #[cfg(target_os = "linux")]
+    {
+        action_log::log(
+            "gpu",
+            if opaque {
+                "Linux opaque + Fifo present"
+            } else {
+                "Linux transparent + Fifo present (compositor blur if available)"
+            },
+        );
+    }
 
     // Restore main window geometry (menus live in the custom title bar).
     // Do NOT apply maximized here: with frameless + transparent/acrylic, boot-time
     // maximize leaves a huge DWM backdrop while egui still paints the old inner size
     // (UI card top-left, empty blur filling the rest of the screen).
-    let boot = settings::AppSettings::load();
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Beautiful · Alpha 0.4.8")
+        .with_title(concat!("Beautiful · Alpha ", env!("CARGO_PKG_VERSION")))
+        .with_app_id("beautiful")
         .with_decorations(false)
         .with_min_inner_size([960.0, 640.0])
         .with_transparent(!opaque);
@@ -112,8 +141,11 @@ fn main() -> eframe::Result {
         viewport = viewport.with_inner_size([1280.0, 800.0]);
     }
     if let Some([x, y]) = boot.window_outer_pos {
-        // Ignore wildly off-screen positions from a removed monitor.
+        // Title bar must spawn on-screen. Negative Y (or huge off-monitor) hid
+        // close/min and stacked the recover banner above the drag strip.
         if x.is_finite() && y.is_finite() && x > -8000.0 && y > -8000.0 {
+            let x = x.max(0.0);
+            let y = y.max(0.0);
             viewport = viewport.with_position([x, y]);
         }
     }

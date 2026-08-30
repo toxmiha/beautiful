@@ -259,7 +259,7 @@ fn main() {
             "total_us": hottest.1,
             "number1_stage": hottest.2,
             "label": "Hypothesis from synthetic Soft Light∩float InStack stages — confirm with F12 xform.live_* on real Free drag",
-            "note": "MCP cannot drive Free Transform; this is the offline evidence gate for Phase 0",
+            "note": "MCP cannot drive Transform; this is the offline evidence gate for Phase 0",
         }),
     );
 

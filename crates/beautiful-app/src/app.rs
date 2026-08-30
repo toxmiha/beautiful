@@ -6,8 +6,9 @@ use crate::addons::AddonManager;
 use crate::autosave::AutosaveState;
 use crate::canvas::{CanvasState, CanvasView};
 use crate::dock::{DockLayout, DockSide, PanelKind};
+use crate::export_studio::ExportStudioState;
 use crate::file::FileState;
-use crate::file_browser::FileBrowser;
+use crate::file_browser::{BrowserJob, FileBrowser};
 use crate::file_drop::FileDropManager;
 use crate::filter_studio::FilterStudioState;
 use crate::gallery::{self, GalleryState};
@@ -15,18 +16,32 @@ use crate::mcp_bridge::{McpBridge, McpCommand};
 use crate::palette::ColorState;
 use crate::pen_input::PenInput;
 use crate::prefs_ui::PrefsUi;
+use crate::preset_browser::PresetBrowserUi;
+use crate::preset_library::PresetLibrary;
 use crate::resources::ResourceStats;
 use crate::settings::AppSettings;
 use crate::theme;
 use crate::tool_session::ToolSession;
 use crate::ui::{self, BrushPanelUi, FilterUiState, LayerUiState, ToolPages, WorkspaceTool};
-use crate::open_canvas::{self, OpenCanvasList, ParkedCanvas, MAX_OPEN_CANVASES};
+use crate::open_canvas::{self, OpenCanvasList, ParkedCanvas};
 use crate::workspace::Workspace;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppScreen {
     Gallery,
     Editor,
+}
+
+/// Home has no canvas. `BeautifulApp.document` is still a required field, so we
+/// keep a 1×1 empty stub — not a fake 2000×1500 painting (that also made
+/// display-tile cover look like a 12-tile live backlog on the gallery).
+const HOME_STUB_W: u32 = 1;
+const HOME_STUB_H: u32 = 1;
+
+fn home_stub_document(undo_max: usize) -> Document {
+    let mut d = Document::new(HOME_STUB_W, HOME_STUB_H);
+    d.set_undo_max_steps(undo_max);
+    d
 }
 
 pub struct BeautifulApp {
@@ -38,12 +53,20 @@ pub struct BeautifulApp {
     open_canvases: OpenCanvasList,
     /// Pending close of a canvas tab after dirty prompt.
     pending_close_canvas: Option<usize>,
+    pending_reopen: Option<std::path::PathBuf>,
+    home_tab_focused: bool,
+    /// Horizontal scroll nudge for canvas file tabs (< > / wheel).
+    canvas_tabs_scroll_delta: f32,
     pen: PenInput,
     color_state: ColorState,
     dock: DockLayout,
     dock_dirty: bool,
     /// Force SidePanel widths from layout.json once per process.
     dock_widths_seeded: bool,
+    /// Skip persisting dock extents while the OS window is minimized / tiny.
+    dock_geom_was_frozen: bool,
+    /// Immediate viewport hosts already created this session (skip position patch).
+    float_viewports_live: std::collections::HashSet<u64>,
     /// Persist main window size/pos when it changes.
     window_geom_dirty: bool,
     /// Frames to skip geometry sync while the viewport settles.
@@ -53,9 +76,12 @@ pub struct BeautifulApp {
     tool: WorkspaceTool,
     tool_session: ToolSession,
     tool_pages: ToolPages,
+    preset_library: PresetLibrary,
+    preset_browser: PresetBrowserUi,
     brush_panel: BrushPanelUi,
     filters: FilterUiState,
     filter_studio: FilterStudioState,
+    export_studio: ExportStudioState,
     resources: ResourceStats,
     resource_tick: f32,
     theme_applied: bool,
@@ -64,10 +90,14 @@ pub struct BeautifulApp {
     file_drop: FileDropManager,
     screen: AppScreen,
     gallery: GalleryState,
+    demo_player: Option<crate::demo_player::DemoPlayer>,
     layer_ui: LayerUiState,
     settings: AppSettings,
     addons: AddonManager,
+    audio: crate::audio::AudioEngine,
     prefs: PrefsUi,
+    /// Xbox / Steam Deck / XInput via gilrs.
+    gamepad: crate::gamepad::GamepadInput,
     /// Smoothed frames-per-second for the status bar.
     fps: f32,
     frame_ms: f32,
@@ -81,8 +111,23 @@ pub struct BeautifulApp {
     mcp_quit: bool,
     /// F12 microprofiler window.
     perf_ui_open: bool,
+    /// Tab: hide docks / file tabs / sheets / status; keep the title-bar menus.
+    ui_chrome_hidden: bool,
+    /// Last applied borderless-fullscreen for hide-UI (so we can restore).
+    ui_chrome_fullscreen: bool,
+    /// Window was maximized before hide-UI fullscreen.
+    ui_chrome_restore_maximized: bool,
+    /// Win32 placement before hide-UI covered the monitor.
+    #[cfg(windows)]
+    ui_chrome_saved_placement: Option<crate::os_win::SavedWindowPlacement>,
     /// Extra frames of continuous repaint (MCP spam_repaint / profiler).
     spam_repaint_left: u32,
+    /// After eye toggle: delay zstd cold-park so it cannot steal the present frame.
+    visibility_park_cooldown: u32,
+    /// Track layer focus for idle eye snap pre-warm.
+    last_active_for_eye_warm: usize,
+    /// Pace eye snap bake — never every frame (idle CPU rule).
+    eye_warm_next_at: f64,
     /// Autosave + crash recovery.
     autosave: AutosaveState,
     /// Discord Rich Presence worker.
@@ -95,6 +140,8 @@ pub struct BeautifulApp {
     desk_screen_rect: Option<egui::Rect>,
     /// In-window Loading progress until deferred GPU/addons finish.
     boot: crate::splash::BootState,
+    /// Settings/dock already written — Drop must not redo I/O.
+    exit_persisted: bool,
 }
 
 impl BeautifulApp {
@@ -106,8 +153,18 @@ impl BeautifulApp {
         // autosave run across the first frames under an in-app Loading bar.
         theme::apply_settings_colors(&settings);
         theme::apply(&cc.egui_ctx);
+        crate::i18n::set_language(&settings.ui_language);
         log_win32_exstyle(cc);
         apply_window_material(cc, &settings);
+        #[cfg(windows)]
+        {
+            if crate::os_win::uncover_if_monitor_sized(cc) {
+                crate::action_log::log(
+                    "ui",
+                    "boot: window was monitor-sized (Tab leftover); restored to work area",
+                );
+            }
+        }
         log_wgpu_surface(cc);
 
         let wgpu_rs = cc.wgpu_render_state.clone();
@@ -115,14 +172,16 @@ impl BeautifulApp {
         let mut update_checker = crate::update_check::UpdateChecker::new();
         update_checker.request_check(std::time::Duration::from_secs(0));
 
-        let mut document = Document::new(2000, 1500);
-        document.set_undo_max_steps(settings.undo_max_steps);
-        let tool_session = ToolSession::load();
+        let mut document = home_stub_document(settings.undo_max_steps);
+        let mut tool_session = ToolSession::load();
         tool_session.apply_to_document(&mut document);
         let tool = tool_session.tool;
         let color_state = ColorState::from_rgba(document.brush.color);
         let workspace = Workspace::new_with_primary("Untitled", document.width, document.height);
-        let open_canvases = OpenCanvasList::new_primary("Untitled");
+        let open_canvases = OpenCanvasList::home_only();
+        let preset_library = PresetLibrary::load_or_seed();
+        let mut tool_pages = ToolPages::load();
+        tool_pages.migrate_slots(&mut tool_session, &preset_library);
 
         crate::action_log::log("boot", "window ready — deferred Loading overlay");
 
@@ -132,11 +191,16 @@ impl BeautifulApp {
             workspace,
             open_canvases,
             pending_close_canvas: None,
+            pending_reopen: None,
+            home_tab_focused: true,
+            canvas_tabs_scroll_delta: 0.0,
             pen: PenInput::new(),
             color_state,
             dock: DockLayout::load(),
             dock_dirty: false,
             dock_widths_seeded: false,
+            dock_geom_was_frozen: false,
+            float_viewports_live: std::collections::HashSet::new(),
             window_geom_dirty: false,
             // Skip boot-time maximize restore: frameless+acrylic+wgpu often keeps the
             // swapchain at the windowed size, so UI stays top-left inside a huge blur.
@@ -144,10 +208,13 @@ impl BeautifulApp {
             pending_maximize: false,
             tool,
             tool_session,
-            tool_pages: ToolPages::load(),
+            tool_pages,
+            preset_library,
+            preset_browser: PresetBrowserUi::default(),
             brush_panel: BrushPanelUi::default(),
             filters: FilterUiState::default(),
             filter_studio: FilterStudioState::default(),
+            export_studio: ExportStudioState::default(),
             resources: ResourceStats::default(),
             resource_tick: 0.0,
             theme_applied: true,
@@ -156,10 +223,13 @@ impl BeautifulApp {
             file_drop: FileDropManager::default(),
             screen: AppScreen::Gallery,
             gallery: GalleryState::default(),
+            demo_player: None,
             layer_ui: LayerUiState::default(),
             settings,
             addons: AddonManager::new(),
+            audio: crate::audio::AudioEngine::new(),
             prefs: PrefsUi::default(),
+            gamepad: crate::gamepad::GamepadInput::new(),
             fps: 60.0,
             frame_ms: 16.0,
             canvas_gpu_ready: false,
@@ -167,14 +237,45 @@ impl BeautifulApp {
             mcp,
             mcp_quit: false,
             perf_ui_open: false,
+            ui_chrome_hidden: false,
+            ui_chrome_fullscreen: false,
+            ui_chrome_restore_maximized: false,
+            #[cfg(windows)]
+            ui_chrome_saved_placement: None,
             spam_repaint_left: 0,
+            visibility_park_cooldown: 0,
+            last_active_for_eye_warm: 0,
+            eye_warm_next_at: 0.0,
             autosave: AutosaveState::default(),
             discord,
             discord_tick: 0.0,
             update_checker,
             desk_screen_rect: None,
             boot: crate::splash::BootState::default(),
+            exit_persisted: false,
         }
+    }
+
+    /// Drop any real canvas and park a 1×1 stub while the gallery is showing.
+    fn reset_home_stub(&mut self) {
+        self.document = home_stub_document(self.settings.undo_max_steps);
+        self.document.ensure_active_paintable();
+        self.canvas.on_document_replaced();
+        self.workspace = Workspace::new_with_primary("Untitled", HOME_STUB_W, HOME_STUB_H);
+    }
+
+    fn persist_session_files(&mut self) {
+        if self.exit_persisted {
+            return;
+        }
+        self.exit_persisted = true;
+        self.tool_session
+            .capture_from_document(&self.document, self.tool);
+        self.tool_session.save();
+        self.dock.save();
+        self.tool_pages.save();
+        self.preset_library.save();
+        let _ = self.settings.save();
     }
 
     /// Advance one deferred boot step per call; bar jumps when the step finishes.
@@ -201,8 +302,10 @@ impl BeautifulApp {
                 );
             }
             BootStep::Addons => {
-                crate::addons::ensure_example_addon(&self.settings);
-                self.addons.reload(&self.settings);
+                let stop_audio = self.addons.reload(&self.settings);
+                if stop_audio {
+                    self.audio.stop();
+                }
                 crate::action_log::log("boot", "addons");
             }
             BootStep::Autosave => {
@@ -210,7 +313,9 @@ impl BeautifulApp {
                 crate::action_log::log("boot", "autosave");
             }
             BootStep::Warmup => {
-                self.document.warm_tip_cache();
+                if self.screen == AppScreen::Editor {
+                    self.document.warm_tip_cache();
+                }
                 beautiful_core::warm_srgb_luts();
                 crate::action_log::log("boot", "warmup");
             }
@@ -227,6 +332,18 @@ impl BeautifulApp {
         self.color_state = ColorState::from_rgba(self.document.brush.color);
         self.color_state.drawing_slot = slot;
         self.document.drawing_slot = slot;
+    }
+
+    fn fire_addon_event(&mut self, event: &str) {
+        self.addons
+            .refresh_snapshot(&self.document, self.file.path.as_deref());
+        let batches = self.addons.dispatch_event(event);
+        for (_id, cmds) in batches {
+            for cmd in cmds {
+                self.addons
+                    .apply_host_command(cmd, &mut self.document, &mut self.file, &mut self.audio);
+            }
+        }
     }
 
     /// Blank sheet inside the current holst (not a new file).
@@ -268,6 +385,73 @@ impl BeautifulApp {
         self.apply_tool_session();
         self.canvas.mark_dirty();
         self.spam_repaint_left = self.spam_repaint_left.max(2);
+    }
+
+    /// Mute the pad while Preferences is capturing a binding (don't paint with RT).
+    fn pad_for_canvas(&self) -> crate::gamepad::GamepadFrame {
+        if self.prefs.is_capturing_gamepad() {
+            crate::gamepad::GamepadFrame::default()
+        } else {
+            self.gamepad.frame().clone()
+        }
+    }
+
+    /// New untitled canvas tab (same options as the tab `+` menu).
+    fn add_blank_canvas_tab(&mut self) {
+        if !self.open_canvases.has_no_tabs()
+            && self.open_canvases.active().parked.is_none()
+            && self.screen == AppScreen::Editor
+        {
+            self.park_active_canvas();
+        } else if self.open_canvases.has_no_tabs() {
+            // Coming from Home-only: just push a fresh tab.
+        } else if self.open_canvases.active().parked.is_none() {
+            self.park_active_canvas();
+        }
+        let _ = self
+            .open_canvases
+            .push_active_new("Untitled".into(), None, 0, 0);
+        self.workspace = Workspace::new_with_primary("Untitled", 2000, 1500);
+        self.document = Document::new(2000, 1500);
+        self.apply_tool_session();
+        self.canvas.on_document_replaced();
+        self.file.path = None;
+        self.file.orphan_time_secs = 0;
+        self.file.mark_clean(&self.document);
+        self.home_tab_focused = false;
+        self.screen = AppScreen::Editor;
+    }
+
+    /// New canvas tab from clipboard image.
+    fn add_canvas_from_clipboard(&mut self) {
+        match crate::clipboard_image::read_clipboard_rgba() {
+            Ok((w, h, rgba)) => match beautiful_core::document_from_rgba(w, h, rgba) {
+                Ok(mut doc) => {
+                    doc.ensure_active_paintable();
+                    if !self.open_canvases.has_no_tabs()
+                        && self.open_canvases.active().parked.is_none()
+                    {
+                        self.park_active_canvas();
+                    }
+                    // Keep Home-parked Warm — never take_active_parked() to discard.
+                    let title = format!("Clipboard {w}×{h}");
+                    let _ = self.open_canvases.push_active_new(title.clone(), None, 0, 0);
+                    self.workspace = Workspace::new_with_primary(&title, w, h);
+                    self.document = doc;
+                    self.apply_tool_session();
+                    self.canvas.on_document_replaced();
+                    self.file.path = None;
+                    self.file.orphan_time_secs = 0;
+                    self.file.mark_clean(&self.document);
+                    self.home_tab_focused = false;
+                    self.screen = AppScreen::Editor;
+                    self.file
+                        .set_status(format!("Canvas from clipboard ({w}×{h})"), false);
+                }
+                Err(e) => self.file.set_status(format!("Clipboard: {e}"), true),
+            },
+            Err(e) => self.file.set_status(format!("Clipboard: {e}"), true),
+        }
     }
 
     /// New sheet from clipboard image (within current holst).
@@ -332,39 +516,7 @@ impl BeautifulApp {
             );
             return;
         }
-        match crate::file::FileState::load_path_document(path) {
-            Ok(mut doc) => {
-                doc.ensure_active_paintable();
-                let mut canvas = CanvasState::new();
-                canvas.on_document_replaced();
-                let title = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "Подвкладка".into());
-                let view = if self.canvas.last_viewport.is_positive() {
-                    self.canvas.last_viewport
-                } else {
-                    egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1100.0, 750.0))
-                };
-                self.workspace.add_and_focus(
-                    title,
-                    doc,
-                    canvas,
-                    &mut self.document,
-                    &mut self.canvas,
-                    view,
-                );
-                self.apply_tool_session();
-                self.file
-                    .set_status(format!("Открыта подвкладка {}", path.display()), false);
-                self.canvas.mark_dirty();
-                self.spam_repaint_left = self.spam_repaint_left.max(2);
-            }
-            Err(e) => {
-                self.file
-                    .set_status(format!("Не удалось открыть подвкладку: {e}"), true);
-            }
-        }
+        self.file.start_open(path, crate::file::OpenIntent::NewSheet);
     }
 
     /// Open native Windows file dialog to pick file(s) as new canvas tabs.
@@ -386,8 +538,10 @@ impl BeautifulApp {
             .capture_from_document(&self.document, self.tool);
         if self.workspace.focus_index(idx, &mut self.document, &mut self.canvas) {
             self.apply_tool_session();
-            self.canvas.mark_dirty();
-            self.spam_repaint_left = self.spam_repaint_left.max(2);
+            // Warm switch: overwrite cover in place — never wipe to checkerboard.
+            self.canvas.request_cover_refresh();
+            self.canvas.defer_nav_thumbs();
+            self.spam_repaint_left = self.spam_repaint_left.max(1);
             if !self.document.layers.is_empty() {
                 let li = self
                     .document
@@ -403,6 +557,14 @@ impl BeautifulApp {
     }
 
     fn sync_active_canvas_meta(&mut self) {
+        if self.open_canvases.has_no_tabs() {
+            return;
+        }
+        // Home / Warm-parked: live app holds a stub — never write its path/title
+        // onto the parked tab (that stole names and emptied canvases).
+        if self.home_tab_focused || self.open_canvases.active().parked.is_some() {
+            return;
+        }
         let title = self
             .file
             .path
@@ -424,10 +586,175 @@ impl BeautifulApp {
         self.workspace.set_focused_title(title);
     }
 
+    /// Park live body if needed, then push a new active tab for `title`.
+    /// Never discards an existing Warm — that was the empty-tab / stolen-name bug.
+    fn push_new_canvas_tab(&mut self, title: String, path: Option<std::path::PathBuf>, edit_gen: u64, saved_edit_gen: u64) -> bool {
+        if !self.open_canvases.can_open_more() && !self.open_canvases.has_no_tabs() {
+            return false;
+        }
+        if !self.open_canvases.has_no_tabs() && self.open_canvases.active().parked.is_none() {
+            self.park_active_canvas();
+        }
+        // If Home already Warm-parked the previous tab, leave that Warm alone.
+        match self
+            .open_canvases
+            .push_active_new_ex(title, path, edit_gen, saved_edit_gen, false)
+        {
+            Ok(_) => true,
+            Err(msg) => {
+                self.file.set_status(msg, true);
+                false
+            }
+        }
+    }
+
+    /// Install New Canvas dialog result into its own tab (Gallery or Editor).
+    fn consume_pending_new_canvas(&mut self) {
+        if !self.file.take_enter_editor() {
+            return;
+        }
+        let Some(mut doc) = self.file.take_pending_new_document() else {
+            return;
+        };
+        doc.ensure_active_paintable();
+        let title = self.file.display_name();
+        let edit = doc.edit_generation();
+        if !self.push_new_canvas_tab(title.clone(), None, edit, edit) {
+            return;
+        }
+        self.document = doc;
+        self.canvas.on_document_replaced();
+        self.workspace = Workspace::new_with_primary(
+            &title,
+            self.document.width,
+            self.document.height,
+        );
+        self.file.path = None;
+        self.file.orphan_time_secs = 0;
+        self.file.mark_clean(&self.document);
+        self.home_tab_focused = false;
+        self.screen = AppScreen::Editor;
+        self.sync_active_canvas_meta();
+        self.apply_tool_session();
+        self.canvas.mark_dirty();
+        self.spam_repaint_left = self.spam_repaint_left.max(2);
+    }
+
+    /// Active tab claims to be live but has no body — recover without stealing
+    /// the previous canvas's pixels/name.
+    fn install_missing_canvas_body(&mut self) {
+        let (path, title, unsaved, saved_gen) = {
+            let tab = self.open_canvases.active();
+            (
+                tab.path.clone(),
+                tab.title.clone(),
+                tab.unsaved_time_secs,
+                tab.saved_edit_gen,
+            )
+        };
+        self.file.path = path.clone();
+        self.file.orphan_time_secs = unsaved;
+        self.file.set_saved_edit_gen(saved_gen);
+        if let Some(p) = path.as_ref().filter(|p| p.is_file()) {
+            match crate::file::FileState::load_path_document(p) {
+                Ok(mut doc) => {
+                    doc.ensure_active_paintable();
+                    self.document = doc;
+                    self.canvas.on_document_replaced();
+                    let title = open_canvas::title_from_path(p);
+                    self.workspace = Workspace::new_with_primary(
+                        &title,
+                        self.document.width,
+                        self.document.height,
+                    );
+                    self.file.mark_clean(&self.document);
+                    self.open_canvases.sync_active_meta(
+                        Some(p.clone()),
+                        title,
+                        self.document.edit_generation(),
+                        self.file.saved_edit_gen(),
+                    );
+                    self.file.set_status("Reloaded canvas (tab body was missing)", false);
+                    return;
+                }
+                Err(e) => {
+                    self.file
+                        .set_status(format!("Tab body missing; reload failed: {e}"), true);
+                }
+            }
+        }
+        self.document = Document::new(2000, 1500);
+        self.canvas.on_document_replaced();
+        self.workspace = Workspace::new_with_primary(
+            &title,
+            self.document.width,
+            self.document.height,
+        );
+        self.open_canvases.sync_active_meta(
+            path,
+            title,
+            self.document.edit_generation(),
+            saved_gen,
+        );
+    }
+
+    /// Persist and kill the process. Do not hide the window first: a hidden
+    /// root viewport can stop getting frames, so eframe never reaches `on_exit`
+    /// and the process stays in Task Manager with the whole document in RAM.
+    fn force_quit(&mut self) -> ! {
+        crate::action_log::log("exit", "force_quit");
+        crate::perf_ui::flush_on_exit();
+        self.autosave.shutdown_clean(&self.settings);
+        self.persist_session_files();
+        crate::action_log::log("exit", "persist done — process::exit");
+        crate::action_log::flush();
+        std::process::exit(0);
+    }
+
+    /// Window close must see *every* open canvas, including parked dirty tabs and
+    /// the gallery screen. Already-prompting / saving states only CancelClose.
+    fn handle_window_close_request(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|i| i.viewport().close_requested()) {
+            return;
+        }
+        if self.file.close_blocked() || (self.file_browser.open && self.file_browser.is_save_mode())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            return;
+        }
+        self.sync_active_canvas_meta();
+        if self.file.is_dirty(&self.document) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.screen = AppScreen::Editor;
+            self.file.close_prompt = Some(crate::file::ClosePrompt::Quit);
+            return;
+        }
+        if let Some(idx) = self.open_canvases.first_dirty_index() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.screen = AppScreen::Editor;
+            self.focus_canvas_index(idx);
+            self.file.close_prompt = Some(crate::file::ClosePrompt::Quit);
+            return;
+        }
+        self.force_quit();
+    }
+
     fn park_active_canvas(&mut self) {
+        if self.open_canvases.has_no_tabs() {
+            return;
+        }
+        // Hard rule: never overwrite an existing Warm with the live stub.
+        if self.open_canvases.active().parked.is_some() {
+            return;
+        }
+        self.open_canvases.ensure_primary("Untitled");
         self.tool_session
             .capture_from_document(&self.document, self.tool);
+        self.tool_session.save();
+        self.dock.save();
+        self.tool_pages.save();
         self.sync_active_canvas_meta();
+        self.open_canvases.active_mut().unsaved_time_secs = self.file.orphan_time_secs;
         let path = self.file.path.clone();
         let title = self.open_canvases.active().title.clone();
         let edit_gen = self.open_canvases.active().edit_gen;
@@ -449,43 +776,94 @@ impl BeautifulApp {
                 self.workspace = workspace;
                 let tab = self.open_canvases.active();
                 self.file.path = tab.path.clone();
+                self.file.orphan_time_secs = tab.unsaved_time_secs;
                 self.file.set_saved_edit_gen(tab.saved_edit_gen);
-                self.canvas.mark_dirty();
+                // Warm restore: overwrite cover for the installed sheet — no wipe crawl.
+                self.canvas.request_cover_refresh();
+                self.canvas.defer_nav_thumbs();
             }
             ParkedCanvas::Cold { .. } => {
-                let path = self.open_canvases.active().path.clone();
-                if let Some(path) = path {
-                    match crate::file::FileState::load_path_document(&path) {
-                        Ok(mut doc) => {
-                            doc.ensure_active_paintable();
-                            self.document = doc;
-                            self.canvas.on_document_replaced();
-                            let title = open_canvas::title_from_path(&path);
-                            self.workspace = Workspace::new_with_primary(
-                                &title,
-                                self.document.width,
-                                self.document.height,
-                            );
-                            self.file.path = Some(path.clone());
-                            self.file.mark_clean(&self.document);
-                            self.open_canvases.sync_active_meta(
-                                Some(path),
-                                title,
-                                self.document.edit_generation(),
-                                self.file.saved_edit_gen(),
-                            );
-                            self.file.set_status("Reloaded canvas from disk", false);
-                        }
-                        Err(e) => {
-                            self.file.set_status(format!("Reload failed: {e}"), true);
-                            self.document = Document::new(2000, 1500);
-                            self.canvas.on_document_replaced();
-                            self.workspace = Workspace::new_with_primary(
-                                "Untitled",
-                                self.document.width,
-                                self.document.height,
-                            );
-                        }
+                // Bind identity from the tab FIRST so a failed reload cannot
+                // leave file.path pointing at the previous canvas (that made
+                // sync_active_canvas_meta rename/overwrite the cold tab).
+                let (path, title, unsaved, saved_gen) = {
+                    let tab = self.open_canvases.active();
+                    (
+                        tab.path.clone(),
+                        tab.title.clone(),
+                        tab.unsaved_time_secs,
+                        tab.saved_edit_gen,
+                    )
+                };
+                self.file.path = path.clone();
+                self.file.orphan_time_secs = unsaved;
+                self.file.set_saved_edit_gen(saved_gen);
+
+                let reload = path.as_ref().and_then(|p| {
+                    if !p.is_file() {
+                        return Some(Err(format!("file missing: {}", p.display())));
+                    }
+                    Some(crate::file::FileState::load_path_document(p))
+                });
+
+                match reload {
+                    Some(Ok(mut doc)) => {
+                        doc.ensure_active_paintable();
+                        self.document = doc;
+                        self.canvas.on_document_replaced();
+                        let title = path
+                            .as_ref()
+                            .map(|p| open_canvas::title_from_path(p))
+                            .unwrap_or(title);
+                        self.workspace = Workspace::new_with_primary(
+                            &title,
+                            self.document.width,
+                            self.document.height,
+                        );
+                        self.file.mark_clean(&self.document);
+                        self.open_canvases.sync_active_meta(
+                            path,
+                            title,
+                            self.document.edit_generation(),
+                            self.file.saved_edit_gen(),
+                        );
+                        self.file.set_status("Reloaded canvas from disk", false);
+                    }
+                    Some(Err(e)) => {
+                        self.file.set_status(format!("Reload failed: {e}"), true);
+                        // Keep tab path/title; empty placeholder — never inherit previous canvas.
+                        self.document = Document::new(2000, 1500);
+                        self.canvas.on_document_replaced();
+                        self.workspace = Workspace::new_with_primary(
+                            &title,
+                            self.document.width,
+                            self.document.height,
+                        );
+                        self.open_canvases.sync_active_meta(
+                            path,
+                            title,
+                            self.document.edit_generation(),
+                            saved_gen,
+                        );
+                    }
+                    None => {
+                        self.file.set_status(
+                            "Cold tab has no path — restored empty canvas",
+                            true,
+                        );
+                        self.document = Document::new(2000, 1500);
+                        self.canvas.on_document_replaced();
+                        self.workspace = Workspace::new_with_primary(
+                            &title,
+                            self.document.width,
+                            self.document.height,
+                        );
+                        self.open_canvases.sync_active_meta(
+                            None,
+                            title,
+                            self.document.edit_generation(),
+                            saved_gen,
+                        );
                     }
                 }
             }
@@ -507,14 +885,37 @@ impl BeautifulApp {
     }
 
     fn focus_canvas_index(&mut self, idx: usize) {
-        if idx >= self.open_canvases.len() || idx == self.open_canvases.active_index() {
+        if idx >= self.open_canvases.len() {
             return;
         }
-        self.park_active_canvas();
-        self.open_canvases.cold_unload_excess();
+        // Home parked the active tab in place — clicking it must unpark, not no-op.
+        if idx == self.open_canvases.active_index() {
+            if self.home_tab_focused || self.open_canvases.active().parked.is_some() {
+                if let Some(parked) = self.open_canvases.take_active_parked() {
+                    self.install_parked_canvas(parked);
+                }
+                self.home_tab_focused = false;
+                self.screen = AppScreen::Editor;
+                self.apply_tool_session();
+                // install_parked_canvas already requested cover refresh.
+                self.spam_repaint_left = self.spam_repaint_left.max(2);
+            }
+            return;
+        }
+        // Already parked (Home): never park again — that would overwrite Warm with a 64×64 stub.
+        if self.open_canvases.active().parked.is_none() {
+            self.park_active_canvas();
+        }
+        // Activate BEFORE any unload — never drop the Warm we are about to show.
         if let Some(parked) = self.open_canvases.activate(idx) {
             self.install_parked_canvas(parked);
+        } else {
+            // Inactive tab with no body (bug / discarded Warm) — recover identity.
+            self.install_missing_canvas_body();
         }
+        self.home_tab_focused = false;
+        self.screen = AppScreen::Editor;
+        self.apply_tool_session();
     }
 
     fn close_canvas_index(&mut self, idx: usize) {
@@ -522,13 +923,21 @@ impl BeautifulApp {
             return;
         }
         if self.open_canvases.len() <= 1 {
-            if self.file.is_dirty(&self.document) {
-                self.pending_close_canvas = Some(0);
-                self.file.close_prompt = Some(crate::file::ClosePrompt::ToGallery);
-            } else {
-                self.file.flush_time();
-                self.screen = AppScreen::Gallery;
+            // Closing the last holst tab: save prompt if dirty, then remove tab → Home only.
+            if self.file.is_dirty(&self.document)
+                || (self.home_tab_focused && self.open_canvases.tabs()[idx].is_dirty())
+            {
+                // If parked on Home, focus/unpark first so dirty check uses live doc.
+                if self.home_tab_focused || self.open_canvases.active().parked.is_some() {
+                    self.focus_canvas_index(idx);
+                }
+                if self.file.is_dirty(&self.document) {
+                    self.pending_close_canvas = Some(0);
+                    self.file.close_prompt = Some(crate::file::ClosePrompt::ToGallery);
+                    return;
+                }
             }
+            self.close_last_canvas_to_home();
             return;
         }
 
@@ -568,14 +977,34 @@ impl BeautifulApp {
         self.open_canvases.remove(idx);
     }
 
+    /// Remove the sole holst tab and land on Home (no lingering Untitled tab).
+    fn close_last_canvas_to_home(&mut self) {
+        self.tool_session
+            .capture_from_document(&self.document, self.tool);
+        self.tool_session.save();
+        self.dock.save();
+        self.tool_pages.save();
+        let _ = self.settings.save();
+        self.file.flush_time();
+        self.reset_home_stub();
+        self.file.clear_home_state();
+        self.file.mark_clean(&self.document);
+        self.open_canvases.clear_all();
+        self.apply_tool_session();
+        self.home_tab_focused = true;
+        self.screen = AppScreen::Gallery;
+    }
+
     /// After user confirms discard/save leave for a canvas tab close.
     fn finish_pending_canvas_close(&mut self) {
         let Some(idx) = self.pending_close_canvas.take() else {
             return;
         };
         if self.open_canvases.len() <= 1 {
-            self.file.flush_time();
-            self.screen = AppScreen::Gallery;
+            self.close_last_canvas_to_home();
+            if let Some(path) = self.pending_reopen.take() {
+                self.file.start_open(&path, crate::file::OpenIntent::NewCanvas);
+            }
             return;
         }
         let id = self
@@ -604,106 +1033,59 @@ impl BeautifulApp {
             self.open_canvases.remove(remove_at);
         }
         self.sync_active_canvas_meta();
+        if let Some(path) = self.pending_reopen.take() {
+            self.file.start_open(&path, crate::file::OpenIntent::NewCanvas);
+        }
+    }
+
+    /// Last open tab closed (or discarded): home screen + fresh untitled so reopen
+    /// loads from disk instead of resurrecting the RAM copy.
+    fn leave_to_gallery(&mut self) {
+        self.tool_session
+            .capture_from_document(&self.document, self.tool);
+        self.tool_session.save();
+        self.dock.save();
+        self.tool_pages.save();
+        let _ = self.settings.save();
+        self.file.flush_time();
+        self.reset_home_stub();
+        self.file.clear_home_state();
+        self.file.mark_clean(&self.document);
+        self.open_canvases.sync_active_meta(
+            None,
+            "Untitled".into(),
+            self.document.edit_generation(),
+            self.file.saved_edit_gen(),
+        );
+        self.apply_tool_session();
+        self.screen = AppScreen::Gallery;
+    }
+
+    /// Home is a tab destination, not a document close: preserve parked canvases.
+    fn focus_home_tab(&mut self) {
+        if self.open_canvases.has_no_tabs() {
+            self.home_tab_focused = true;
+            self.screen = AppScreen::Gallery;
+            return;
+        }
+        if self.screen == AppScreen::Editor && self.open_canvases.active().parked.is_none() {
+            self.park_active_canvas();
+        }
+        self.file.flush_time();
+        self.home_tab_focused = true;
+        self.screen = AppScreen::Gallery;
+        // Safe place to reclaim RAM — user is on Home, not mid tab-switch.
+        self.open_canvases.cold_unload_excess();
     }
 
     /// Open a crash-recovery snapshot without binding Save to the autosave path.
     fn open_recovered_canvas(&mut self, entry: &crate::autosave::RecoverEntry) {
-        match crate::file::FileState::load_path_document(&entry.path) {
-            Ok(mut doc) => {
-                doc.ensure_active_paintable();
-                if self.open_canvases.active().parked.is_none()
-                    && self.screen == AppScreen::Editor
-                    && self.open_canvases.can_open_more()
-                {
-                    self.park_active_canvas();
-                } else if !self.open_canvases.can_open_more()
-                    && !(self.open_canvases.len() == 1 && self.open_canvases.active().path.is_none())
-                {
-                    self.file.set_status(
-                        format!("Too many open canvases (max {MAX_OPEN_CANVASES}) — close a tab"),
-                        true,
-                    );
-                    return;
-                }
-
-                let title = if entry.title.is_empty() {
-                    "Recovered".to_string()
-                } else {
-                    format!("{} (recovered)", entry.title)
-                };
-                let edit_gen = doc.edit_generation();
-                // Prefer original path as the save target if it still exists; else untitled.
-                let bind_path = entry
-                    .original
-                    .as_ref()
-                    .filter(|p| p.is_file())
-                    .cloned();
-
-                if self.open_canvases.len() == 1
-                    && self.open_canvases.active().path.is_none()
-                    && self.screen != AppScreen::Editor
-                {
-                    self.document = doc;
-                    self.canvas.on_document_replaced();
-                    self.workspace = Workspace::new_with_primary(
-                        &title,
-                        self.document.width,
-                        self.document.height,
-                    );
-                    self.file.path = bind_path.clone();
-                    // Force dirty so Save As is obvious if original missing.
-                    if bind_path.is_none() {
-                        self.file.set_saved_edit_gen(edit_gen.wrapping_sub(1));
-                    } else {
-                        self.file.mark_clean(&self.document);
-                    }
-                    self.open_canvases.sync_active_meta(
-                        bind_path,
-                        title,
-                        self.document.edit_generation(),
-                        self.file.saved_edit_gen(),
-                    );
-                } else {
-                    if let Err(msg) = self.open_canvases.push_active_new(
-                        title.clone(),
-                        bind_path.clone(),
-                        edit_gen,
-                        if bind_path.is_some() {
-                            edit_gen
-                        } else {
-                            edit_gen.wrapping_sub(1)
-                        },
-                    ) {
-                        self.file.set_status(msg.to_string(), true);
-                        return;
-                    }
-                    self.document = doc;
-                    self.canvas.on_document_replaced();
-                    self.workspace = Workspace::new_with_primary(
-                        &title,
-                        self.document.width,
-                        self.document.height,
-                    );
-                    self.file.path = bind_path;
-                    if self.file.path.is_none() {
-                        self.file.set_saved_edit_gen(edit_gen.wrapping_sub(1));
-                    } else {
-                        self.file.mark_clean(&self.document);
-                    }
-                }
-                self.file.set_status(
-                    format!("Recovered “{}” — save to keep", entry.title),
-                    false,
-                );
-                self.screen = AppScreen::Editor;
-                self.canvas.mark_dirty();
-                self.spam_repaint_left = self.spam_repaint_left.max(2);
-            }
-            Err(e) => {
-                self.file
-                    .set_status(format!("Recover failed: {e}"), true);
-            }
-        }
+        self.file.start_open(
+            &entry.path,
+            crate::file::OpenIntent::Recover {
+                title: entry.title.clone(),
+            },
+        );
     }
 
     /// Open a file as a new holst tab (or focus if already open).
@@ -711,99 +1093,175 @@ impl BeautifulApp {
         if let Some(existing) = self.open_canvases.find_path(path) {
             self.screen = AppScreen::Editor;
             self.focus_canvas_index(existing);
-            self.file
-                .set_status(format!("Focused {}", path.display()), false);
+            self.pending_reopen = Some(path.to_path_buf());
+            self.close_canvas_index(self.open_canvases.active_index());
+            if self.pending_close_canvas.is_none() && self.file.close_prompt.is_none() {
+                if let Some(path) = self.pending_reopen.take() {
+                    self.file.start_open(&path, crate::file::OpenIntent::NewCanvas);
+                }
+            }
             return;
         }
         if !self.open_canvases.can_open_more() {
-            self.file.set_status(
-                format!("Too many open canvases (max {MAX_OPEN_CANVASES}) — close a tab"),
-                true,
-            );
             return;
         }
-        match crate::file::FileState::load_path_document(path) {
-            Ok(mut doc) => {
-                doc.ensure_active_paintable();
-                let replace_primary = self.open_canvases.len() == 1
-                    && self.open_canvases.active().path.is_none()
-                    && !self.file.is_dirty(&self.document)
-                    && self.open_canvases.active().parked.is_none()
-                    && self.screen != AppScreen::Editor;
+        self.file.start_open(path, crate::file::OpenIntent::NewCanvas);
+    }
 
-                if replace_primary {
-                    self.tool_session
-                        .capture_from_document(&self.document, self.tool);
-                    self.document = doc;
-                    self.document.ensure_active_paintable();
-                    self.canvas.on_document_replaced();
-                    let title = open_canvas::title_from_path(path);
-                    self.workspace = Workspace::new_with_primary(
-                        &title,
-                        self.document.width,
-                        self.document.height,
-                    );
-                    self.file.path = Some(path.to_path_buf());
-                    self.file.push_library(path, Some(&self.document));
-                    self.file.mark_clean(&self.document);
-                    self.open_canvases.sync_active_meta(
-                        Some(path.to_path_buf()),
-                        title,
-                        self.document.edit_generation(),
-                        self.file.saved_edit_gen(),
-                    );
-                    self.file
-                        .set_status(format!("Opened {}", path.display()), false);
-                    self.screen = AppScreen::Editor;
-                    self.apply_tool_session();
-                    self.canvas.mark_dirty();
-                    self.spam_repaint_left = self.spam_repaint_left.max(2);
-                    return;
-                }
+    fn collect_txmh_workspace(
+        &self,
+    ) -> (
+        Vec<beautiful_core::Document>,
+        Vec<beautiful_core::TxmhSheetMeta>,
+        usize,
+    ) {
+        let focused = self.workspace.focused_index();
+        let mut docs = Vec::with_capacity(self.workspace.len());
+        let mut metas = Vec::with_capacity(self.workspace.len());
+        for (i, sheet) in self.workspace.sheets().iter().enumerate() {
+            let r = sheet.rect;
+            metas.push(beautiful_core::TxmhSheetMeta {
+                title: sheet.title.clone(),
+                rect: Some([r.min.x, r.min.y, r.max.x, r.max.y]),
+            });
+            let mut doc = if i == focused {
+                self.document.clone()
+            } else {
+                sheet
+                    .document
+                    .clone()
+                    .unwrap_or_else(|| beautiful_core::Document::new(64, 64))
+            };
+            doc.prepare_for_save();
+            docs.push(doc);
+        }
+        (docs, metas, focused)
+    }
 
-                if self.open_canvases.active().parked.is_none() {
-                    self.park_active_canvas();
-                }
-
-                let title = open_canvas::title_from_path(path);
-                let edit_gen = doc.edit_generation();
-                if let Err(msg) = self.open_canvases.push_active_new(
-                    title.clone(),
-                    Some(path.to_path_buf()),
-                    edit_gen,
-                    edit_gen,
-                ) {
-                    self.file.set_status(msg.to_string(), true);
-                    if let Some(parked) = self.open_canvases.activate(0) {
-                        self.install_parked_canvas(parked);
-                    }
-                    return;
-                }
-                self.document = doc;
-                self.canvas.on_document_replaced();
-                self.workspace =
-                    Workspace::new_with_primary(&title, self.document.width, self.document.height);
-                self.file.path = Some(path.to_path_buf());
-                self.file.push_library(path, Some(&self.document));
-                self.file.mark_clean(&self.document);
-                self.open_canvases.sync_active_meta(
-                    Some(path.to_path_buf()),
-                    title,
-                    self.document.edit_generation(),
-                    self.file.saved_edit_gen(),
-                );
-                self.open_canvases.cold_unload_excess();
-                self.file
-                    .set_status(format!("Opened {}", path.display()), false);
-                self.screen = AppScreen::Editor;
-                self.apply_tool_session();
-                self.canvas.mark_dirty();
-                self.spam_repaint_left = self.spam_repaint_left.max(2);
-            }
-            Err(e) => {
-                self.file.set_status(format!("Open failed: {e}"), true);
+    fn save_current_document(&mut self) {
+        if self.file.show_save_as || self.file.show_save_root_prompt {
+            return;
+        }
+        if self.file.can_native_save() {
+            if let Some(path) = self.file.path.clone() {
+                self.save_document_to(&path, crate::file::ExportFormat::Txmh);
+                return;
             }
         }
+        self.file.save_as_format = crate::file::ExportFormat::Txmh;
+        self.file.show_save_as = true;
+    }
+
+    fn save_document_to(&mut self, path: &std::path::Path, format: crate::file::ExportFormat) {
+        self.file.want_save = false;
+        let workspace = if matches!(format, crate::file::ExportFormat::Txmh) && self.workspace.len() > 1
+        {
+            Some(self.collect_txmh_workspace())
+        } else {
+            None
+        };
+        self.file.save_to_with_opts_and_workspace(
+            path,
+            &mut self.document,
+            format,
+            beautiful_core::RasterExportOpts::default(),
+            workspace,
+        );
+    }
+
+    fn install_open_complete(&mut self, opened: crate::file::OpenComplete) {
+        let crate::file::OpenComplete { path, intent, payload } = opened;
+        let (mut doc, loaded_workspace) = match payload {
+            crate::file::OpenPayload::Document(doc) => (doc, None),
+            crate::file::OpenPayload::Workspace(ws) => {
+                let multi = ws.sheets.len() > 1;
+                let mut workspace = Workspace::from_loaded_sheets(ws.sheets, ws.metas, ws.focused);
+                // install takes focused doc into app — do NOT clone (OOM on large TXMH).
+                workspace.install_focused_into_app(&mut self.document, &mut self.canvas);
+                let doc = std::mem::replace(&mut self.document, Document::new(64, 64));
+                (doc, multi.then_some(workspace))
+            }
+        };
+        doc.ensure_active_paintable();
+        let title = match &intent {
+            crate::file::OpenIntent::Recover { title } => format!("{} (recovered)", if title.is_empty() { "Recovered" } else { title }),
+            _ => open_canvas::title_from_path(&path),
+        };
+        let recovered = matches!(intent, crate::file::OpenIntent::Recover { .. });
+        let as_sheet = matches!(intent, crate::file::OpenIntent::NewSheet) && loaded_workspace.is_none();
+
+        if as_sheet {
+            let view = self.canvas.last_viewport;
+            self.workspace.add_and_focus(title.clone(), doc, CanvasState::new(), &mut self.document, &mut self.canvas, view);
+        } else {
+            let empty_tabs = self.open_canvases.has_no_tabs();
+            let replace_primary = !empty_tabs
+                && self.open_canvases.len() == 1
+                && self.open_canvases.active().path.is_none()
+                && self.screen != AppScreen::Editor;
+            if replace_primary {
+                // Replacing the sole untitled from Home — discard that tab's body.
+                let _ = self.open_canvases.take_active_parked();
+            } else if !empty_tabs && self.open_canvases.active().parked.is_none() {
+                self.park_active_canvas();
+            }
+            // If Home Warm-parked another canvas, leave it; open as an extra tab.
+            if empty_tabs || !replace_primary {
+                let edit = doc.edit_generation();
+                if self
+                    .open_canvases
+                    .push_active_new(
+                        title.clone(),
+                        if recovered { None } else { Some(path.clone()) },
+                        edit,
+                        if recovered {
+                            edit.wrapping_sub(1)
+                        } else {
+                            edit
+                        },
+                    )
+                    .is_err()
+                {
+                    self.file.set_status("Too many open canvases", true);
+                    return;
+                }
+            } else {
+                // replace_primary: reuse sole Untitled tab identity for the opened file.
+                let edit = doc.edit_generation();
+                self.open_canvases.sync_active_meta(
+                    if recovered { None } else { Some(path.clone()) },
+                    title.clone(),
+                    edit,
+                    if recovered {
+                        edit.wrapping_sub(1)
+                    } else {
+                        edit
+                    },
+                );
+            }
+            self.document = doc;
+            self.canvas.on_document_replaced();
+            self.workspace = loaded_workspace.unwrap_or_else(|| {
+                Workspace::new_with_primary(&title, self.document.width, self.document.height)
+            });
+            self.file.path = (!recovered).then_some(path.clone());
+        }
+        if recovered {
+            self.file.set_untitled_name_hint(title.clone());
+            self.file.set_saved_edit_gen(self.document.edit_generation().wrapping_sub(1));
+        } else {
+            self.file.push_library(&path, Some(&self.document));
+            self.file.mark_clean(&self.document);
+        }
+        self.sync_active_canvas_meta();
+        self.screen = AppScreen::Editor;
+        self.home_tab_focused = false;
+        self.apply_tool_session();
+        self.canvas.mark_dirty();
+        self.spam_repaint_left = self.spam_repaint_left.max(2);
+        self.document
+            .queue_eye_snap_warm(self.document.active_layer);
+        self.eye_warm_next_at = 0.0;
     }
 
     fn flush_visibility_coalesce(&mut self) {
@@ -814,28 +1272,148 @@ impl BeautifulApp {
         for (idx, vis) in self.layer_ui.pending_visibility.drain(..) {
             last.insert(idx, vis);
         }
+        let mut any_display = false;
         for (idx, vis) in last {
             crate::perf::begin_action(format!("ui.layer_visible[{idx}]={vis}"));
             let _s = crate::perf::Scope::new(
                 crate::perf::Category::Visibility,
                 "visibility.set",
             );
-            // Always go through set_layer_visible (folder descendants + dirty rect).
-            self.document.set_layer_visible(idx, vis);
+            // Gradient-style present: mark dirty only; empty layers return false.
+            if self.document.set_layer_visible(idx, vis) {
+                any_display = true;
+                // Pre-warm reverse toggle (on/off snap) on next idle tick.
+                self.document.queue_eye_snap_warm(idx);
+            }
             let pending = self.document.composite.has_pending_work();
             let dirty_px = dirty_area_px(&self.document);
             crate::perf::end_action(pending, dirty_px);
         }
-        // Only reblend the current viewport — drop outside dirty so Dense does not
-        // idle-drain the whole layer (was ~70% sticky CPU after eye).
+        if !any_display {
+            return;
+        }
+        // Full visual footprint before confine — keep-ring outside cover must not
+        // keep pre-toggle GPU tiles (pan would show ghosts).
+        let mut footprint = beautiful_core::DirtyRect::empty();
+        if !self.document.composite.dirty.is_empty() {
+            footprint.union(self.document.composite.dirty);
+        }
+        for r in &self.document.composite.dirty_parts {
+            footprint.union(*r);
+        }
+        // Peer policy: composite only the present cover (view + DISPLAY_VIEW_PAD).
+        // Do NOT snap to 512 here — that expanded sandwich ROI and spiked eye CPU.
         let view = self.canvas.view_dirty_rect(&self.document);
-        self.document.composite.confine_pending_to_view(view);
+        let (dw, dh) = (self.document.width, self.document.height);
+        let cover = view.padded(beautiful_core::DISPLAY_VIEW_PAD, dw, dh);
+        self.document.composite.confine_pending_to_view(cover);
+        // Drop off-cover defer — idle drain of eye footprints thrashes CPU (idle rule).
         self.document.composite.offscreen_dirty.clear();
-        // Defer navigator rebuild — eye spam must not rebuild thumbs every flip.
+        self.canvas.queue_visibility_gpu_refresh(footprint, cover);
+        self.document.thaw_pending_visibility_tiles();
         self.canvas.defer_nav_thumbs();
         self.canvas.mark_dirty();
-        // One wake frame so sandwich/GPU upload runs without sticky repaint.
-        self.spam_repaint_left = self.spam_repaint_left.max(1);
+        self.spam_repaint_left = self.spam_repaint_left.max(2);
+        self.visibility_park_cooldown = self.visibility_park_cooldown.max(90);
+    }
+
+    /// Drop Tab before egui's pass so menus never steal it for widget focus.
+    /// Toggle hide-UI here when Tab is the bound shortcut (Focus runs before `update`).
+    fn consume_tab_for_ui_chrome(&mut self, raw_input: &mut egui::RawInput) {
+        if self.prefs.is_capturing_shortcut() || self.prefs.is_capturing_gamepad() {
+            return;
+        }
+        if self.document.text_editing.is_some() {
+            return;
+        }
+        let mut tab_shift: Option<bool> = None;
+        raw_input.events.retain(|ev| {
+            let egui::Event::Key {
+                key: egui::Key::Tab,
+                pressed,
+                modifiers,
+                ..
+            } = ev
+            else {
+                return true;
+            };
+            if modifiers.ctrl || modifiers.alt || modifiers.command {
+                return true;
+            }
+            if *pressed && tab_shift.is_none() {
+                tab_shift = Some(modifiers.shift);
+            }
+            false
+        });
+        let Some(shift) = tab_shift else {
+            return;
+        };
+        if self
+            .settings
+            .keymap
+            .is_plain_tab_binding(crate::keymap::Action::ToggleUiChrome, shift)
+        {
+            self.ui_chrome_hidden = !self.ui_chrome_hidden;
+        }
+    }
+
+    fn toggle_ui_chrome_if_requested(&mut self, ctx: &egui::Context) {
+        if self.prefs.is_capturing_shortcut() || self.prefs.is_capturing_gamepad() {
+            return;
+        }
+        if self.document.text_editing.is_some() {
+            return;
+        }
+        // Do not use wants_keyboard_input(): menu chips count as focused and
+        // that used to swallow Tab before hide-UI.
+        let hit = ctx.input_mut(|i| {
+            self.settings
+                .keymap
+                .consume_pressed(i, crate::keymap::Action::ToggleUiChrome)
+        });
+        if hit {
+            self.ui_chrome_hidden = !self.ui_chrome_hidden;
+        }
+    }
+
+    fn sync_ui_chrome_fullscreen(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if self.ui_chrome_hidden == self.ui_chrome_fullscreen {
+            return;
+        }
+        if self.ui_chrome_hidden {
+            self.ui_chrome_restore_maximized =
+                ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+            #[cfg(windows)]
+            {
+                // Do not use ViewportCommand::Fullscreen: winit posts SetWindowPos
+                // asynchronously, and DxgiFromVisual never re-binds the DComp visual.
+                self.ui_chrome_saved_placement = crate::os_win::cover_monitor(frame);
+            }
+            #[cfg(not(windows))]
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+            }
+            self.window_geom_settle = self.window_geom_settle.max(8);
+        } else {
+            #[cfg(windows)]
+            {
+                if let Some(saved) = self.ui_chrome_saved_placement.take() {
+                    crate::os_win::restore_window(frame, saved);
+                }
+                // Do not persist the cover-monitor size while GetClientRect lags.
+                self.window_geom_settle = self.window_geom_settle.max(8);
+            }
+            #[cfg(not(windows))]
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                if self.ui_chrome_restore_maximized {
+                    self.pending_maximize = true;
+                    self.window_geom_settle = self.window_geom_settle.max(6);
+                }
+            }
+        }
+        self.ui_chrome_fullscreen = self.ui_chrome_hidden;
+        ctx.request_repaint();
     }
 
     fn handle_file_shortcuts(&mut self, ctx: &egui::Context) {
@@ -883,38 +1461,39 @@ impl BeautifulApp {
             }
         });
         if save {
-            self.file.save(&mut self.document);
+            self.save_current_document();
         }
         if open {
             self.open_canvas_from_dialog();
         }
         if new_doc {
-            if self.screen == AppScreen::Editor {
-                self.park_active_canvas();
-                let _ = self
-                    .open_canvases
-                    .push_active_new("Untitled".into(), None, 0, 0);
-                self.workspace = Workspace::new_with_primary("Untitled", 2000, 1500);
-                self.document = Document::new(2000, 1500);
-                self.apply_tool_session();
-                self.canvas.on_document_replaced();
-                self.file.path = None;
-                self.file.mark_clean(&self.document);
-            }
+            // Dialog only — do not push a 2000×1500 phantom tab first.
             self.file.open_new_dialog("");
         }
-        if paste {
-            let had_image = self
-                .file
-                .paste_clipboard(&mut self.document, &mut self.canvas);
-            // Text-only paste: re-inject so focused TextEdit still receives it.
-            if !had_image && !paste_text.is_empty() {
-                ctx.input_mut(|input| {
-                    input.events.push(egui::Event::Paste(paste_text.clone()));
-                });
+        let live_canvas = self.screen == AppScreen::Editor
+            && !self.home_tab_focused
+            && !self.open_canvases.has_no_tabs();
+        if paste && live_canvas {
+            if self.document.text_editing.is_some() {
+                // Keep paste for the text caret (handle_text_keys).
+                if !paste_text.is_empty() {
+                    ctx.input_mut(|input| {
+                        input.events.push(egui::Event::Paste(paste_text.clone()));
+                    });
+                }
+            } else {
+                let had_image = self
+                    .file
+                    .paste_clipboard(&mut self.document, &mut self.canvas);
+                // Text-only paste: re-inject so focused TextEdit still receives it.
+                if !had_image && !paste_text.is_empty() {
+                    ctx.input_mut(|input| {
+                        input.events.push(egui::Event::Paste(paste_text.clone()));
+                    });
+                }
             }
         }
-        if copy {
+        if copy && live_canvas && self.document.text_editing.is_none() {
             self.file.copy_clipboard(&mut self.document);
         }
     }
@@ -974,6 +1553,61 @@ impl BeautifulApp {
             let _ = reply.send(value);
             ctx.request_repaint();
         }
+    }
+
+    /// Display-tile freshness for MCP / F12 (GPU inventory + CPU flags).
+    fn present_tile_report(&self) -> Value {
+        let view = self.canvas.view_dirty_rect(&self.document);
+        let (dw, dh) = (self.document.width, self.document.height);
+        let cover = view.padded(beautiful_core::DISPLAY_VIEW_PAD, dw, dh);
+        let cpu = self.canvas.tile_present_cpu_json();
+        let mut gpu = if let Some(rs) = self.wgpu_rs.as_ref() {
+            crate::canvas_gpu::display_tile_gpu_report(
+                rs,
+                cover,
+                dw,
+                dh,
+                self.document.content_revision,
+                self.canvas.display_tile_epoch(),
+            )
+        } else {
+            json!({
+                "gpu": false,
+                "cover_ready": false,
+                "cover_empty": cover.is_empty(),
+                "present": "display_tiles",
+                "mip_present": "retired",
+            })
+        };
+        if let Some(obj) = gpu.as_object_mut() {
+            obj.insert("cpu".into(), cpu);
+            obj.insert(
+                "cover".into(),
+                json!({
+                    "x0": cover.x0,
+                    "y0": cover.y0,
+                    "x1": cover.x1,
+                    "y1": cover.y1,
+                }),
+            );
+            obj.insert(
+                "content_revision".into(),
+                json!(self.document.content_revision),
+            );
+            obj.insert(
+                "live_pending".into(),
+                json!(self.document.composite.has_live_pending_work()),
+            );
+            obj.insert(
+                "pending".into(),
+                json!(self.document.composite.has_pending_work()),
+            );
+            obj.insert(
+                "canvas_dirty".into(),
+                json!(self.canvas.is_dirty()),
+            );
+        }
+        gpu
     }
 
     fn handle_mcp_cmd(&mut self, cmd: McpCommand, ctx: &egui::Context) -> Value {
@@ -1052,8 +1686,36 @@ impl BeautifulApp {
                     crate::perf::end_action(false, 0);
                     return json!({"ok": false, "error": "idx out of range"});
                 }
-                self.document.set_layer_visible(idx, visible);
+                if !self.document.set_layer_visible(idx, visible) {
+                    // Empty / no-op eye — flag flipped, no GPU wake.
+                    crate::perf::end_action(false, 0);
+                    return json!({
+                        "ok": true,
+                        "idx": idx,
+                        "visible": visible,
+                        "revision": self.document.revision,
+                        "noop": true,
+                    });
+                }
+                let mut footprint = beautiful_core::DirtyRect::empty();
+                if !self.document.composite.dirty.is_empty() {
+                    footprint.union(self.document.composite.dirty);
+                }
+                for r in &self.document.composite.dirty_parts {
+                    footprint.union(*r);
+                }
+                let view = self.canvas.view_dirty_rect(&self.document);
+                let (dw, dh) = (self.document.width, self.document.height);
+                let cover = view.padded(beautiful_core::DISPLAY_VIEW_PAD, dw, dh);
+                self.document.composite.confine_pending_to_view(cover);
+                // Match UI flush: no 512 snap (keeps sandwich ROI tight), no offscreen drain.
+                self.document.composite.offscreen_dirty.clear();
+                self.canvas.queue_visibility_gpu_refresh(footprint, cover);
+                self.document.thaw_pending_visibility_tiles();
+                self.canvas.defer_nav_thumbs();
                 self.canvas.mark_dirty();
+                self.spam_repaint_left = self.spam_repaint_left.max(2);
+                self.visibility_park_cooldown = self.visibility_park_cooldown.max(90);
                 let pending = self.document.composite.has_pending_work();
                 let dirty_px = dirty_area_px(&self.document);
                 crate::perf::end_action(pending, dirty_px);
@@ -1094,9 +1756,13 @@ impl BeautifulApp {
                             crate::perf::Category::Composite,
                             "visibility.burst_sync",
                         );
-                        // Match UI path: viewport sync (atomic), not budgeted full-doc.
+                        // Match UI flush: confine cover, no 512 snap.
                         let view = self.canvas.view_dirty_rect(&self.document);
-                        let _ = self.document.sync_display_view(view, 128);
+                        let (dw, dh) = (self.document.width, self.document.height);
+                        let cover = view.padded(beautiful_core::DISPLAY_VIEW_PAD, dw, dh);
+                        self.document.composite.confine_pending_to_view(cover);
+                        self.document.composite.offscreen_dirty.clear();
+                        let _ = self.document.sync_display_view(view, beautiful_core::DISPLAY_VIEW_PAD);
                         sync_ms += s0.elapsed().as_secs_f64() * 1000.0;
                     }
                 }
@@ -1194,7 +1860,9 @@ impl BeautifulApp {
                     "ping", "open_path", "open_library_match", "list_layers",
                     "set_layer_visible", "toggle_layer_burst", "draw_stroke",
                     "spam_repaint", "show_profiler", "caps", "bench_begin", "bench_end",
-                    "wait_frames", "perf_snapshot", "perf_reset", "get_view", "quit"
+                    "wait_frames", "perf_snapshot", "perf_reset", "get_view",
+                    "set_zoom", "tile_status", "gradient_begin", "gradient_commit",
+                    "gradient_cancel", "quit"
                 ],
                 "categories": crate::perf::Category::ALL.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                 "pipeline_spans": crate::perf::PIPELINE_SPANS,
@@ -1242,20 +1910,141 @@ impl BeautifulApp {
                     "dirty": !self.document.composite.dirty.is_empty(),
                     "offscreen": !self.document.composite.offscreen_dirty.is_empty(),
                     "pending": self.document.composite.has_pending_work(),
+                    "live_pending": self.document.composite.has_live_pending_work(),
                     "zoom": self.canvas.zoom,
+                    "zoom_percent": self.canvas.zoom * 100.0,
                     "fps": self.fps,
                     "profiler_open": self.perf_ui_open,
+                    "content_revision": self.document.content_revision,
+                    "tiles": self.present_tile_report(),
+                    "present": "display_tiles",
+                    "mip_present": "retired",
                 }))
             }
             McpCommand::GetView => json!({
                 "ok": true,
                 "zoom": self.canvas.zoom,
+                "zoom_percent": self.canvas.zoom * 100.0,
                 "revision": self.document.revision,
+                "content_revision": self.document.content_revision,
                 "width": self.document.width,
                 "height": self.document.height,
                 "screen": format!("{:?}", self.screen),
                 "path": self.file.path.as_ref().map(|p| p.display().to_string()),
+                "live_pending": self.document.composite.has_live_pending_work(),
+                "pending": self.document.composite.has_pending_work(),
+                "dirty": !self.document.composite.dirty.is_empty(),
+                "offscreen": !self.document.composite.offscreen_dirty.is_empty(),
+                "canvas_dirty": self.canvas.is_dirty(),
+                "present": "display_tiles",
+                "mip_present": "retired",
+                "tiles": self.present_tile_report(),
             }),
+            McpCommand::SetZoom { percent, fit } => {
+                let (dw, dh) = self.document.canvas_size();
+                let dw = dw as f32;
+                let dh = dh as f32;
+                if fit {
+                    self.canvas.fit_to_view(dw, dh);
+                } else if let Some(pct) = percent {
+                    let pivot = if self.canvas.last_viewport.is_positive() {
+                        Some(self.canvas.last_viewport.center())
+                    } else {
+                        None
+                    };
+                    let center = pivot.unwrap_or(egui::Pos2::ZERO);
+                    self.canvas.set_zoom_percent(pct, pivot, center, dw, dh);
+                }
+                ctx.request_repaint();
+                json!({
+                    "ok": true,
+                    "zoom": self.canvas.zoom,
+                    "zoom_percent": self.canvas.zoom * 100.0,
+                    "fit": fit,
+                })
+            }
+            McpCommand::TileStatus => {
+                let mut report = self.present_tile_report();
+                if let Some(obj) = report.as_object_mut() {
+                    obj.insert("ok".into(), json!(true));
+                }
+                ctx.request_repaint();
+                report
+            }
+            McpCommand::GradientBegin { x0, y0, x1, y1 } => {
+                if self.screen != AppScreen::Editor {
+                    return json!({"ok": false, "error": "not in editor"});
+                }
+                if !self.document.require_paintable("Градиент") {
+                    return json!({
+                        "ok": false,
+                        "error": "active layer is not paintable",
+                    });
+                }
+                if self.canvas.gradient_session.is_some() {
+                    self.canvas.cancel_gradient_session(&mut self.document);
+                }
+                self.tool_session.tool = WorkspaceTool::Gradient;
+                self.tool = WorkspaceTool::Gradient;
+                let idx = self.document.active_layer;
+                let before = self.document.layers[idx].tiles.clone_shared();
+                let start = self.document.buffer_to_view(x0, y0);
+                let end = self.document.buffer_to_view(x1, y1);
+                self.document.selection.ensure_mask();
+                let clip = crate::canvas::gradient_clip_from_document(&self.document);
+                self.canvas.gradient_session = Some(crate::canvas::GradientSession {
+                    layer_idx: idx,
+                    layer_before: before,
+                    start,
+                    end,
+                    defining: false,
+                    drag: None,
+                    clip,
+                    cpu_preview: false,
+                });
+                ctx.request_repaint();
+                json!({
+                    "ok": true,
+                    "layer": idx,
+                    "x0": x0,
+                    "y0": y0,
+                    "x1": x1,
+                    "y1": y1,
+                    "revision": self.document.revision,
+                    "content_revision": self.document.content_revision,
+                })
+            }
+            McpCommand::GradientCommit => {
+                if self.canvas.gradient_session.is_none() {
+                    return json!({"ok": false, "error": "no gradient session"});
+                }
+                crate::perf::begin_action("gradient_commit");
+                self.canvas.confirm_gradient_session(&mut self.document);
+                let pending = self.document.composite.has_pending_work();
+                crate::perf::end_action(pending, dirty_area_px(&self.document));
+                ctx.request_repaint();
+                json!({
+                    "ok": true,
+                    "revision": self.document.revision,
+                    "content_revision": self.document.content_revision,
+                    "pending": pending,
+                    "live_pending": self.document.composite.has_live_pending_work(),
+                    "tiles": self.present_tile_report(),
+                })
+            }
+            McpCommand::GradientCancel => {
+                if self.canvas.gradient_session.is_none() {
+                    return json!({"ok": false, "error": "no gradient session"});
+                }
+                self.canvas.cancel_gradient_session(&mut self.document);
+                ctx.request_repaint();
+                json!({
+                    "ok": true,
+                    "cancelled": true,
+                    "revision": self.document.revision,
+                    "content_revision": self.document.content_revision,
+                })
+            }
             McpCommand::Quit => {
                 self.mcp_quit = true;
                 json!({"ok": true, "quitting": true})
@@ -1306,9 +2095,29 @@ fn native_open_dialog(
         dialog = dialog.add_filter("BMP", &["bmp"]);
         combined.push("bmp");
     }
+    if formats.tga {
+        dialog = dialog.add_filter("TGA", &["tga"]);
+        combined.push("tga");
+    }
     if formats.webp {
         dialog = dialog.add_filter("WebP", &["webp"]);
         combined.push("webp");
+    }
+    if formats.gif {
+        dialog = dialog.add_filter("GIF", &["gif"]);
+        combined.push("gif");
+    }
+    if formats.tiff {
+        dialog = dialog.add_filter("TIFF", &["tif", "tiff"]);
+        combined.extend(["tif", "tiff"]);
+    }
+    if formats.ico {
+        dialog = dialog.add_filter("ICO", &["ico"]);
+        combined.push("ico");
+    }
+    if formats.svg {
+        dialog = dialog.add_filter("SVG", &["svg"]);
+        combined.push("svg");
     }
     if !combined.is_empty() {
         dialog = dialog.add_filter("Enabled formats", &combined);
@@ -1353,6 +2162,24 @@ fn native_save_path(
         crate::file::ExportFormat::Jpeg => {
             dialog = dialog.add_filter("JPEG", &["jpg", "jpeg"]);
         }
+        crate::file::ExportFormat::Bmp => {
+            dialog = dialog.add_filter("BMP", &["bmp"]);
+        }
+        crate::file::ExportFormat::Tga => {
+            dialog = dialog.add_filter("TGA", &["tga"]);
+        }
+        crate::file::ExportFormat::Webp => {
+            dialog = dialog.add_filter("WebP", &["webp"]);
+        }
+        crate::file::ExportFormat::Gif => {
+            dialog = dialog.add_filter("GIF", &["gif"]);
+        }
+        crate::file::ExportFormat::Tiff => {
+            dialog = dialog.add_filter("TIFF", &["tif", "tiff"]);
+        }
+        crate::file::ExportFormat::Ico => {
+            dialog = dialog.add_filter("ICO", &["ico"]);
+        }
     }
     let _ = formats;
     if let Some(p) = start.and_then(|p| p.parent()) {
@@ -1367,10 +2194,10 @@ impl eframe::App for BeautifulApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         let solid = crate::debug_flags::opaque_window()
             || matches!(
-                self.settings.material,
+                self.settings.material.normalize(),
                 crate::settings::UiMaterial::Solid
             )
-            || !crate::os_win::dwm_backdrop_supported();
+            || !crate::os_win::backdrop_supported();
         if solid {
             let c = self.settings.app_color;
             [
@@ -1386,20 +2213,19 @@ impl eframe::App for BeautifulApp {
     }
 
     fn on_exit(&mut self) {
-        crate::perf_ui::flush_on_exit();
-        self.autosave.shutdown_clean(&self.settings);
-        self.dock.save();
-        let _ = self.settings.save();
+        self.force_quit();
     }
 
     /// Brush stamps run here (before panel layout). Still frame-bound by eframe:
     /// `CursorMoved` → queue → `RedrawRequested` → hook → update → present.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.consume_tab_for_ui_chrome(raw_input);
         // Preferences / filter / canvas-size / file browser: never stamp while chrome is modal.
         if self.prefs.open
             || self.filters.dialog_open()
             || self.filters.canvas_size_open
             || self.filter_studio.is_open()
+            || self.export_studio.is_open()
             || self.file_browser.open
         {
             return;
@@ -1419,9 +2245,8 @@ impl eframe::App for BeautifulApp {
                 hand,
             )
         };
-        // Full-rate wake only while actually stamping. Idle brush-ring updates
-        // are paced by egui-winit CursorMoved throttle (~30 Hz) — do not
-        // request_repaint on every hover move (was ~6% CPU vs peers ~2%).
+        // Full-rate wake while stamping. Hover ring is woken by egui-winit
+        // CursorMoved / MouseMotion (Fifo present caps FPS).
         if painted {
             ctx.request_repaint();
         } else if matches!(self.tool, WorkspaceTool::Gradient)
@@ -1444,9 +2269,14 @@ impl eframe::App for BeautifulApp {
         theme::apply(ctx);
         self.theme_applied = true;
 
-        // —— Cold start: main window already visible; Loading bar while we finish ——
-        // Progress advances only when a boot step completes (not a timer).
+        // Pads do not post Win32/Wayland messages — poll even during splash so
+        // XInput is attached before the editor, then wake the idle loop.
+        self.gamepad.poll();
+
+        // —— Cold start only: Loading bar while deferred GPU/addons finish ——
+        // Ends after Warmup. No second full-screen phase over gallery/editor.
         if !self.boot.is_ready() {
+            self.handle_window_close_request(ctx);
             if self.boot.settle_frames > 0 {
                 self.boot.settle_frames -= 1;
             } else {
@@ -1460,20 +2290,42 @@ impl eframe::App for BeautifulApp {
         }
 
         self.drain_mcp(ctx);
+        self.gamepad.schedule_wake(ctx);
+        if !self.prefs.is_capturing_gamepad()
+            && self
+                .gamepad
+                .frame()
+                .action_pressed(&self.settings.keymap, crate::keymap::GamepadAction::ToggleDrawMode)
+        {
+            use crate::keymap::GamepadDrawMode;
+            let mode = &mut self.settings.keymap.gamepad_feel.draw_mode;
+            *mode = match *mode {
+                GamepadDrawMode::Center => GamepadDrawMode::Sticks,
+                GamepadDrawMode::Sticks => GamepadDrawMode::Center,
+            };
+        }
         self.flush_visibility_coalesce();
-        // Deferred cold-park: never on the eye-click path (was ~500ms zstd).
-        if !self.canvas.is_drawing()
+        // Deferred cold-park: never on the same frame as eye present.
+        if self.visibility_park_cooldown > 0 {
+            self.visibility_park_cooldown -= 1;
+        }
+        // Eye snaps fill on first toggle (EyeSnapStore). Do not idle-wake for
+        // plate pre-warm — that destroyed snaps and spun CPU every 500ms.
+        if self.document.active_layer != self.last_active_for_eye_warm {
+            self.last_active_for_eye_warm = self.document.active_layer;
+        }
+        if self.visibility_park_cooldown == 0
+            && !self.canvas.is_drawing()
             && self.layer_ui.pending_visibility.is_empty()
             && !ctx.input(|i| i.pointer.any_down())
         {
             let n = self.document.park_hidden_layers_idle(24);
             if n > 0 {
-                // Keep draining over subsequent idle frames.
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
         }
         if self.mcp_quit {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.force_quit();
         }
 
         if ctx.input(|i| {
@@ -1486,9 +2338,14 @@ impl eframe::App for BeautifulApp {
                 crate::perf::set_mode(crate::perf::Mode::Hud);
             }
         }
+        self.toggle_ui_chrome_if_requested(ctx);
+        self.sync_ui_chrome_fullscreen(ctx, frame);
         if self.spam_repaint_left > 0 {
             self.spam_repaint_left -= 1;
             ctx.request_repaint();
+        }
+        if self.perf_ui_open || self.mcp.is_some() {
+            crate::perf::note_present(self.present_tile_report());
         }
         crate::perf_ui::show(ctx, &mut self.perf_ui_open);
 
@@ -1503,10 +2360,12 @@ impl eframe::App for BeautifulApp {
                 self.window_geom_settle = 4;
                 ctx.request_repaint();
             }
-        } else {
+        } else if !self.ui_chrome_hidden {
             sync_window_geometry(ctx, &mut self.settings, &mut self.window_geom_dirty);
         }
-        handle_frameless_resize_borders(ctx);
+        if !self.ui_chrome_hidden {
+            handle_frameless_resize_borders(ctx, false);
+        }
 
         // Frame timing (egui stable_dt) → smoothed FPS readout.
         let dt = ctx.input(|i| i.stable_dt).clamp(1e-4, 0.5);
@@ -1514,27 +2373,40 @@ impl eframe::App for BeautifulApp {
         let inst = 1.0 / dt;
         self.fps = self.fps * 0.9 + inst * 0.1;
         self.file.add_app_time(dt);
-        let opened_async = self.file.poll_open(&mut self.document, &mut self.canvas);
-        if self.file.is_opening() {
+        let opened_async = self.file.poll_open();
+        if self.file.is_opening()
+            || self.filters.is_applying()
+            || self.filter_studio.is_applying()
+        {
             ctx.request_repaint();
         }
 
-        // Autosave while editing a dirty document.
-        if self.screen == AppScreen::Editor {
+        let saved_async = self.file.poll_save(&self.document);
+        if saved_async || self.file.is_saving() {
+            ctx.request_repaint();
+        }
+
+        self.autosave.poll(&self.settings);
+        if self.screen == AppScreen::Editor && !self.open_canvases.has_no_tabs() {
             let title = self.file.display_name();
-            self.autosave.tick(
+            if let Some(wake) = self.autosave.tick(
                 &self.settings,
+                self.open_canvases.active().id.0,
                 &self.document,
                 &title,
                 self.file.path.as_deref(),
                 self.document.edit_generation(),
                 self.file.is_dirty(&self.document),
-            );
+            ) {
+                ctx.request_repaint_after(wake);
+            }
+        } else if self.autosave.is_busy() {
+            ctx.request_repaint();
         }
-        if opened_async {
-            self.document.ensure_active_paintable();
-            self.screen = AppScreen::Editor;
-            self.canvas.mark_dirty();
+
+        self.handle_window_close_request(ctx);
+        if let Some(opened) = opened_async {
+            self.install_open_complete(opened);
         }
 
         // OS file drop (winit → egui DroppedFile): paths only, open on main thread.
@@ -1543,8 +2415,11 @@ impl eframe::App for BeautifulApp {
         // Idle drain: composite offscreen bands directly (no view bounce / no wipe).
         // Roi has no full-doc buffer — discard any legacy offscreen backlog so we
         // do not spin request_repaint forever (was ~8% sticky idle CPU).
+        // After eye/opacity, confine defers off-cover work here; drain after the
+        // short park cooldown so the UI thread is not fighting the first frames.
         self.document.composite.discard_non_live_work();
-        if !self.canvas.is_drawing()
+        if self.visibility_park_cooldown == 0
+            && !self.canvas.is_drawing()
             && !self.document.composite.is_roi()
             && !self.document.composite.offscreen_dirty.is_empty()
         {
@@ -1585,23 +2460,24 @@ impl eframe::App for BeautifulApp {
             }
         }
 
-        // Wake only while live pending work can progress (dirty / gpu upload).
-        // Offscreen-only backlog: paced wake (not every frame) so idle hover near
-        // a float does not spin ~80% CPU while Dense backfills.
-        if self.document.composite.has_pending_work() && !self.canvas.is_drawing() {
-            let only_offscreen = !self.document.composite.is_roi()
-                && self.document.composite.dirty.is_empty()
-                && self.document.composite.dirty_parts.is_empty()
-                && !self.document.composite.force_full
-                && self.document.composite.gpu_dirty.is_empty()
-                && self.document.composite.gpu_dirty_parts.is_empty()
-                && !self.document.composite.offscreen_dirty.is_empty();
+        // Progressive eye present: wake next cell after GPU upload (no 33ms throttle).
+        if self.document.eye_fill_pending() && !self.canvas.is_drawing() {
             crate::perf::bump("count.request_repaint");
-            if only_offscreen {
-                ctx.request_repaint_after(std::time::Duration::from_millis(33));
-            } else {
-                ctx.request_repaint();
-            }
+            ctx.request_repaint();
+        } else if self.document.eye_repaint_needed() && !self.canvas.is_drawing() {
+            crate::perf::bump("count.request_repaint");
+            ctx.request_repaint_after(std::time::Duration::from_millis(
+                beautiful_core::Document::EYE_WARM_REPAINT_MS,
+            ));
+        } else if self.document.composite.has_live_pending_work() && !self.canvas.is_drawing() {
+            crate::perf::bump("count.request_repaint");
+            ctx.request_repaint();
+        } else if !self.document.composite.is_roi()
+            && !self.document.composite.offscreen_dirty.is_empty()
+            && !self.canvas.is_drawing()
+        {
+            crate::perf::bump("count.request_repaint");
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
         self.resource_tick += dt;
@@ -1619,14 +2495,20 @@ impl eframe::App for BeautifulApp {
         if let Some((msg, err)) = self.document.take_notice() {
             self.file.set_status(msg, err);
         }
-        let saved_async = self.file.poll_save(&self.document);
-        if saved_async || self.file.is_saving() {
-            ctx.request_repaint();
-        }
-        theme::paint_app_gradient(ctx);
+        theme::paint_app_gradient(
+            ctx,
+            if self.canvas.last_viewport.is_positive() {
+                Some(self.canvas.last_viewport)
+            } else {
+                None
+            },
+        );
 
         self.update_checker.poll();
         if let Some(offer) = self.update_checker.pending().cloned() {
+            if self.ui_chrome_hidden {
+                // Banner is chrome — keep the offer queued until UI is shown again.
+            } else {
             let mut open = false;
             let mut dismiss = false;
             egui::TopBottomPanel::top("update_offer_banner")
@@ -1673,6 +2555,7 @@ impl eframe::App for BeautifulApp {
             if dismiss {
                 self.update_checker.dismiss();
             }
+            }
         }
 
         let mut go_gallery = false;
@@ -1686,56 +2569,14 @@ impl eframe::App for BeautifulApp {
         }
 
         if self.screen == AppScreen::Gallery {
-            // Crash recovery banner — home screen, not canvas.
-            if !self.autosave.pending_recover.is_empty() {
-                let mut open_recover: Option<std::path::PathBuf> = None;
-                let mut dismiss_all = false;
-                egui::TopBottomPanel::top("recover_banner")
-                    .exact_height(72.0)
-                    .frame(
-                        egui::Frame::new()
-                            .fill(egui::Color32::from_rgb(48, 36, 28))
-                            .inner_margin(egui::Margin::symmetric(12, 8))
-                            .stroke(egui::Stroke::new(1.0_f32, theme::ACCENT)),
-                    )
-                    .show(ctx, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    egui::RichText::new("Recover files")
-                                        .strong()
-                                        .color(theme::text()),
-                                );
-                                ui.label(theme::label_dim(
-                                    "Previous session did not quit cleanly. Open a snapshot or dismiss.",
-                                ));
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if theme::btn(ui, theme::label("Dismiss all")).clicked() {
-                                    dismiss_all = true;
-                                }
-                                for entry in self.autosave.pending_recover.iter().rev().take(4) {
-                                    let label = format!("Open “{}”", entry.title);
-                                    if theme::btn(ui, theme::label(&label)).clicked() {
-                                        open_recover = Some(entry.path.clone());
-                                    }
-                                }
-                            });
-                        });
-                    });
-                if dismiss_all {
-                    self.autosave.dismiss_recover(&self.settings);
-                }
-                if let Some(path) = open_recover {
-                    if let Some(entry) = self.autosave.take_recover(&path, &self.settings) {
-                        self.open_recovered_canvas(&entry);
-                    }
-                }
-            }
             let mut request_new_sheet = false;
             let mut request_open_canvas = false;
             let mut request_new_canvas = false;
             let mut request_open_paths: Vec<std::path::PathBuf> = Vec::new();
+            self.filters
+                .set_apply_targets(&self.document, &self.layer_ui.selected);
+            self.filter_studio
+                .set_apply_targets(&self.document, &self.layer_ui.selected);
             ui::top_menu(
                 ctx,
                 &mut self.dock,
@@ -1755,7 +2596,84 @@ impl eframe::App for BeautifulApp {
                 &mut request_new_canvas,
                 &mut request_open_paths,
                 &mut self.filter_studio,
+                &mut self.ui_chrome_hidden,
             );
+            self.sync_ui_chrome_fullscreen(ctx, frame);
+            if !self.prefs.is_capturing_gamepad()
+                && ctx.input(|input| {
+                    self.settings
+                        .keymap
+                        .pressed(input, crate::keymap::Action::Preferences)
+                })
+            {
+                self.prefs.open = true;
+            }
+            // Recover banner sits *below* the title bar (close/min live in the drag strip).
+            if !self.ui_chrome_hidden && !self.autosave.pending_recover.is_empty() {
+                let mut open_recover: Option<std::path::PathBuf> = None;
+                let mut dismiss_all = false;
+                egui::TopBottomPanel::top("recover_banner")
+                    .exact_height(72.0)
+                    .frame(
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgb(48, 36, 28))
+                            .inner_margin(egui::Margin::symmetric(12, 8))
+                            .stroke(egui::Stroke::new(1.0_f32, theme::ACCENT)),
+                    )
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Recover unsaved work")
+                                        .strong()
+                                        .color(theme::text()),
+                                );
+                                ui.label(theme::label_dim(
+                                    "Beautiful did not quit cleanly (crash or kill). Restore the last autosave of that session — your last Save on disk is untouched.",
+                                ));
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if theme::btn(ui, theme::label("Dismiss all")).clicked() {
+                                    dismiss_all = true;
+                                }
+                                for entry in self.autosave.pending_recover.iter().rev().take(4) {
+                                    let label = if let Some(orig) = entry.original.as_ref().and_then(|p| p.file_stem()).and_then(|s| s.to_str()) {
+                                        format!("Restore “{orig}”")
+                                    } else {
+                                        format!("Restore “{}”", entry.title)
+                                    };
+                                    let resp = theme::btn(ui, theme::label(&label));
+                                    if resp.hovered() {
+                                        if let Some(preview) = beautiful_core::load_file_preview_max(&entry.path, 180) {
+                                            let tex = ui.ctx().load_texture(
+                                                format!("recover_preview_{}", entry.path.display()),
+                                                egui::ColorImage::from_rgba_unmultiplied(
+                                                    [preview.width as usize, preview.height as usize],
+                                                    &preview.rgba,
+                                                ),
+                                                egui::TextureOptions::LINEAR,
+                                            );
+                                            resp.clone().on_hover_ui(|ui| {
+                                                ui.image((tex.id(), tex.size_vec2()));
+                                            });
+                                        }
+                                    }
+                                    if resp.clicked() {
+                                        open_recover = Some(entry.path.clone());
+                                    }
+                                }
+                            });
+                        });
+                    });
+                if dismiss_all {
+                    self.autosave.dismiss_recover(&self.settings);
+                }
+                if let Some(path) = open_recover {
+                    if let Some(entry) = self.autosave.take_recover(&path, &self.settings) {
+                        self.open_recovered_canvas(&entry);
+                    }
+                }
+            }
             if request_open_canvas {
                 self.open_canvas_from_dialog();
             }
@@ -1768,26 +2686,27 @@ impl eframe::App for BeautifulApp {
             for path in request_open_paths {
                 self.open_as_new_canvas(&path);
             }
-            if (self.file.status.as_deref() == Some("New canvas created")
-                && !self.file.show_new_dialog)
-                || opened_async
-            {
-                self.screen = AppScreen::Editor;
-                self.sync_active_canvas_meta();
-            }
-            if let Some(path) = gallery::show(
+            if let Some(action) = gallery::show(
                 ctx,
                 &mut self.gallery,
                 &mut self.file,
                 &mut self.document,
                 &mut self.canvas,
             ) {
-                self.open_as_new_canvas(&path);
+                match action {
+                    crate::gallery::GalleryAction::Open(path) => {
+                        self.open_as_new_canvas(&path);
+                    }
+                    crate::gallery::GalleryAction::PlayDemo(path) => {
+                        self.demo_player = Some(crate::demo_player::DemoPlayer::open(&path));
+                    }
+                }
             }
             // File browser can be opened from gallery menu too.
             if self.file.show_save_as && !self.file_browser.open && !self.file.show_save_root_prompt
             {
-                if !self.settings.save_root_decided {
+                if !self.settings.save_root_decided
+                    && self.settings.configured_save_root().is_none() {
                     self.file.begin_save_root_prompt(&self.settings);
                 } else {
                     self.open_save_as_browser();
@@ -1803,10 +2722,22 @@ impl eframe::App for BeautifulApp {
                 }
             }
             self.consume_file_browser(ctx);
+            self.poll_export_studio(ctx);
             self.show_preferences_ui(ctx, frame);
             self.file
                 .dialogs(ctx, &mut self.document, &mut self.canvas, &self.settings);
+            if self.file.pending_enter_editor || self.file.pending_new_document.is_some() {
+                self.consume_pending_new_canvas();
+            }
+            if self.file.take_want_save() {
+                self.save_current_document();
+            }
             self.file.show_center_toast(ctx);
+            if !self.ui_chrome_hidden {
+                self.show_canvas_tabs(ctx);
+                self.show_demo_player(ctx);
+            }
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
             return;
         }
 
@@ -1818,7 +2749,7 @@ impl eframe::App for BeautifulApp {
 
         // Apply undo/redo/tool keys BEFORE docks + canvas so navigator/thumbs see
         // the restored document in the same frame (was after docks → stale nav).
-        if !fb_modal {
+        if !fb_modal && !self.prefs.is_capturing_gamepad() {
             ui::handle_shortcuts(
                 ctx,
                 &mut self.document,
@@ -1827,8 +2758,11 @@ impl eframe::App for BeautifulApp {
                 &mut self.tool_session,
                 &mut self.color_state,
                 &self.settings.keymap,
+                self.gamepad.frame(),
                 &mut self.prefs.open,
                 self.settings.zoom_step_factor(),
+                self.settings.pan_speed,
+                self.settings.pan_speed_shift,
             );
         }
 
@@ -1838,6 +2772,10 @@ impl eframe::App for BeautifulApp {
             let mut request_open_canvas = false;
             let mut request_new_canvas = false;
             let mut request_open_paths: Vec<std::path::PathBuf> = Vec::new();
+            self.filters
+                .set_apply_targets(&self.document, &self.layer_ui.selected);
+            self.filter_studio
+                .set_apply_targets(&self.document, &self.layer_ui.selected);
             ui::top_menu(
                 ctx,
                 &mut self.dock,
@@ -1857,33 +2795,41 @@ impl eframe::App for BeautifulApp {
                 &mut request_new_canvas,
                 &mut request_open_paths,
                 &mut self.filter_studio,
+                &mut self.ui_chrome_hidden,
             );
+            self.sync_ui_chrome_fullscreen(ctx, frame);
             crate::filter_studio::show(
                 ctx,
                 &mut self.document,
                 &mut self.canvas,
                 &mut self.filter_studio,
+                &mut self.addons,
+                &mut self.file,
+                &mut self.audio,
             );
-            ui::show_addon_panels(ctx, &mut self.addons, &mut self.document, &mut self.file);
+            if !self.ui_chrome_hidden {
+                crate::addons::show_addon_panels(
+                    ctx,
+                    &mut self.addons,
+                    &mut self.document,
+                    &mut self.file,
+                    &mut self.audio,
+                );
+            }
+            self.audio.tick();
+            // Playlist advance lives in the add-on (`on_event("audio_ended")`).
+            if self.audio.ended_pending() {
+                self.addons.refresh_audio(&self.audio);
+                self.fire_addon_event("audio_ended");
+                ctx.request_repaint();
+            } else if self.audio.is_playing() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
             if request_open_canvas && !self.file_browser.open {
                 self.open_canvas_from_dialog();
             }
             if request_new_canvas && !self.file_browser.open {
-                if self.open_canvases.can_open_more() {
-                    self.park_active_canvas();
-                    let _ = self.open_canvases.push_active_new(
-                        "Untitled".into(),
-                        None,
-                        0,
-                        0,
-                    );
-                    self.workspace = Workspace::new_with_primary("Untitled", 2000, 1500);
-                    self.document = Document::new(2000, 1500);
-                    self.apply_tool_session();
-                    self.canvas.on_document_replaced();
-                    self.file.path = None;
-                    self.file.mark_clean(&self.document);
-                }
+                // Dialog only — real tab is created in consume_pending_new_canvas.
                 self.file.open_new_dialog("");
             }
             if request_new_sheet && !self.file_browser.open {
@@ -1895,16 +2841,14 @@ impl eframe::App for BeautifulApp {
         }
 
         // Canvas (file) tabs under the menu.
-        self.show_canvas_tabs(ctx);
+        if !self.ui_chrome_hidden {
+            self.show_canvas_tabs(ctx);
+            self.show_demo_player(ctx);
+        }
 
         if go_gallery {
-            if self.file.is_dirty(&self.document) {
-                self.file.close_prompt = Some(crate::file::ClosePrompt::ToGallery);
-            } else {
-                self.file.flush_time();
-                self.screen = AppScreen::Gallery;
-                return;
-            }
+            self.focus_home_tab();
+            return;
         }
         if let Some(action) = self.file.leave_after_prompt.take() {
             if self.pending_close_canvas.is_some() {
@@ -1916,50 +2860,32 @@ impl eframe::App for BeautifulApp {
             } else {
                 match action {
                     crate::file::ClosePrompt::ToGallery => {
-                        self.file.flush_time();
-                        self.screen = AppScreen::Gallery;
+                        self.focus_home_tab();
                         return;
                     }
                     crate::file::ClosePrompt::Quit => {
                         self.file.flush_time();
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        return;
+                        self.force_quit();
                     }
                 }
             }
         } else if self.pending_close_canvas.is_some()
-            && self.file.close_prompt.is_none()
-            && !self.file.is_saving()
+            && !self.file.close_blocked()
+            && !self.file_browser.open
         {
             // User cancelled the unsaved prompt for a tab close.
             self.pending_close_canvas = None;
-        }
-        if ctx.input(|i| i.viewport().close_requested())
-            && self.file.is_dirty(&self.document)
-            && self.file.close_prompt.is_none()
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.file.close_prompt = Some(crate::file::ClosePrompt::Quit);
+            self.pending_reopen = None;
         }
 
-        {
-            let _s = crate::perf::Scope::new(crate::perf::Category::Ui, "frame.options_bar");
-            ui::options_bar(
-                ctx,
-                &mut self.document,
-                self.tool,
-                &mut self.canvas,
-                !fb_modal,
-            );
-        }
-
-        {
+        if !self.ui_chrome_hidden {
             let _ui = crate::perf::Scope::new(crate::perf::Category::Ui, "pipe.ui");
             let _dock = crate::perf::Scope::new(crate::perf::Category::Ui, "frame.dock");
             self.render_docks(ctx);
         }
 
-        {
+        // Status HUD (zoom / FPS / mem): F12 profiler or Settings → Status & panels.
+        if !self.ui_chrome_hidden && (self.settings.show_status_metrics || self.perf_ui_open) {
             let _s = crate::perf::Scope::new(crate::perf::Category::Ui, "frame.bottom_bar");
             ui::bottom_bar(
                 ctx,
@@ -1969,11 +2895,12 @@ impl eframe::App for BeautifulApp {
                 &self.file,
                 self.fps,
                 self.frame_ms,
-                self.settings.show_status_metrics || self.perf_ui_open,
+                true,
             );
         }
 
-        // Подвкладки (Sheet) — окна внутри текущего холста.
+        // Подвкладки (Sheet) — outermost bottom chrome.
+        if !self.ui_chrome_hidden {
         egui::TopBottomPanel::bottom("sheet_tabs")
             .exact_height(28.0)
             .frame(theme::chrome_frame())
@@ -2082,14 +3009,25 @@ impl eframe::App for BeautifulApp {
                     }
                 });
             });
+        }
+
+        if !self.ui_chrome_hidden {
+            self.render_dock_after_chrome(ctx);
+        }
 
         // Stage 1 isolation: idle hover skips CanvasView entirely (no hit-test,
         // sync, GPU paint). Pointer still moves; chrome still runs.
-        let temp_hand_down = ctx.input(|i| {
-            self.settings
-                .keymap
-                .key_down(i, crate::keymap::Action::TempHand)
-        });
+        let temp_hand_down = self.document.text_editing.is_none()
+            && (ctx.input(|i| {
+                self.settings
+                    .keymap
+                    .key_down(i, crate::keymap::Action::TempHand)
+            }) || (!self.prefs.is_capturing_gamepad()
+                && self
+                    .gamepad
+                    .frame()
+                    .action_held(&self.settings.keymap, crate::keymap::GamepadAction::TempHand)));
+        let canvas_pad = self.pad_for_canvas();
         let skip_canvas = crate::debug_flags::no_canvas_hover()
             && !self.canvas.is_drawing()
             && !self.canvas.lmb_down
@@ -2135,9 +3073,21 @@ impl eframe::App for BeautifulApp {
                             self.settings.zoom_step_factor(),
                             self.settings.zoom_smooth,
                             temp_hand_down,
+                            self.settings.pan_speed,
+                            self.settings.pan_speed_shift,
+                            self.settings.display_performance.gpu_tex_side(),
+                            &self.settings.keymap,
+                            &canvas_pad,
                         );
                     }
                 });
+        }
+
+        // Stroke-end set thumbs_deferred so this frame's dock skipped nav/layer
+        // thumb rebuild (was ~99% UI). Drop the gate now — next frame rebuilds
+        // from warm dense, not a full layer walk.
+        if self.canvas.release_thumbs_deferral() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
 
         // Sheet windows float above docks / chrome (floating document sheets).
@@ -2168,10 +3118,18 @@ impl eframe::App for BeautifulApp {
         // Prompts / toasts / errors above sheets (must paint after Foreground sheets).
         self.file
             .dialogs(ctx, &mut self.document, &mut self.canvas, &self.settings);
+        if self.file.pending_enter_editor || self.file.pending_new_document.is_some() {
+            self.consume_pending_new_canvas();
+        }
+        if self.file.take_want_save() {
+            self.save_current_document();
+        }
         self.file.show_center_toast(ctx);
 
         if self.file.show_save_as && !self.file_browser.open && !self.file.show_save_root_prompt {
-            if !self.settings.save_root_decided {
+            if !self.settings.save_root_decided
+                && self.settings.configured_save_root().is_none()
+            {
                 self.file.begin_save_root_prompt(&self.settings);
             } else {
                 self.open_save_as_browser();
@@ -2187,6 +3145,22 @@ impl eframe::App for BeautifulApp {
         }
         // Modal blocker removed: file browser runs in its own OS window.
         self.consume_file_browser(ctx);
+        self.poll_export_studio(ctx);
+
+        {
+            let action = crate::preset_browser::show_window(
+                ctx,
+                &mut self.preset_browser,
+                &mut self.preset_library,
+                &mut self.tool_pages,
+                &mut self.tool_session,
+            );
+            if let crate::preset_browser::PresetBrowserAction::AddToPage(id) = action {
+                if self.tool_session.select_instance(&id, &mut self.document) {
+                    self.tool = self.tool_session.tool;
+                }
+            }
+        }
 
         if let Some(idx) = self.canvas.pending_layer_pick.take() {
             self.layer_ui.focus_layer(idx);
@@ -2204,6 +3178,7 @@ impl eframe::App for BeautifulApp {
         self.tool_session
             .capture_from_document(&self.document, self.tool);
         self.tool_session.save_if_due();
+        self.preset_library.save_if_dirty();
         crate::perf::set_frame_meta(crate::perf::FrameMeta {
             dirty_px: dirty_area_px(&self.document),
             pending: self.document.composite.has_pending_work(),
@@ -2245,17 +3220,25 @@ impl BeautifulApp {
             self.discord.ui_status(),
             Some(self.pen.last_raw_force()),
             Some(self.pen.last_pressure()),
+            self.gamepad.frame(),
         );
         if prefs_apply.undo {
             self.document
                 .set_undo_max_steps(self.settings.undo_max_steps);
         }
         if prefs_apply.appearance {
-            // Colors already re-applied each frame; still refresh DWM material live.
             apply_window_material_runtime(frame, &self.settings);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(
+                self.settings.material.uses_dwm_backdrop()
+                    && crate::os_win::backdrop_supported()
+                    && !crate::debug_flags::opaque_window(),
+            ));
         }
         if prefs_apply.addons_reload {
-            self.addons.reload(&self.settings);
+            let stop_audio = self.addons.reload(&self.settings);
+            if stop_audio {
+                self.audio.stop();
+            }
             let _ = self.settings.save();
         }
         if prefs_apply.close {
@@ -2274,6 +3257,13 @@ impl BeautifulApp {
         use crate::settings::DiscordTitleMode;
 
         let tool_name = self.tool.discord_label();
+        if self.open_canvases.has_no_tabs() {
+            self.discord.set_activity(ActivityUpdate {
+                details: "Beautiful".to_owned(),
+                state: "Browsing gallery".to_owned(),
+            });
+            return;
+        }
         let tab = self.open_canvases.active();
         let path_nsfw = tab
             .path
@@ -2282,13 +3272,8 @@ impl BeautifulApp {
             .unwrap_or(false);
         let nsfw = tab.nsfw || path_nsfw || self.file.pending_nsfw();
         let canvas_title = tab.title.clone();
-        let (details, state, preview_jpeg, show_preview) = match self.screen {
-            AppScreen::Gallery => (
-                "Beautiful".to_owned(),
-                "Browsing gallery".to_owned(),
-                None,
-                false,
-            ),
+        let (details, state) = match self.screen {
+            AppScreen::Gallery => ("Beautiful".to_owned(), "Browsing gallery".to_owned()),
             AppScreen::Editor => {
                 let details = if nsfw {
                     "Beautiful".to_owned()
@@ -2309,56 +3294,143 @@ impl BeautifulApp {
                     "{tool_name} · {}×{} · {layers} layers",
                     self.document.width, self.document.height
                 );
-                let want_preview = self.settings.discord_show_canvas_preview && !nsfw;
-                let preview_jpeg = if want_preview {
-                    let (w, h, pixels) = beautiful_core::build_navigator_thumb_from_layers(
-                        self.document.background,
-                        &self.document.layers,
-                        self.document.floating_blit(),
-                        self.document.width,
-                        self.document.height,
-                        256,
-                    );
-                    crate::discord_rpc::encode_preview_jpeg(&pixels, w, h)
-                } else {
-                    None
-                };
-                (details, state, preview_jpeg, want_preview)
+                (details, state)
             }
         };
-        self.discord.set_activity(ActivityUpdate {
-            details,
-            state,
-            show_preview,
-            preview_jpeg,
-        });
+        self.discord.set_activity(ActivityUpdate { details, state });
     }
 
     fn consume_file_browser(&mut self, ctx: &egui::Context) {
+        let job = self.file_browser.job();
         let save_mode = self.file_browser.is_save_mode();
+        let browser_was_open = self.file_browser.open;
         let save_fmt = self.file_browser.take_save_format();
         if let Some(paths) = self.file_browser.show_and_take(ctx, &mut self.file) {
-            if save_mode {
-                if let Some(path) = paths.into_iter().next() {
-                    self.file.save_as_format = save_fmt;
-                    self.file.save_to(&path, &mut self.document, save_fmt);
-                }
-                self.file_browser.save_mode = false;
-            } else {
-                let as_sheet = self.file_browser.open_as_sheet;
-                for path in paths {
-                    if as_sheet {
-                        self.open_as_new_sheet(&path);
-                    } else {
-                        self.open_as_new_canvas(&path);
+            match job {
+                BrowserJob::SaveDocument => {
+                    if let Some(path) = paths.into_iter().next() {
+                        self.file.save_as_format = save_fmt;
+                        if matches!(
+                            save_fmt,
+                            crate::file::ExportFormat::Png | crate::file::ExportFormat::Jpeg
+                        ) {
+                            self.file.pending_raster_export = Some((path, save_fmt));
+                        } else {
+                            self.save_document_to(&path, save_fmt);
+                        }
                     }
+                    self.file_browser.save_mode = false;
+                    self.file_browser.clear_job();
+                }
+                BrowserJob::PickImage => {
+                    if let Some(path) = paths.into_iter().next() {
+                        if let Some(player) = self.demo_player.as_mut() {
+                            player.set_watermark_file(path);
+                        }
+                    }
+                    self.file_browser.clear_job();
+                }
+                BrowserJob::PickAudio => {
+                    if let Some(path) = paths.into_iter().next() {
+                        if let Some(player) = self.demo_player.as_mut() {
+                            player.set_music_file(path);
+                        }
+                    }
+                    self.file_browser.clear_job();
+                }
+                BrowserJob::SaveVideo => {
+                    if let Some(path) = paths.into_iter().next() {
+                        if let Some(player) = self.demo_player.as_mut() {
+                            player.start_export_to(path);
+                        }
+                    }
+                    self.file_browser.save_mode = false;
+                    self.file_browser.clear_job();
+                }
+                BrowserJob::OpenDocument => {
+                    let as_sheet = self.file_browser.open_as_sheet;
+                    for path in paths {
+                        if as_sheet {
+                            self.open_as_new_sheet(&path);
+                        } else {
+                            self.open_as_new_canvas(&path);
+                        }
+                    }
+                    self.file_browser.clear_job();
+                }
+            }
+        } else if save_mode && browser_was_open && !self.file_browser.open {
+            let was_doc_save = job == BrowserJob::SaveDocument;
+            self.file_browser.clear_job();
+            if was_doc_save {
+                if let Some(prompt) = self.file.close_after_save.take() {
+                    self.file.close_prompt = Some(prompt);
                 }
             }
         }
     }
 
+    fn poll_export_studio(&mut self, ctx: &egui::Context) {
+        if let Some((path, format)) = self.file.pending_raster_export.take() {
+            self.export_studio
+                .open_for(path, format, &self.document);
+        }
+        if let Some(apply) = crate::export_studio::show(ctx, &mut self.export_studio) {
+            self.file.save_to_with_opts_and_workspace(
+                &apply.path,
+                &mut self.document,
+                apply.format,
+                apply.opts,
+                None,
+            );
+        }
+    }
+
+    fn show_demo_player(&mut self, ctx: &egui::Context) {
+        let mut request = None;
+        let close = if let Some(player) = self.demo_player.as_mut() {
+            let open = player.show(ctx, &mut self.audio);
+            request = player.take_request();
+            !open
+        } else {
+            false
+        };
+        match request {
+            Some(crate::demo_player::DemoPlayerRequest::PickWatermark) => {
+                let start = pictures_dir();
+                self.file_browser
+                    .open_for_pick_image(start.as_deref());
+            }
+            Some(crate::demo_player::DemoPlayerRequest::PickAudio) => {
+                let start = music_dir();
+                self.file_browser.open_for_pick_audio(start.as_deref());
+            }
+            Some(crate::demo_player::DemoPlayerRequest::SaveVideo) => {
+                if let Some(player) = self.demo_player.as_ref() {
+                    let name = player.suggested_video_name();
+                    let fmt = player.video_format();
+                    let start = videos_dir();
+                    self.file_browser
+                        .open_for_save_video(start.as_deref(), &name, fmt);
+                }
+            }
+            None => {}
+        }
+        if close {
+            if self
+                .demo_player
+                .as_ref()
+                .is_some_and(|p| p.owns_audio())
+            {
+                self.audio.stop();
+            }
+            self.demo_player = None;
+        }
+    }
+
     fn show_canvas_tabs(&mut self, ctx: &egui::Context) {
         let mut focus: Option<usize> = None;
+        let mut home = false;
         let mut close: Option<usize> = None;
         let mut reorder: Option<(usize, usize)> = None;
         let mut hover_preview: Option<(usize, egui::Rect)> = None;
@@ -2366,14 +3438,17 @@ impl BeautifulApp {
         egui::TopBottomPanel::top("canvas_file_tabs")
             .exact_height(34.0)
             .frame(
-                egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(28, 28, 32))
-                    .inner_margin(egui::Margin::symmetric(6, 4))
-                    .stroke(egui::Stroke::new(1.0_f32, theme::stroke())),
+                theme::chrome_frame().inner_margin(egui::Margin::symmetric(6, 4)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
+                    let home_resp = ui.selectable_label(self.home_tab_focused, theme::label("Домой"));
+                    if home_resp.clicked() {
+                        home = true;
+                    }
+                    ui.separator();
+
                     let active = self.open_canvases.active_index();
                     let tabs: Vec<(
                         usize,
@@ -2395,103 +3470,180 @@ impl BeautifulApp {
                         })
                         .collect();
 
-                    for (i, label, is_active, id, _path) in tabs {
-                        let tab_id = open_canvas::tab_drag_id(id);
-                        let sense = egui::Sense::click_and_drag();
-                        let w = (label.len() as f32 * 7.2 + 44.0).clamp(88.0, 240.0);
-                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 26.0), sense);
-
-                        let fill = if is_active {
-                            egui::Color32::from_rgb(48, 40, 34)
-                        } else if resp.hovered() {
-                            egui::Color32::from_rgb(40, 40, 46)
+                    // Reserve chrome for < > and + so the scroll strip can shrink.
+                    let chrome_w = 34.0 + 4.0 + 34.0 + 4.0 + 36.0;
+                    let avail = (ui.available_width() - chrome_w).max(80.0);
+                    let n = tabs.len().max(1);
+                    let natural: Vec<f32> = tabs
+                        .iter()
+                        .map(|(_, label, _, _, _)| (label.len() as f32 * 7.2 + 44.0).clamp(72.0, 240.0))
+                        .collect();
+                    let natural_sum: f32 = natural.iter().sum();
+                    let min_tab = 64.0_f32;
+                    let tab_widths: Vec<f32> = if natural_sum <= avail {
+                        natural
+                    } else {
+                        // Shrink evenly down to min_tab; overflow scrolls.
+                        let even = (avail / n as f32).clamp(min_tab, 240.0);
+                        if even * n as f32 <= avail + 0.5 {
+                            vec![even; n]
                         } else {
-                            egui::Color32::from_rgb(32, 32, 36)
-                        };
-                        ui.painter().rect_filled(rect, 6.0, fill);
-                        if is_active {
-                            let bar = egui::Rect::from_min_max(
-                                egui::pos2(rect.min.x + 6.0, rect.max.y - 2.0),
-                                egui::pos2(rect.max.x - 6.0, rect.max.y),
-                            );
-                            ui.painter().rect_filled(bar, 1.0, theme::ACCENT);
-                            ui.painter().rect_stroke(
-                                rect,
-                                6.0,
-                                egui::Stroke::new(1.0_f32, theme::ACCENT_DIM),
-                                egui::StrokeKind::Outside,
-                            );
-                        } else if resp.hovered() {
-                            ui.painter().rect_stroke(
-                                rect,
-                                6.0,
-                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 70, 78)),
-                                egui::StrokeKind::Outside,
-                            );
+                            natural
+                                .iter()
+                                .map(|w| (*w).min(even).max(min_tab))
+                                .collect()
                         }
+                    };
 
-                        let text_col = if is_active {
-                            egui::Color32::from_rgb(255, 236, 220)
-                        } else {
-                            egui::Color32::from_rgb(180, 180, 188)
-                        };
-                        ui.painter().text(
-                            rect.left_center() + egui::vec2(12.0, 0.0),
-                            egui::Align2::LEFT_CENTER,
-                            &label,
-                            egui::FontId::proportional(13.0),
-                            text_col,
-                        );
-
-                        let close_r = egui::Rect::from_center_size(
-                            egui::pos2(rect.max.x - 13.0, rect.center().y),
-                            egui::vec2(16.0, 16.0),
-                        );
-                        let close_resp =
-                            ui.interact(close_r, tab_id.with("x"), egui::Sense::click());
-                        if close_resp.hovered() {
-                            ui.painter().circle_filled(
-                                close_r.center(),
-                                8.0,
-                                egui::Color32::from_rgb(70, 40, 36),
-                            );
-                        }
-                        ui.painter().text(
-                            close_r.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "×",
-                            egui::FontId::proportional(14.0),
-                            if close_resp.hovered() {
-                                egui::Color32::from_rgb(255, 160, 140)
-                            } else {
-                                egui::Color32::from_rgb(140, 140, 148)
-                            },
-                        );
-
-                        if close_resp.clicked() || resp.middle_clicked() {
-                            close = Some(i);
-                        } else if resp.clicked() {
-                            focus = Some(i);
-                        }
-                        if resp.hovered() && !close_resp.hovered() {
-                            hover_preview = Some((i, resp.rect));
-                        }
-                        if resp.dragged() {
-                            egui::DragAndDrop::set_payload(ui.ctx(), i);
-                        }
-                        if let Some(from) = resp.dnd_release_payload::<usize>() {
-                            if *from != i {
-                                reorder = Some((*from, i));
+                    let scroll_delta = std::mem::take(&mut self.canvas_tabs_scroll_delta);
+                    let scroll_out = egui::ScrollArea::horizontal()
+                        .id_salt("canvas_file_tabs_scroll")
+                        .max_width(avail)
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .show(ui, |ui| {
+                            if scroll_delta != 0.0 {
+                                ui.scroll_with_delta(egui::vec2(-scroll_delta, 0.0));
                             }
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                for ((i, label, is_active, id, _path), w) in
+                                    tabs.into_iter().zip(tab_widths.into_iter())
+                                {
+                                    let tab_id = open_canvas::tab_drag_id(id);
+                                    let sense = egui::Sense::click_and_drag();
+                                    let (rect, resp) =
+                                        ui.allocate_exact_size(egui::vec2(w, 26.0), sense);
+
+                                    let fill = if is_active {
+                                        theme::bg_tab_active()
+                                    } else if resp.hovered() {
+                                        theme::hover_fill()
+                                    } else {
+                                        theme::bg_tab()
+                                    };
+                                    ui.painter().rect_filled(rect, 6.0, fill);
+                                    if is_active {
+                                        let bar = egui::Rect::from_min_max(
+                                            egui::pos2(rect.min.x + 6.0, rect.max.y - 2.0),
+                                            egui::pos2(rect.max.x - 6.0, rect.max.y),
+                                        );
+                                        ui.painter().rect_filled(bar, 1.0, theme::ACCENT);
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            6.0,
+                                            egui::Stroke::new(1.0_f32, theme::ACCENT_DIM),
+                                            egui::StrokeKind::Outside,
+                                        );
+                                    } else if resp.hovered() {
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            6.0,
+                                            egui::Stroke::new(1.0_f32, theme::stroke()),
+                                            egui::StrokeKind::Outside,
+                                        );
+                                    }
+
+                                    let text_col = if is_active {
+                                        theme::text()
+                                    } else {
+                                        theme::text_dim()
+                                    };
+                                    // Truncate label when the tab is narrow.
+                                    let max_chars = ((w - 28.0) / 7.2).floor().max(4.0) as usize;
+                                    let draw_label = if label.chars().count() > max_chars {
+                                        let mut s: String =
+                                            label.chars().take(max_chars.saturating_sub(1)).collect();
+                                        s.push('…');
+                                        s
+                                    } else {
+                                        label.clone()
+                                    };
+                                    ui.painter().text(
+                                        rect.left_center() + egui::vec2(10.0, 0.0),
+                                        egui::Align2::LEFT_CENTER,
+                                        &draw_label,
+                                        egui::FontId::proportional(13.0),
+                                        text_col,
+                                    );
+
+                                    let close_r = egui::Rect::from_center_size(
+                                        egui::pos2(rect.max.x - 13.0, rect.center().y),
+                                        egui::vec2(16.0, 16.0),
+                                    );
+                                    let close_resp =
+                                        ui.interact(close_r, tab_id.with("x"), egui::Sense::click());
+                                    if close_resp.hovered() {
+                                        ui.painter().circle_filled(
+                                            close_r.center(),
+                                            8.0,
+                                            egui::Color32::from_rgb(70, 40, 36),
+                                        );
+                                    }
+                                    ui.painter().text(
+                                        close_r.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "×",
+                                        egui::FontId::proportional(14.0),
+                                        if close_resp.hovered() {
+                                            egui::Color32::from_rgb(255, 160, 140)
+                                        } else {
+                                            egui::Color32::from_rgb(140, 140, 148)
+                                        },
+                                    );
+
+                                    if close_resp.clicked() || resp.middle_clicked() {
+                                        close = Some(i);
+                                    } else if resp.clicked() {
+                                        focus = Some(i);
+                                    }
+                                    if resp.hovered() && !close_resp.hovered() {
+                                        hover_preview = Some((i, resp.rect));
+                                    }
+                                    if resp.dragged() {
+                                        egui::DragAndDrop::set_payload(ui.ctx(), i);
+                                    }
+                                    if let Some(from) = resp.dnd_release_payload::<usize>() {
+                                        if *from != i {
+                                            reorder = Some((*from, i));
+                                        }
+                                    }
+                                }
+                            });
+                        });
+
+                    // Mouse wheel over the tab strip scrolls horizontally.
+                    let pointer = ctx.pointer_latest_pos();
+                    if pointer.is_some_and(|p| scroll_out.inner_rect.contains(p)) {
+                        let wheel = ctx.input(|i| i.smooth_scroll_delta.y + i.smooth_scroll_delta.x);
+                        if wheel.abs() > 0.1 {
+                            self.canvas_tabs_scroll_delta -= wheel;
                         }
                     }
-                    ui.add_space(4.0);
-                    if theme::small_btn(ui, theme::label("+"))
-                        .on_hover_text("Открыть холст…")
-                        .clicked()
-                    {
-                        self.open_canvas_from_dialog();
+
+                    if theme::small_btn(ui, theme::label("<")).clicked() {
+                        self.canvas_tabs_scroll_delta = -180.0;
                     }
+                    if theme::small_btn(ui, theme::label(">")).clicked() {
+                        self.canvas_tabs_scroll_delta = 180.0;
+                    }
+
+                    ui.add_space(4.0);
+                    ui.menu_button(theme::label("+"), |ui| {
+                        theme::apply_opaque_chrome(ui);
+                        ui.set_min_width(200.0);
+                        if theme::btn(ui, theme::label("Создать (пустой)")).clicked() {
+                            self.file.open_new_dialog("");
+                            ui.close();
+                        }
+                        if theme::btn(ui, theme::label("Из буфера обмена")).clicked() {
+                            self.add_canvas_from_clipboard();
+                            ui.close();
+                        }
+                        if theme::btn(ui, theme::label("Открыть…")).clicked() {
+                            self.open_canvas_from_dialog();
+                            ui.close();
+                        }
+                    });
                 });
             });
 
@@ -2500,6 +3652,11 @@ impl BeautifulApp {
         }
         if let Some(i) = focus {
             self.focus_canvas_index(i);
+            self.home_tab_focused = false;
+            self.screen = AppScreen::Editor;
+        }
+        if home {
+            self.focus_home_tab();
         }
         if let Some(i) = close {
             self.close_canvas_index(i);
@@ -2663,7 +3820,10 @@ impl BeautifulApp {
                 self.settings
                     .keymap
                     .key_down(i, crate::keymap::Action::TempHand)
-            }),
+            }) || self
+                .gamepad
+                .frame()
+                .action_held(&self.settings.keymap, crate::keymap::GamepadAction::TempHand),
         );
         self.workspace.sync_maximized_sheets(desk_rect);
         self.workspace.ensure_inactive_snapshots(desk_rect);
@@ -3046,6 +4206,7 @@ impl BeautifulApp {
                             .layout(egui::Layout::top_down(egui::Align::Min)),
                     );
                     child_ui.set_clip_rect(body_rect.intersect(ui.clip_rect()));
+                    let canvas_pad = self.pad_for_canvas();
                     CanvasView::show(
                         &mut child_ui,
                         &mut self.document,
@@ -3060,7 +4221,16 @@ impl BeautifulApp {
                             self.settings
                                 .keymap
                                 .key_down(i, crate::keymap::Action::TempHand)
-                        }),
+                        }) || (!self.prefs.is_capturing_gamepad()
+                            && canvas_pad.action_held(
+                                &self.settings.keymap,
+                                crate::keymap::GamepadAction::TempHand,
+                            )),
+                        self.settings.pan_speed,
+                        self.settings.pan_speed_shift,
+                        self.settings.display_performance.gpu_tex_side(),
+                        &self.settings.keymap,
+                        &canvas_pad,
                     );
                 }
             } else if let Some((gen, w, h, _)) = snap_key {
@@ -3191,51 +4361,140 @@ impl BeautifulApp {
 
     fn render_docks(&mut self, ctx: &egui::Context) {
         let content = ctx.content_rect();
-        self.dock.begin_frame(content);
-        let freeze = false; // File browser is a separate OS window.
+        let (inner, outer) = ctx.input(|i| {
+            let vp = i.viewport();
+            (vp.inner_rect, vp.outer_rect)
+        });
+        self.dock.begin_frame(content, inner, outer);
+        let freeze = false;
+        let geom_ok = dock_geom_active(ctx);
+        if !geom_ok {
+            self.dock_geom_was_frozen = true;
+        } else if self.dock_geom_was_frozen {
+            self.dock_geom_was_frozen = false;
+            self.dock_widths_seeded = false;
+        }
 
-        if !self.dock_widths_seeded {
+        if !self.dock_widths_seeded && geom_ok {
             self.dock_widths_seeded = true;
             for (ci, col) in self.dock.left_columns.iter().enumerate() {
+                let (lo, hi) = crate::dock::column_width_range(col);
                 seed_side_panel_width(
                     ctx,
                     egui::Id::new(("dock_left_col", ci)),
-                    col.width.clamp(200.0, 420.0),
+                    col.width.clamp(lo, hi),
                     true,
+                    lo,
+                    hi,
                 );
             }
             for (ci, col) in self.dock.right_columns.iter().enumerate() {
+                let (lo, hi) = crate::dock::column_width_range(col);
                 seed_side_panel_width(
                     ctx,
                     egui::Id::new(("dock_right_col", ci)),
-                    col.width.clamp(200.0, 420.0),
+                    col.width.clamp(lo, hi),
                     false,
+                    lo,
+                    hi,
+                );
+            }
+            for (ci, col) in self.dock.top_rows.iter().enumerate() {
+                let (lo, hi) = crate::dock::row_height_range(col);
+                seed_tb_panel_height(
+                    ctx,
+                    egui::Id::new(("dock_top_row", ci)),
+                    col.width.clamp(lo, hi),
+                    true,
+                    lo,
+                    hi,
+                );
+            }
+            for (ci, col) in self.dock.bottom_rows.iter().enumerate() {
+                let (lo, hi) = crate::dock::row_height_range(col);
+                seed_tb_panel_height(
+                    ctx,
+                    egui::Id::new(("dock_bottom_row", ci)),
+                    col.width.clamp(lo, hi),
+                    false,
+                    lo,
+                    hi,
                 );
             }
         }
 
+        let top_rows = self.dock.top_rows.clone();
         let left_cols = self.dock.left_columns.clone();
         let right_cols = self.dock.right_columns.clone();
-        let floating = self.dock.floating.clone();
         let dragging = self.dock.drag.is_some() && !freeze;
+
+        for (ci, col) in top_rows.iter().enumerate() {
+            let id = egui::Id::new(("dock_top_row", ci));
+            let (lo, hi) = crate::dock::row_height_range(col);
+            let h = col.width.clamp(lo, hi);
+            let frame = dock_strip_frame(col);
+            egui::TopBottomPanel::top(id)
+                .resizable(true)
+                .default_height(h)
+                .height_range(lo..=hi)
+                .frame(frame)
+                .show(ctx, |ui| {
+                    if freeze {
+                        ui.disable();
+                    }
+                    let nh = ui.available_height();
+                    if geom_ok {
+                        if let Some(c) = self.dock.top_rows.get_mut(ci) {
+                            if (c.width - nh).abs() > 0.5 {
+                                c.width = nh;
+                                self.dock_dirty = true;
+                            }
+                        }
+                    }
+                    self.dock
+                        .column_rects
+                        .push((DockSide::Top, ci, ui.max_rect()));
+                    self.render_dock_row(ui, DockSide::Top, ci, &col.panels);
+                });
+        }
+        if dragging && top_rows.is_empty() {
+            egui::TopBottomPanel::top("dock_top_rail")
+                .exact_height(22.0)
+                .resizable(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgba_unmultiplied(255, 140, 66, 40)),
+                )
+                .show(ctx, |ui| {
+                    self.dock
+                        .column_rects
+                        .push((DockSide::Top, 0, ui.max_rect()));
+                    ui.centered_and_justified(|ui| {
+                        ui.label(theme::label_dim("▲"));
+                    });
+                });
+        }
 
         for (ci, col) in left_cols.iter().enumerate() {
             let id = egui::Id::new(("dock_left_col", ci));
-            let w = col.width.clamp(200.0, 420.0);
+            let (lo, hi) = crate::dock::column_width_range(col);
+            let w = col.width.clamp(lo, hi);
             egui::SidePanel::left(id)
                 .resizable(true)
                 .default_width(w)
-                .width_range(200.0..=420.0)
-                .frame(theme::panel_frame())
+                .width_range(lo..=hi)
+                .frame(dock_strip_frame(col))
                 .show(ctx, |ui| {
                     if freeze {
                         ui.disable();
                     }
                     let nw = ui.available_width();
-                    if let Some(c) = self.dock.left_columns.get_mut(ci) {
-                        if (c.width - nw).abs() > 0.5 {
-                            c.width = nw;
-                            self.dock_dirty = true;
+                    if geom_ok {
+                        if let Some(c) = self.dock.left_columns.get_mut(ci) {
+                            if (c.width - nw).abs() > 0.5 {
+                                c.width = nw;
+                                self.dock_dirty = true;
+                            }
                         }
                     }
                     self.dock
@@ -3264,21 +4523,24 @@ impl BeautifulApp {
 
         for (ci, col) in right_cols.iter().enumerate() {
             let id = egui::Id::new(("dock_right_col", ci));
-            let w = col.width.clamp(200.0, 420.0);
+            let (lo, hi) = crate::dock::column_width_range(col);
+            let w = col.width.clamp(lo, hi);
             egui::SidePanel::right(id)
                 .resizable(true)
                 .default_width(w)
-                .width_range(200.0..=420.0)
-                .frame(theme::panel_frame())
+                .width_range(lo..=hi)
+                .frame(dock_strip_frame(col))
                 .show(ctx, |ui| {
                     if freeze {
                         ui.disable();
                     }
                     let nw = ui.available_width();
-                    if let Some(c) = self.dock.right_columns.get_mut(ci) {
-                        if (c.width - nw).abs() > 0.5 {
-                            c.width = nw;
-                            self.dock_dirty = true;
+                    if geom_ok {
+                        if let Some(c) = self.dock.right_columns.get_mut(ci) {
+                            if (c.width - nw).abs() > 0.5 {
+                                c.width = nw;
+                                self.dock_dirty = true;
+                            }
                         }
                     }
                     self.dock
@@ -3304,86 +4566,66 @@ impl BeautifulApp {
                     });
                 });
         }
+    }
 
-        for floating in floating {
-            let kind = floating.kind;
-            if !self.dock.floating.iter().any(|f| f.kind == kind) {
-                continue;
-            }
-            let mut open = true;
-            let frame = egui::Frame::new()
-                .fill(theme::menu_fill())
-                .stroke(egui::Stroke::new(1.0_f32, theme::stroke()))
-                .corner_radius(8.0)
-                .inner_margin(egui::Margin::same(8));
-            egui::Window::new(kind.title())
-                .id(egui::Id::new(("float_panel", kind.title())))
-                .title_bar(false)
-                .open(&mut open)
-                .current_pos(egui::pos2(floating.pos[0], floating.pos[1]))
-                .default_size(egui::vec2(floating.size[0], floating.size[1]))
+    fn render_dock_after_chrome(&mut self, ctx: &egui::Context) {
+        let freeze = false;
+        let geom_ok = dock_geom_active(ctx);
+        let bottom_rows = self.dock.bottom_rows.clone();
+        let dragging = self.dock.drag.is_some() && !freeze;
+
+        for (ci, col) in bottom_rows.iter().enumerate() {
+            let id = egui::Id::new(("dock_bottom_row", ci));
+            let (lo, hi) = crate::dock::row_height_range(col);
+            let h = col.width.clamp(lo, hi);
+            egui::TopBottomPanel::bottom(id)
                 .resizable(true)
-                .collapsible(false)
-                .movable(false)
-                .frame(frame)
+                .default_height(h)
+                .height_range(lo..=hi)
+                .frame(dock_strip_frame(col))
                 .show(ctx, |ui| {
                     if freeze {
                         ui.disable();
                     }
-                    theme::apply_opaque_chrome(ui);
-                    if crate::dock::floating_grip_strip(ui, kind, &mut self.dock) {
-                        self.dock_dirty = true;
-                    }
-                    if self.dock.floating.iter().any(|f| f.kind == kind) {
-                        let enabled = !matches!(kind, PanelKind::Navigator | PanelKind::Layers)
-                            || !self.canvas.tool_edit_lock();
-                        egui::ScrollArea::vertical()
-                            .id_salt(("float_scroll", kind.title()))
-                            .scroll_source(egui::scroll_area::ScrollSource {
-                                scroll_bar: true,
-                                drag: false, // LMB/RMB drag must not scroll panels
-                                mouse_wheel: true,
-                            })
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                ui.add_enabled_ui(enabled, |ui| {
-                                    ui::render_panel_kind(
-                                        ui,
-                                        kind,
-                                        &mut self.document,
-                                        &mut self.canvas,
-                                        &mut self.color_state,
-                                        &mut self.tool,
-                                        &mut self.tool_pages,
-                                        &mut self.brush_panel,
-                                        &mut self.layer_ui,
-                                        self.settings.zoom_step_factor(),
-                                        &mut self.tool_session,
-                                    );
-                                });
-                            });
-                    }
-                    // Only sync size — writing back min_rect.pos drifts BR by inner_margin each frame.
-                    let size = [
-                        ui.max_rect().width().max(200.0),
-                        ui.max_rect().height().max(120.0),
-                    ];
-                    if let Some(f) = self.dock.floating.iter().find(|f| f.kind == kind) {
-                        if (f.size[0] - size[0]).abs() > 1.0 || (f.size[1] - size[1]).abs() > 1.0 {
-                            self.dock
-                                .update_floating_rect(kind, f.pos, size);
-                            self.dock_dirty = true;
+                    let nh = ui.available_height();
+                    if geom_ok {
+                        if let Some(c) = self.dock.bottom_rows.get_mut(ci) {
+                            if (c.width - nh).abs() > 0.5 {
+                                c.width = nh;
+                                self.dock_dirty = true;
+                            }
                         }
                     }
+                    self.dock
+                        .column_rects
+                        .push((DockSide::Bottom, ci, ui.max_rect()));
+                    self.render_dock_row(ui, DockSide::Bottom, ci, &col.panels);
                 });
-            if !open {
-                self.dock.hide_panel(kind);
-                self.dock_dirty = true;
-            }
+        }
+        if dragging && bottom_rows.is_empty() {
+            egui::TopBottomPanel::bottom("dock_bottom_rail")
+                .exact_height(22.0)
+                .resizable(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgba_unmultiplied(255, 140, 66, 40)),
+                )
+                .show(ctx, |ui| {
+                    self.dock
+                        .column_rects
+                        .push((DockSide::Bottom, 0, ui.max_rect()));
+                    ui.centered_and_justified(|ui| {
+                        ui.label(theme::label_dim("▼"));
+                    });
+                });
         }
 
-        // Resolve drop only AFTER column/slot hit-rects are registered.
+        self.render_float_hosts(ctx);
+
+        if self.dock.host_move.is_some() {
+            ctx.request_repaint();
+        }
+
         if !freeze && self.dock.drag.is_some() {
             if let Some(pos) = ctx.pointer_interact_pos() {
                 if let Some(d) = self.dock.drag.as_mut() {
@@ -3417,20 +4659,12 @@ impl BeautifulApp {
             return;
         }
 
-        let mut weights = match side {
-            DockSide::Left => self
-                .dock
-                .left_columns
-                .get(column)
-                .map(|c| c.weights.clone())
-                .unwrap_or_default(),
-            DockSide::Right => self
-                .dock
-                .right_columns
-                .get(column)
-                .map(|c| c.weights.clone())
-                .unwrap_or_default(),
-        };
+        let mut weights = self
+            .dock
+            .strips(side)
+            .get(column)
+            .map(|c| c.weights.clone())
+            .unwrap_or_default();
         while weights.len() < kinds.len() {
             weights.push(1.0);
         }
@@ -3520,18 +4754,7 @@ impl BeautifulApp {
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 for (i, kind) in kinds.iter().enumerate() {
-                    let still_here = match side {
-                        DockSide::Left => self
-                            .dock
-                            .left_columns
-                            .get(column)
-                            .is_some_and(|c| c.panels.contains(kind)),
-                        DockSide::Right => self
-                            .dock
-                            .right_columns
-                            .get(column)
-                            .is_some_and(|c| c.panels.contains(kind)),
-                    };
+                    let still_here = self.dock.strip_has(side, column, *kind);
                     if !still_here {
                         continue;
                     }
@@ -3578,6 +4801,9 @@ impl BeautifulApp {
                                             &mut self.layer_ui,
                                             self.settings.zoom_step_factor(),
                                             &mut self.tool_session,
+                                            &mut self.settings,
+                                            &mut self.preset_library,
+                                            &mut self.preset_browser,
                                         );
                                     });
                                 });
@@ -3596,6 +4822,9 @@ impl BeautifulApp {
                                     &mut self.layer_ui,
                                     self.settings.zoom_step_factor(),
                                     &mut self.tool_session,
+                                    &mut self.settings,
+                                    &mut self.preset_library,
+                                    &mut self.preset_browser,
                                 );
                             });
                             if kind.hugs_content() {
@@ -3617,6 +4846,7 @@ impl BeautifulApp {
                         &mut self.dock,
                         Some(side),
                         Some(column),
+                        None,
                         panel_rect,
                     ) {
                         self.dock_dirty = true;
@@ -3639,15 +4869,448 @@ impl BeautifulApp {
                 }
             });
     }
+
+    fn render_dock_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        side: DockSide,
+        column: usize,
+        kinds: &[PanelKind],
+    ) {
+        if kinds.is_empty() {
+            return;
+        }
+        let mut weights = self
+            .dock
+            .strips(side)
+            .get(column)
+            .map(|c| c.weights.clone())
+            .unwrap_or_default();
+        while weights.len() < kinds.len() {
+            weights.push(1.0);
+        }
+        weights.truncate(kinds.len());
+        let splitter_w = 6.0;
+        let row_w = ui.available_width().max(80.0);
+        let body_w = (row_w - splitter_w * kinds.len().saturating_sub(1) as f32).max(40.0);
+        let w_sum: f32 = weights.iter().sum::<f32>().max(0.01);
+        let mut widths: Vec<f32> = weights.iter().map(|w| body_w * (*w) / w_sum).collect();
+        for (i, kind) in kinds.iter().enumerate() {
+            if kind.hugs_content() {
+                widths[i] = widths[i].max(52.0);
+            } else {
+                widths[i] = widths[i].max(120.0);
+            }
+        }
+
+        let row_h = ui.available_height().max(48.0);
+        ui.horizontal(|ui| {
+            ui.set_min_height(row_h);
+            for (i, kind) in kinds.iter().enumerate() {
+                if !self.dock.strip_has(side, column, *kind) {
+                    continue;
+                }
+                let pw = widths.get(i).copied().unwrap_or(160.0);
+                let (panel_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(pw, row_h), egui::Sense::hover());
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(panel_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                child.set_clip_rect(panel_rect);
+                let enabled = !matches!(kind, PanelKind::Navigator | PanelKind::Layers)
+                    || !self.canvas.tool_edit_lock();
+                child.add_space(2.0);
+                child.add_enabled_ui(enabled, |ui| {
+                    ui::render_panel_kind(
+                        ui,
+                        *kind,
+                        &mut self.document,
+                        &mut self.canvas,
+                        &mut self.color_state,
+                        &mut self.tool,
+                        &mut self.tool_pages,
+                        &mut self.brush_panel,
+                        &mut self.layer_ui,
+                        self.settings.zoom_step_factor(),
+                        &mut self.tool_session,
+                        &mut self.settings,
+                        &mut self.preset_library,
+                        &mut self.preset_browser,
+                    );
+                });
+                if crate::dock::panel_corner_zone(
+                    ui,
+                    *kind,
+                    &mut self.dock,
+                    Some(side),
+                    Some(column),
+                    None,
+                    panel_rect,
+                ) {
+                    self.dock_dirty = true;
+                }
+                self.dock.slot_rects.push((side, column, i, panel_rect));
+                if i + 1 < kinds.len()
+                    && crate::dock::panel_splitter_h(
+                        ui,
+                        side,
+                        column,
+                        i,
+                        &mut self.dock,
+                        body_w,
+                    )
+                {
+                    self.dock_dirty = true;
+                }
+            }
+        });
+    }
+
+    fn render_float_hosts(&mut self, ctx: &egui::Context) {
+        let min_clicked = ctx.data(|d| {
+            d.get_temp::<bool>(egui::Id::new("beautiful_hide_floats_min"))
+                .unwrap_or(false)
+        });
+        if min_clicked {
+            ctx.data_mut(|d| {
+                d.remove::<bool>(egui::Id::new("beautiful_hide_floats_min"));
+            });
+        }
+        let main_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        let hide_floats = main_minimized || min_clicked;
+        let hosts = self.dock.float_hosts.clone();
+        let live: std::collections::HashSet<u64> = hosts.iter().map(|h| h.id).collect();
+        self.float_viewports_live.retain(|id| live.contains(id));
+
+        for host in hosts {
+            if !self.dock.float_hosts.iter().any(|h| h.id == host.id) {
+                continue;
+            }
+            let first_show = self.float_viewports_live.insert(host.id);
+            let title = host
+                .panels
+                .iter()
+                .map(|k| crate::i18n::t(k.title()))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let mut builder = egui::ViewportBuilder::default()
+                .with_title(title.clone())
+                .with_decorations(false)
+                .with_transparent(true)
+                .with_resizable(true)
+                .with_always_on_top()
+                .with_taskbar(false)
+                .with_visible(!hide_floats)
+                .with_min_inner_size([52.0, 80.0]);
+            if first_show {
+                builder = builder
+                    .with_inner_size([host.size[0].max(52.0), host.size[1].max(80.0)])
+                    .with_position(egui::pos2(host.pos[0], host.pos[1]));
+            }
+
+            let mut close = false;
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of(("dock_float_host", host.id)),
+                builder,
+                |vp_ctx, class| {
+                    if vp_ctx.input(|i| i.viewport().close_requested()) {
+                        close = true;
+                    }
+                    handle_frameless_resize_borders(vp_ctx, true);
+
+                    let (inner, outer, monitor) = vp_ctx.input(|i| {
+                        let v = i.viewport();
+                        (v.inner_rect, v.outer_rect, v.monitor_size)
+                    });
+                    if let Some(o) = outer {
+                        self.dock.float_host_rects.push((host.id, o));
+                    }
+
+                    let tools_only = host.panels.len() == 1 && host.panels[0] == PanelKind::Tools;
+                    let frame = if tools_only {
+                        theme::tools_strip_frame()
+                    } else {
+                        theme::float_host_frame()
+                    };
+
+                    let mut paint = |ui: &mut egui::Ui| {
+                        theme::apply_opaque_chrome(ui);
+                        if crate::dock::float_host_grip(ui, &mut self.dock, host.id) {
+                            self.dock_dirty = true;
+                        }
+                        let local0 = ui.min_rect().min;
+                        let vp_rect_to_screen = |r: egui::Rect| -> egui::Rect {
+                            match outer {
+                                Some(out) => egui::Rect::from_min_size(
+                                    egui::pos2(
+                                        out.min.x + (r.min.x - local0.x),
+                                        out.min.y + (r.min.y - local0.y),
+                                    ),
+                                    r.size(),
+                                ),
+                                None => r,
+                            }
+                        };
+
+                        let moving_this = self
+                            .dock
+                            .host_move
+                            .as_ref()
+                            .is_some_and(|m| m.host_id == host.id);
+                        if moving_this {
+                            let ppp = vp_ctx.pixels_per_point();
+                            let pointer = crate::os_win::cursor_screen_points(ppp).or_else(|| {
+                                ui.ctx().pointer_latest_pos().map(|p| match (inner, outer) {
+                                    (Some(inn), Some(out)) => egui::pos2(
+                                        out.min.x + (p.x - inn.min.x),
+                                        out.min.y + (p.y - inn.min.y),
+                                    ),
+                                    _ => p,
+                                })
+                            });
+                            let size = outer
+                                .map(|o| [o.width().max(52.0), o.height().max(80.0)])
+                                .unwrap_or(host.size);
+                            let win0 = outer
+                                .map(|o| [o.min.x, o.min.y])
+                                .unwrap_or(host.pos);
+                            #[cfg(windows)]
+                            let released = !crate::os_win::primary_mouse_down();
+                            #[cfg(not(windows))]
+                            let released = ui.input(|i| !i.pointer.primary_down());
+                            if let Some(p) = pointer {
+                                let mut grab = self
+                                    .dock
+                                    .host_move
+                                    .map(|m| m.grab)
+                                    .unwrap_or(egui::Vec2::ZERO);
+                                let ready = self.dock.host_move.is_some_and(|m| m.ready);
+                                if !ready {
+                                    grab = egui::vec2(p.x - win0[0], p.y - win0[1]);
+                                    if let Some(m) = self.dock.host_move.as_mut() {
+                                        m.grab = grab;
+                                        m.ready = true;
+                                    }
+                                }
+                                let mut pos = [p.x - grab.x, p.y - grab.y];
+                                if released {
+                                    let mut guides: Vec<egui::Rect> = self
+                                        .dock
+                                        .float_hosts
+                                        .iter()
+                                        .filter(|h| h.id != host.id)
+                                        .map(|h| {
+                                            egui::Rect::from_min_size(
+                                                egui::pos2(h.pos[0], h.pos[1]),
+                                                egui::vec2(h.size[0], h.size[1]),
+                                            )
+                                        })
+                                        .collect();
+                                    if let Some(m) = self.dock.main_outer {
+                                        guides.push(m);
+                                    }
+                                    let probe = egui::Rect::from_min_size(
+                                        egui::pos2(pos[0], pos[1]),
+                                        egui::vec2(size[0], size[1]),
+                                    );
+                                    let work =
+                                        crate::dock::inferred_work_area(probe, monitor);
+                                    pos = crate::dock::snap_host_pos(pos, size, &guides, work);
+                                    self.dock.host_move = None;
+                                }
+                                vp_ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                                    egui::pos2(pos[0], pos[1]),
+                                ));
+                                self.dock.update_host_rect(host.id, pos, size);
+                                self.dock_dirty = true;
+                            } else if released {
+                                self.dock.host_move = None;
+                            }
+                            ui.ctx().request_repaint();
+                        }
+
+                        let columns = self
+                            .dock
+                            .float_hosts
+                            .iter()
+                            .find(|h| h.id == host.id)
+                            .map(|h| {
+                                let mut h = h.clone();
+                                h.ensure_columns();
+                                h.columns
+                            })
+                            .unwrap_or_default();
+
+                        let mut local_cols: Vec<(usize, egui::Rect)> = Vec::new();
+                        let mut local_slots: Vec<(usize, usize, egui::Rect)> = Vec::new();
+                        let row_h = ui.available_height().max(48.0);
+                        ui.horizontal(|ui| {
+                            ui.set_min_height(row_h);
+                            for (ci, col) in columns.iter().enumerate() {
+                                let cw = col.width.clamp(52.0, 480.0).min(ui.available_width().max(52.0));
+                                let (col_rect, _) = ui
+                                    .allocate_exact_size(egui::vec2(cw, row_h), egui::Sense::hover());
+                                local_cols.push((ci, col_rect));
+                                self.dock.float_column_rects.push((
+                                    host.id,
+                                    ci,
+                                    vp_rect_to_screen(col_rect),
+                                ));
+                                let n = col.panels.len().max(1);
+                                let ph = (col_rect.height() / n as f32).max(48.0);
+                                for (pi, kind) in col.panels.iter().enumerate() {
+                                    let slot = egui::Rect::from_min_size(
+                                        egui::pos2(
+                                            col_rect.left(),
+                                            col_rect.top() + ph * pi as f32,
+                                        ),
+                                        egui::vec2(col_rect.width(), ph),
+                                    );
+                                    local_slots.push((ci, pi, slot));
+                                    self.dock.float_slot_rects.push((
+                                        host.id,
+                                        ci,
+                                        pi,
+                                        vp_rect_to_screen(slot),
+                                    ));
+                                    let mut child = ui.new_child(
+                                        egui::UiBuilder::new()
+                                            .max_rect(slot)
+                                            .layout(egui::Layout::top_down(egui::Align::Min)),
+                                    );
+                                    child.set_clip_rect(slot);
+                                    let enabled =
+                                        !matches!(kind, PanelKind::Navigator | PanelKind::Layers)
+                                            || !self.canvas.tool_edit_lock();
+                                    child.add_enabled_ui(enabled, |ui| {
+                                        ui::render_panel_kind(
+                                            ui,
+                                            *kind,
+                                            &mut self.document,
+                                            &mut self.canvas,
+                                            &mut self.color_state,
+                                            &mut self.tool,
+                                            &mut self.tool_pages,
+                                            &mut self.brush_panel,
+                                            &mut self.layer_ui,
+                                            self.settings.zoom_step_factor(),
+                                            &mut self.tool_session,
+                                            &mut self.settings,
+                                            &mut self.preset_library,
+                                            &mut self.preset_browser,
+                                        );
+                                    });
+                                    if crate::dock::panel_corner_zone(
+                                        ui,
+                                        *kind,
+                                        &mut self.dock,
+                                        None,
+                                        None,
+                                        Some(host.id),
+                                        slot,
+                                    ) {
+                                        self.dock_dirty = true;
+                                    }
+                                }
+                            }
+                        });
+                        crate::dock::paint_float_drop_preview(
+                            ui.painter(),
+                            &self.dock,
+                            host.id,
+                            &local_cols,
+                            &local_slots,
+                        );
+
+                        if !moving_this && !hide_floats {
+                            if let (Some(inn), Some(out)) = (inner, outer) {
+                                let size = [inn.width().max(52.0), inn.height().max(80.0)];
+                                let pos = [out.min.x, out.min.y];
+                                if let Some(h) =
+                                    self.dock.float_hosts.iter().find(|h| h.id == host.id)
+                                {
+                                    let moved = (h.pos[0] - pos[0]).abs() > 1.0
+                                        || (h.pos[1] - pos[1]).abs() > 1.0
+                                        || (h.size[0] - size[0]).abs() > 1.0
+                                        || (h.size[1] - size[1]).abs() > 1.0;
+                                    if moved {
+                                        self.dock.update_host_rect(host.id, pos, size);
+                                        self.dock_dirty = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                            if self.dock.drag.is_some() {
+                                let screen = match (inner, outer) {
+                                    (Some(inn), Some(out)) => egui::pos2(
+                                        out.min.x + (pos.x - inn.min.x),
+                                        out.min.y + (pos.y - inn.min.y),
+                                    ),
+                                    _ => pos,
+                                };
+                                if let Some(d) = self.dock.drag.as_mut() {
+                                    d.pointer = pos;
+                                }
+                                let skip = self.dock.drag.as_ref().and_then(|d| d.from_host);
+                                self.dock.update_drop_from_screen(screen, skip);
+                                if ui.input(|i| i.pointer.any_released()) {
+                                    if self.dock.finish_drag() {
+                                        self.dock_dirty = true;
+                                    }
+                                }
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    };
+
+                    if class == egui::ViewportClass::Embedded {
+                        let mut open = true;
+                        egui::Window::new(title.clone())
+                            .id(egui::Id::new(("float_host_embed", host.id)))
+                            .title_bar(false)
+                            .open(&mut open)
+                            .current_pos(egui::pos2(host.pos[0], host.pos[1]))
+                            .default_size(egui::vec2(host.size[0], host.size[1]))
+                            .resizable(true)
+                            .collapsible(false)
+                            .frame(frame)
+                            .show(vp_ctx, |ui| paint(ui));
+                        if !open {
+                            close = true;
+                        }
+                    } else {
+                        egui::CentralPanel::default()
+                            .frame(frame)
+                            .show(vp_ctx, |ui| paint(ui));
+                    }
+                },
+            );
+
+            if close {
+                if let Some(h) = self.dock.float_hosts.iter().find(|h| h.id == host.id) {
+                    let kinds: Vec<_> = h
+                        .columns
+                        .iter()
+                        .flat_map(|c| c.panels.iter().copied())
+                        .chain(h.panels.iter().copied())
+                        .collect();
+                    for k in kinds {
+                        self.dock.hide_panel(k);
+                    }
+                }
+                self.dock_dirty = true;
+            }
+        }
+    }
 }
 
 impl Drop for BeautifulApp {
     fn drop(&mut self) {
-        self.tool_session
-            .capture_from_document(&self.document, self.tool);
-        self.tool_session.save();
-        self.dock.save();
-        self.tool_pages.save();
+        self.persist_session_files();
         self.autosave.shutdown_clean(&self.settings);
     }
 }
@@ -3699,7 +5362,12 @@ fn apply_window_material(cc: &eframe::CreationContext<'_>, settings: &AppSetting
     {
         apply_material_to_handle(cc, settings);
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        let enable = settings.material.uses_dwm_backdrop();
+        crate::os_linux_blur::apply(cc, enable);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = (cc, settings);
     }
@@ -3710,7 +5378,12 @@ fn apply_window_material_runtime(frame: &mut eframe::Frame, settings: &AppSettin
     {
         apply_material_to_handle(&mut *frame, settings);
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        let enable = settings.material.uses_dwm_backdrop();
+        crate::os_linux_blur::apply(frame, enable);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = (frame, settings);
     }
@@ -3728,44 +5401,38 @@ fn apply_material_to_handle(
     let _ = window_vibrancy::clear_mica(&window);
     let _ = window_vibrancy::clear_blur(&window);
 
-    let strength = settings.acrylic_strength.clamp(0.0, 1.0);
+    let strength = settings.acrylic_strength.clamp(0.0, 1.0); // blur amount
+    let tint_amt = settings.material_tint.clamp(0.0, 1.0);
+    let matte = settings.material_matte.clamp(0.0, 1.0);
     let c = settings.app_color;
     let dark = Some(matches!(
         settings.theme_brightness,
         crate::settings::ThemeBrightness::Dark
     ));
+    let material = settings.material.normalize();
 
-    // Tint alpha: Glass more see-through, Smoke darker plate, Acrylic mid.
-    let tint = match settings.material {
+    // DWM can't change blur radius — we control how much frosted backdrop shows:
+    // high blur → lighter tint overlay; matte adds milk independently.
+    let tint = match material {
         UiMaterial::Glass => {
-            let a = (30.0 + strength * 90.0) as u8;
+            let clear = 14.0 + (1.0 - strength) * 90.0; // more blur → clearer
+            let milk = matte * 75.0;
+            let a = ((clear + milk) * tint_amt).round().clamp(6.0, 200.0) as u8;
             Some((c[0], c[1], c[2], a))
         }
-        UiMaterial::Smoke => {
-            let a = (80.0 + strength * 120.0) as u8;
-            Some((
-                c[0].saturating_mul(2) / 3,
-                c[1].saturating_mul(2) / 3,
-                c[2].saturating_mul(2) / 3,
-                a,
-            ))
+        UiMaterial::Acrylic | UiMaterial::Mica => {
+            let clear = 22.0 + (1.0 - strength) * 110.0;
+            let milk = matte * 90.0;
+            let a = ((clear + milk) * tint_amt).round().clamp(10.0, 220.0) as u8;
+            Some((c[0], c[1], c[2], a))
         }
-        UiMaterial::LegacyGlass => {
-            let a = (50.0 + strength * 110.0) as u8;
-            Some((
-                c[0].saturating_add(20).min(255),
-                c[1].saturating_add(30).min(255),
-                c[2].saturating_add(40).min(255),
-                a,
-            ))
-        }
-        UiMaterial::Acrylic | UiMaterial::Mica | UiMaterial::Solid => {
-            let a = (40.0 + strength * 160.0) as u8;
+        UiMaterial::Solid | UiMaterial::LegacyGlass | UiMaterial::Smoke => {
+            let a = ((40.0 + (1.0 - strength) * 140.0) * tint_amt).round() as u8;
             Some((c[0], c[1], c[2], a))
         }
     };
 
-    let result = match settings.material {
+    let result = match material {
         UiMaterial::Solid => Ok(()),
         _ if !crate::os_win::dwm_backdrop_supported() => {
             crate::action_log::log(
@@ -3778,12 +5445,16 @@ fn apply_material_to_handle(
             crate::action_log::log("ui", &format!("mica unavailable ({e}), acrylic fallback"));
             window_vibrancy::apply_acrylic(&window, tint)
         }),
-        // Win11: legacy glass blur often breaks with DxgiFromVisual — acrylic + cool tint.
-        UiMaterial::LegacyGlass | UiMaterial::Acrylic | UiMaterial::Glass | UiMaterial::Smoke => {
-            window_vibrancy::apply_acrylic(&window, tint).or_else(|e| {
-                crate::action_log::log("ui", &format!("acrylic failed ({e}), blur fallback"));
-                window_vibrancy::apply_blur(&window, tint)
-            })
+        UiMaterial::Acrylic => window_vibrancy::apply_acrylic(&window, tint).or_else(|e| {
+            crate::action_log::log("ui", &format!("acrylic failed ({e}), blur fallback"));
+            window_vibrancy::apply_blur(&window, tint)
+        }),
+        UiMaterial::Glass => window_vibrancy::apply_acrylic(&window, tint).or_else(|e| {
+            crate::action_log::log("ui", &format!("glass acrylic failed ({e}), blur fallback"));
+            window_vibrancy::apply_blur(&window, tint)
+        }),
+        UiMaterial::LegacyGlass | UiMaterial::Smoke => {
+            window_vibrancy::apply_acrylic(&window, tint)
         }
     };
 
@@ -3791,18 +5462,27 @@ fn apply_material_to_handle(
         Ok(()) => crate::action_log::log(
             "ui",
             &format!(
-                "material={:?} strength={:.2}",
-                settings.material, settings.acrylic_strength
+                "material={:?} strength={:.2} tint={:.2}",
+                material, settings.acrylic_strength, settings.material_tint
             ),
         ),
         Err(e) => crate::action_log::log("ui", &format!("material apply failed: {e}")),
     }
 }
 
-fn seed_side_panel_width(ctx: &egui::Context, id: egui::Id, width: f32, left: bool) {
+fn seed_side_panel_width(
+    ctx: &egui::Context,
+    id: egui::Id,
+    width: f32,
+    left: bool,
+    min_w: f32,
+    max_w: f32,
+) {
     let content = ctx.content_rect();
     let height = content.height().max(1.0);
-    let width = width.clamp(200.0, 420.0).min(content.width().max(200.0));
+    let width = width
+        .clamp(min_w, max_w)
+        .min(content.width().max(min_w));
     let rect = if left {
         egui::Rect::from_min_size(content.left_top(), egui::vec2(width, height))
     } else {
@@ -3816,17 +5496,62 @@ fn seed_side_panel_width(ctx: &egui::Context, id: egui::Id, width: f32, left: bo
     });
 }
 
+fn seed_tb_panel_height(
+    ctx: &egui::Context,
+    id: egui::Id,
+    height: f32,
+    top: bool,
+    min_h: f32,
+    max_h: f32,
+) {
+    let content = ctx.content_rect();
+    let width = content.width().max(1.0);
+    let height = height
+        .clamp(min_h, max_h)
+        .min(content.height().max(min_h));
+    let rect = if top {
+        egui::Rect::from_min_size(content.left_top(), egui::vec2(width, height))
+    } else {
+        egui::Rect::from_min_max(
+            egui::pos2(content.left(), content.bottom() - height),
+            content.right_bottom(),
+        )
+    };
+    ctx.data_mut(|d| {
+        d.insert_persisted(id, egui::containers::panel::PanelState { rect });
+    });
+}
+
+fn dock_geom_active(ctx: &egui::Context) -> bool {
+    let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+    if minimized {
+        return false;
+    }
+    let r = ctx.content_rect();
+    r.width() >= 400.0 && r.height() >= 280.0
+}
+
+fn dock_strip_frame(col: &crate::dock::DockColumn) -> egui::Frame {
+    if col.panels.len() == 1 && col.panels[0] == PanelKind::Tools {
+        theme::tools_strip_frame()
+    } else {
+        theme::panel_frame()
+    }
+}
+
 fn sync_window_geometry(
     ctx: &egui::Context,
     settings: &mut AppSettings,
     dirty: &mut bool,
 ) {
-    let (maximized, inner, outer) = ctx.input(|i| {
+    let (maximized, minimized, inner, outer, monitor) = ctx.input(|i| {
         let vp = i.viewport();
         (
             vp.maximized.unwrap_or(false),
+            vp.minimized.unwrap_or(false),
             vp.inner_rect.map(|r| r.size()),
             vp.outer_rect.map(|r| r.min),
+            vp.monitor_size,
         )
     });
 
@@ -3835,11 +5560,17 @@ fn sync_window_geometry(
         *dirty = true;
     }
 
-    // Keep last restored size/pos while maximized so next launch can restore the windowed rect.
-    if !maximized {
+    // Keep last restored size/pos while maximized/minimized so restore is not a tiny rect.
+    if !maximized && !minimized {
+        let covers_monitor = inner.zip(monitor).is_some_and(|(size, m)| {
+            (size.x - m.x).abs() < 12.0 && (size.y - m.y).abs() < 12.0
+        });
         if let Some(size) = inner {
+            // Tab hide-UI covers the whole monitor (taskbar included). Never
+            // persist that — next boot would spawn over other windows.
             let next = [size.x.round(), size.y.round()];
-            if settings.window_inner_size != Some(next)
+            if !covers_monitor
+                && settings.window_inner_size != Some(next)
                 && next[0] >= 960.0
                 && next[1] >= 640.0
             {
@@ -3848,8 +5579,8 @@ fn sync_window_geometry(
             }
         }
         if let Some(pos) = outer {
-            let next = [pos.x.round(), pos.y.round()];
-            if settings.window_outer_pos != Some(next) {
+            let next = [pos.x.round().max(0.0), pos.y.round().max(0.0)];
+            if !covers_monitor && settings.window_outer_pos != Some(next) {
                 settings.window_outer_pos = Some(next);
                 *dirty = true;
             }
@@ -3858,7 +5589,9 @@ fn sync_window_geometry(
 }
 
 /// Invisible edge grips so undecorated windows stay resizable on Windows.
-fn handle_frameless_resize_borders(ctx: &egui::Context) {
+/// `skip_top`: float hosts — top strip is the move grip; native north resize
+/// also pops Windows Snap layouts.
+fn handle_frameless_resize_borders(ctx: &egui::Context, skip_top: bool) {
     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
     if maximized {
         return;
@@ -3944,6 +5677,29 @@ fn handle_frameless_resize_borders(ctx: &egui::Context) {
         egui::UiBuilder::new().layer_id(layer).max_rect(rect),
     );
     for (id, hit, dir, cursor) in edges {
+        if skip_top
+            && matches!(
+                dir,
+                egui::ResizeDirection::North
+                    | egui::ResizeDirection::NorthWest
+                    | egui::ResizeDirection::NorthEast
+            )
+        {
+            continue;
+        }
+        let hit = if skip_top
+            && matches!(
+                dir,
+                egui::ResizeDirection::West | egui::ResizeDirection::East
+            )
+        {
+            egui::Rect::from_min_max(
+                egui::pos2(hit.left(), hit.top().max(rect.top() + 14.0)),
+                hit.max,
+            )
+        } else {
+            hit
+        };
         let resp = ui.interact(hit, egui::Id::new(id), egui::Sense::drag());
         if resp.hovered() {
             ctx.set_cursor_icon(cursor);
@@ -3952,4 +5708,28 @@ fn handle_frameless_resize_borders(ctx: &egui::Context) {
             ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
         }
     }
+}
+
+fn user_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+}
+
+fn known_folder(name: &str) -> Option<std::path::PathBuf> {
+    user_home()
+        .map(|h| h.join(name))
+        .filter(|p| p.is_dir())
+}
+
+fn pictures_dir() -> Option<std::path::PathBuf> {
+    known_folder("Pictures")
+}
+
+fn music_dir() -> Option<std::path::PathBuf> {
+    known_folder("Music")
+}
+
+fn videos_dir() -> Option<std::path::PathBuf> {
+    known_folder("Videos").or_else(|| known_folder("Pictures"))
 }

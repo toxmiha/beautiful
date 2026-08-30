@@ -4,13 +4,38 @@
 //! quad so the main canvas is no longer an egui `TextureHandle` mesh.
 //! UI panels remain egui; input still comes through eframe for now.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
 use eframe::egui_wgpu::{self, wgpu};
 use egui::PaintCallbackInfo;
 
 use beautiful_core::{
-    apply_mip_action, mip_dims, mip_size_matches, plan_display_frame, plan_mip_action,
-    skip_projection_for_mip, DirtyRect, DisplayMip, Document, MAX_GPU_TEX_SIDE, DISPLAY_VIEW_PAD,
+    extract_display_tile_pixels, gpu_tile_cache_retain_all, plan_display_frame, display_tile_key,
+    tile_doc_rect, DisplayTileCache, DirtyRect, DisplayMip, Document, DISPLAY_TILE_DOC,
+    DISPLAY_VIEW_PAD,
 };
+
+/// Max display tiles drawn per frame (512-doc tiles).
+const MAX_TILE_DRAW: usize = 512;
+
+/// Stroke dirty uploads stay small so brush latency stays low.
+const MAX_TILE_UPLOAD_STROKE: usize = 24;
+/// Gap fill per frame: extract from already-composited dense is memcpy.
+/// Dump 1788011359: defer-all during zoom left 12k gap counts vs 12 composes
+/// and checkerboard holes after zoom-out. Fill now, do not wait for gesture end.
+const MAX_TILE_UPLOAD_GAP: usize = 48;
+
+struct GpuDisplayTile {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+    doc_rect: DirtyRect,
+    tw: u32,
+    th: u32,
+    /// `Document::content_revision` at last upload — MCP/F12 stale check.
+    content_rev: u64,
+}
 
 /// wgpu `write_texture` requires `bytes_per_row` multiple of 256 when height > 1.
 fn align_bytes_per_row(width_px: u32) -> u32 {
@@ -55,15 +80,27 @@ pub struct CanvasDrawParams {
     pub display_h: f32,
     pub rotation_deg: f32,
     pub flip_h: bool,
-    /// Expected GPU texture size (doc or mip). Paint is skipped on mismatch.
+    pub doc_w: f32,
+    pub doc_h: f32,
+    /// Stage/crop origin inside the buffer (0 when no pasteboard).
+    pub stage_ox: f32,
+    pub stage_oy: f32,
+    /// Logical canvas size (stage). Equals doc_w/h when no pasteboard.
+    pub stage_w: f32,
+    pub stage_h: f32,
+    /// Expected GPU texture size (doc or mip). Unused on display-tile path.
     pub expect_tex_w: u32,
     pub expect_tex_h: u32,
+    /// Per-tile GPU display (512-doc tiles, GL vertex scale on zoom).
+    pub display_tiles: bool,
+    /// Doc-space view cover for tile culling / readiness.
+    pub cover: DirtyRect,
 }
 
 /// Live gradient overlay params (screen-only; layer untouched until Apply).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct GradientPreviewParams {
-    /// Document pixel coords.
+    /// Document pixel coords (view / stage space, same as the overlay quad UV).
     pub start: (f32, f32),
     pub end: (f32, f32),
     pub doc_w: f32,
@@ -77,6 +114,18 @@ pub struct GradientPreviewParams {
     pub interp: u32,
     /// Ordered Bayer dither (anti-banding), same as Apply.
     pub dither: bool,
+    /// Selection clip in view space. `alpha` is 0..=255, tightly boxed.
+    pub clip: Option<GradientClipMask>,
+}
+
+/// GPU overlay clip (lasso / ellipse). Rect marquees can use a 1×1 white mask.
+#[derive(Clone)]
+pub struct GradientClipMask {
+    pub origin: (f32, f32),
+    pub size: (f32, f32),
+    pub width: u32,
+    pub height: u32,
+    pub alpha: Arc<[u8]>,
 }
 
 /// Max above layers restored by GPU InStack (atlas + FS loop). Over → Path C.
@@ -96,7 +145,7 @@ pub struct InStackLayerGpu {
     /// 0 Soft .. 4 Overlay, 5 Normal.
     pub mode: u32,
     pub opacity: f32,
-    /// Clip-to-below base: 0=none, 1=float, 2+N=atlas slot N (matches CPU nearest_paintable).
+    /// Clip-to-below base: 0=none, 1=float, 2+N=atlas slot N (clip group base).
     pub clip: u32,
 }
 
@@ -126,7 +175,76 @@ struct GradUniforms {
     color1: [f32; 4],
     params: [f32; 4],
     doc_size: [f32; 2],
+    clip_origin: [f32; 2],
+    clip_size: [f32; 2],
     _pad: [f32; 2],
+}
+
+const _: () = assert!(std::mem::size_of::<GradUniforms>() == 96);
+
+fn clip_mask_key(clip: &GradientClipMask) -> u64 {
+    (clip.alpha.as_ptr() as usize as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(clip.width as u64)
+        .wrapping_add((clip.height as u64) << 32)
+}
+
+fn create_grad_mask_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let w = w.max(1);
+    let h = h.max(1);
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("grad_clip_mask"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
+}
+
+fn write_rgba8_texture(queue: &wgpu::Queue, tex: &wgpu::Texture, w: u32, h: u32, rgba: &[u8]) {
+    let w = w.max(1);
+    let h = h.max(1);
+    let row_bytes = (w as usize).saturating_mul(4);
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+    let padded = row_bytes.div_ceil(align).saturating_mul(align);
+    let mut packed = vec![0u8; padded.saturating_mul(h as usize)];
+    let src_stride = row_bytes;
+    for y in 0..h as usize {
+        let src = y.saturating_mul(src_stride);
+        let dst = y.saturating_mul(padded);
+        let n = src_stride.min(rgba.len().saturating_sub(src));
+        if n > 0 {
+            packed[dst..dst + n].copy_from_slice(&rgba[src..src + n]);
+        }
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &packed,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(padded as u32),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 #[repr(C)]
@@ -165,8 +283,15 @@ pub struct CanvasGpuResources {
     tex_format: wgpu::TextureFormat,
     /// Gradient live preview overlay (reuses `vertex_buffer` for the same quad).
     grad_pipeline: wgpu::RenderPipeline,
+    grad_bgl: wgpu::BindGroupLayout,
     grad_bind_group: wgpu::BindGroup,
     grad_uniform_buffer: wgpu::Buffer,
+    grad_mask_tex: wgpu::Texture,
+    grad_mask_view: wgpu::TextureView,
+    grad_mask_samp: wgpu::Sampler,
+    grad_mask_w: u32,
+    grad_mask_h: u32,
+    grad_mask_key: u64,
     /// Soft Light transform overlay (underlay + Free float + Soft Light src).
     soft_pipeline: wgpu::RenderPipeline,
     soft_bgl: wgpu::BindGroupLayout,
@@ -184,14 +309,36 @@ pub struct CanvasGpuResources {
     soft_samp_nearest: wgpu::Sampler,
     /// Soft Light FS over AABB(∪above ∪ float OBB). Soft is omitted from underlay.
     soft_vertex_buffer: wgpu::Buffer,
+    /// Present plate long-side cap (2K or 4K from settings).
+    tex_side_cap: u32,
     /// Document-space AABB last uploaded into the current texture.
     /// Cleared on texture recreate. Early-out must not trust CPU mip coverage alone —
     /// otherwise a fresh/blank tex with "covered" mip shows checkerboard strips until
     /// something (e.g. navigator pan) forces another upload.
     uploaded_doc: DirtyRect,
+    /// CPU compose cache for display tile uploads.
+    display_tile_cache: DisplayTileCache,
+    /// Per-tile GPU textures keyed by (tx, ty).
+    gpu_display_tiles: HashMap<(i32, i32), GpuDisplayTile>,
+    /// Tile mode active (large-doc present path).
+    display_tile_mode: bool,
+    tile_vertex_buffer: wgpu::Buffer,
+    tile_draw_list: Vec<(i32, i32)>,
+    tile_filter_linear: bool,
+    tile_plate_lod: u32,
+    prev_cover: DirtyRect,
+    /// Matches [`crate::canvas::CanvasState::display_tile_epoch`] — stale tile cache guard.
+    display_tile_epoch: u64,
+    /// Gap-budget leftover tiles. Must NOT live in `composite.gpu_dirty` —
+    /// that queue is the live stroke extract list (`gpu_dirty_parts`).
+    tile_upload_remainder: Vec<DirtyRect>,
 }
 
 impl CanvasGpuResources {
+    pub fn display_texture_view(&self) -> Option<&wgpu::TextureView> {
+        self.texture_view.as_ref()
+    }
+
     pub fn create(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("beautiful_canvas"),
@@ -278,6 +425,12 @@ impl CanvasGpuResources {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let tile_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("canvas_tile_vertices"),
+            size: (std::mem::size_of::<CanvasVertex>() * 6 * MAX_TILE_DRAW) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let soft_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("softlight_roi_vertices"),
             size: (std::mem::size_of::<CanvasVertex>() * 6) as u64,
@@ -291,16 +444,34 @@ impl CanvasGpuResources {
         });
         let grad_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("beautiful_grad_bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
         let grad_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("beautiful_grad_pl"),
@@ -345,13 +516,32 @@ impl CanvasGpuResources {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let grad_mask_samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("grad_mask_samp"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let (grad_mask_tex, grad_mask_view) = create_grad_mask_texture(device, 1, 1);
         let grad_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("beautiful_grad_bg"),
             layout: &grad_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: grad_uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: grad_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&grad_mask_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&grad_mask_samp),
+                },
+            ],
         });
 
         let soft_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -499,8 +689,15 @@ impl CanvasGpuResources {
                 wgpu::TextureFormat::Rgba8Unorm
             },
             grad_pipeline,
+            grad_bgl,
             grad_bind_group,
             grad_uniform_buffer,
+            grad_mask_tex,
+            grad_mask_view,
+            grad_mask_samp,
+            grad_mask_w: 1,
+            grad_mask_h: 1,
+            grad_mask_key: 0,
             soft_pipeline,
             soft_bgl,
             soft_uniform_buffer,
@@ -516,8 +713,317 @@ impl CanvasGpuResources {
             soft_samp,
             soft_samp_nearest,
             soft_vertex_buffer,
+            tex_side_cap: beautiful_core::MAX_GPU_TEX_SIDE,
             uploaded_doc: DirtyRect::empty(),
+            display_tile_cache: DisplayTileCache::new(),
+            gpu_display_tiles: HashMap::new(),
+            display_tile_mode: false,
+            tile_vertex_buffer,
+            tile_draw_list: Vec::new(),
+            tile_filter_linear: true,
+            tile_plate_lod: 1,
+            prev_cover: DirtyRect::empty(),
+            display_tile_epoch: 0,
+            tile_upload_remainder: Vec::new(),
         }
+    }
+
+    fn tiles_cover_ready(&self, cover: DirtyRect, doc_w: u32, doc_h: u32) -> bool {
+        if cover.is_empty() || !self.display_tile_mode {
+            return false;
+        }
+        // Remainder is *re-upload* of tiles that already have keys (stale zoom-out
+        // ring). Treating keys-only as ready skipped the drain — half the 512
+        // plates stayed old until LMB.
+        if self
+            .tile_upload_remainder
+            .iter()
+            .any(|t| !t.intersect(cover).is_empty())
+        {
+            return false;
+        }
+        DisplayTileCache::tiles_in_rect(cover, doc_w, doc_h)
+            .iter()
+            .all(|r| self.gpu_display_tiles.contains_key(&display_tile_key(r)))
+    }
+
+    fn clear_gpu_display_tiles(&mut self) {
+        self.gpu_display_tiles.clear();
+        self.display_tile_cache.clear();
+        self.tile_draw_list.clear();
+        self.tile_upload_remainder.clear();
+        self.prev_cover = DirtyRect::empty();
+        self.display_tile_mode = false;
+        self.tile_plate_lod = 1;
+        self.display_tile_epoch = 0;
+    }
+
+    fn rebuild_tile_bind_groups(&mut self, device: &wgpu::Device, linear: bool) {
+        if self.tile_filter_linear == linear {
+            return;
+        }
+        let sampler = if linear {
+            &self.sampler_linear
+        } else {
+            &self.sampler_nearest
+        };
+        for tile in self.gpu_display_tiles.values_mut() {
+            tile.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("beautiful_display_tile_bg"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&tile.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ],
+            });
+        }
+        self.tile_filter_linear = linear;
+    }
+
+    fn upload_gpu_display_tile(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        rect: DirtyRect,
+        pixels: &[u8],
+        tex_w: u32,
+        tex_h: u32,
+        linear: bool,
+        content_rev: u64,
+    ) {
+        let w = tex_w;
+        let h = tex_h;
+        if w == 0 || h == 0 {
+            return;
+        }
+        let key = display_tile_key(&rect);
+        let expect = (w * h * 4) as usize;
+        if pixels.len() < expect {
+            return;
+        }
+        let (padded, bpr) = pad_rgba_for_wgpu(pixels, w, h);
+        let data = padded.as_deref().unwrap_or(pixels);
+
+        if let Some(existing) = self.gpu_display_tiles.get_mut(&key) {
+            if existing.tw == w && existing.th == h {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &existing.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bpr),
+                        rows_per_image: Some(h),
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                existing.doc_rect = rect;
+                existing.content_rev = content_rev;
+                if self.tile_filter_linear != linear {
+                    self.rebuild_tile_bind_groups(device, linear);
+                }
+                return;
+            }
+        }
+
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("beautiful_display_tile"),
+            size: wgpu::Extent3d {
+                width: w.max(1),
+                height: h.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.tex_format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bpr),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = if linear {
+            &self.sampler_linear
+        } else {
+            &self.sampler_nearest
+        };
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("beautiful_display_tile_bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+        self.gpu_display_tiles.insert(
+            key,
+            GpuDisplayTile {
+                texture,
+                view,
+                bind_group,
+                doc_rect: rect,
+                tw: w,
+                th: h,
+                content_rev,
+            },
+        );
+        self.tile_filter_linear = linear;
+    }
+
+    /// Patch a doc-space subrect into an existing 512 GPU tile (eye/opacity).
+    /// Returns false when the tile is missing or the patch does not fit — caller
+    /// must full-compose/upload that 512.
+    fn upload_gpu_display_tile_patch(
+        &mut self,
+        queue: &wgpu::Queue,
+        tile: DirtyRect,
+        patch: DirtyRect,
+        pixels: &[u8],
+        content_rev: u64,
+    ) -> bool {
+        let key = display_tile_key(&tile);
+        let Some(existing) = self.gpu_display_tiles.get_mut(&key) else {
+            return false;
+        };
+        if existing.tw != tile.width() || existing.th != tile.height() {
+            return false;
+        }
+        let patch = patch.intersect(tile);
+        let w = patch.width();
+        let h = patch.height();
+        if w == 0 || h == 0 {
+            return true;
+        }
+        let ox = patch.x0.saturating_sub(tile.x0);
+        let oy = patch.y0.saturating_sub(tile.y0);
+        if ox.saturating_add(w) > existing.tw || oy.saturating_add(h) > existing.th {
+            return false;
+        }
+        let expect = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+        if pixels.len() < expect {
+            return false;
+        }
+        let (padded, bpr) = pad_rgba_for_wgpu(pixels, w, h);
+        let data = padded.as_deref().unwrap_or(pixels);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &existing.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: ox,
+                    y: oy,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bpr),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        existing.content_rev = content_rev;
+        true
+    }
+
+    /// Drop off-cover plates only when the document itself exceeds the VRAM
+    /// budget. A 4K grid is 64×512 — keep them across zoom-in so zoom-out is
+    /// not a hole fill. Pan still has a 1×512 keep ring when we do evict (16K+).
+    fn evict_tiles_outside_cover(&mut self, cover: DirtyRect, doc_w: u32, doc_h: u32) {
+        if cover.is_empty() {
+            return;
+        }
+        if gpu_tile_cache_retain_all(self.gpu_display_tiles.len(), doc_w, doc_h) {
+            return;
+        }
+        let keep_cover = cover.padded(DISPLAY_TILE_DOC, doc_w, doc_h);
+        let keep: HashSet<(i32, i32)> = DisplayTileCache::tiles_in_rect(keep_cover, doc_w, doc_h)
+            .iter()
+            .map(|r| display_tile_key(r))
+            .collect();
+        self.gpu_display_tiles.retain(|k, _| keep.contains(k));
+        // Cover itself can exceed the budget (fit-view 32K). Prefer visible plates.
+        if self.gpu_display_tiles.len() > beautiful_core::GPU_DISPLAY_TILE_CACHE_BUDGET {
+            let visible: HashSet<(i32, i32)> = DisplayTileCache::tiles_in_rect(cover, doc_w, doc_h)
+                .iter()
+                .map(|r| display_tile_key(r))
+                .collect();
+            self.gpu_display_tiles.retain(|k, _| visible.contains(k));
+        }
+    }
+
+    /// Prefer soft re-queue + overwrite for eye/opacity — dropping before refill
+    /// caused visible holes / zoom-out chunk fill. Off-cover freshness uses
+    /// persisted `gpu_tile_invalidate` remainder instead.
+    #[allow(dead_code)]
+    fn drop_tiles_intersecting(
+        &mut self,
+        dirty: DirtyRect,
+        doc_w: u32,
+        doc_h: u32,
+    ) {
+        if dirty.is_empty() {
+            return;
+        }
+        self.gpu_display_tiles.retain(|&(tx, ty), _| {
+            let rect = tile_doc_rect(tx, ty, doc_w, doc_h);
+            rect.intersect(dirty).is_empty()
+        });
+    }
+
+    fn present_ok_for_plan(
+        &self,
+        _plan: &beautiful_core::DisplayFramePlan,
+        _lod: u32,
+        cover: DirtyRect,
+        doc_w: u32,
+        doc_h: u32,
+    ) -> bool {
+        self.tiles_cover_ready(cover, doc_w, doc_h)
     }
 
     fn present_covers(&self, cover: DirtyRect, expect_w: u32, expect_h: u32) -> bool {
@@ -543,10 +1049,13 @@ impl CanvasGpuResources {
             return;
         }
         // Refuse absurd allocations — caller should have capped via LOD.
-        if w > MAX_GPU_TEX_SIDE || h > MAX_GPU_TEX_SIDE {
+        if w > self.tex_side_cap || h > self.tex_side_cap {
             crate::action_log::log(
                 "gpu",
-                &format!("refuse texture {w}x{h} > MAX_GPU_TEX_SIDE={MAX_GPU_TEX_SIDE}"),
+                &format!(
+                    "refuse texture {w}x{h} > tex_side_cap={}",
+                    self.tex_side_cap
+                ),
             );
             return;
         }
@@ -746,6 +1255,115 @@ impl CanvasGpuResources {
         queue.write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&verts));
     }
 
+    fn doc_to_local(
+        doc_x: f32,
+        doc_y: f32,
+        half: egui::Vec2,
+        display_w: f32,
+        display_h: f32,
+        stage_ox: f32,
+        stage_oy: f32,
+        stage_w: f32,
+        stage_h: f32,
+        flip_h: bool,
+    ) -> egui::Vec2 {
+        let mut vx = (doc_x - stage_ox) / stage_w.max(1e-4) * display_w;
+        let vy = (doc_y - stage_oy) / stage_h.max(1e-4) * display_h;
+        if flip_h {
+            // Mirror view-X like `doc_to_screen` — tile corners move; UV stays identity.
+            vx = display_w - vx;
+        }
+        egui::vec2(vx - half.x, vy - half.y)
+    }
+
+    fn prepare_tile_vertices(&mut self, queue: &wgpu::Queue, params: &CanvasDrawParams) {
+        self.tile_draw_list.clear();
+        if !params.display_tiles || params.cover.is_empty() {
+            return;
+        }
+        let vp = params.viewport;
+        if vp.width() <= 1.0 || vp.height() <= 1.0 {
+            return;
+        }
+        let rot = egui::emath::Rot2::from_angle(params.rotation_deg.to_radians());
+        let half = egui::vec2(params.display_w, params.display_h) * 0.5;
+        let doc_w = params.doc_w;
+        let doc_h = params.doc_h;
+        let tiles = DisplayTileCache::tiles_in_rect(
+            params.cover,
+            doc_w as u32,
+            doc_h as u32,
+        );
+        // Position flip handles mirroring; keep UV identity (UV flip alone left tiles unmoved).
+        let uv_base = [[0.0_f32, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let mut verts: Vec<CanvasVertex> = Vec::with_capacity(tiles.len().min(MAX_TILE_DRAW) * 6);
+        for tile_rect in tiles {
+            if verts.len() >= MAX_TILE_DRAW * 6 {
+                break;
+            }
+            let key = display_tile_key(&tile_rect);
+            if !self.gpu_display_tiles.contains_key(&key) {
+                continue;
+            }
+            self.tile_draw_list.push(key);
+            let doc_corners = [
+                (tile_rect.x0 as f32, tile_rect.y0 as f32),
+                (tile_rect.x1 as f32, tile_rect.y0 as f32),
+                (tile_rect.x1 as f32, tile_rect.y1 as f32),
+                (tile_rect.x0 as f32, tile_rect.y1 as f32),
+            ];
+            let mut ndc = [[0.0_f32; 2]; 4];
+            for i in 0..4 {
+                let local = Self::doc_to_local(
+                    doc_corners[i].0,
+                    doc_corners[i].1,
+                    half,
+                    params.display_w,
+                    params.display_h,
+                    params.stage_ox,
+                    params.stage_oy,
+                    params.stage_w,
+                    params.stage_h,
+                    params.flip_h,
+                );
+                let screen = params.canvas_center + rot * local;
+                let lx = screen.x - vp.min.x;
+                let ly = screen.y - vp.min.y;
+                ndc[i][0] = (lx / vp.width()) * 2.0 - 1.0;
+                ndc[i][1] = 1.0 - (ly / vp.height()) * 2.0;
+            }
+            verts.extend_from_slice(&[
+                CanvasVertex {
+                    pos: ndc[0],
+                    uv: uv_base[0],
+                },
+                CanvasVertex {
+                    pos: ndc[1],
+                    uv: uv_base[1],
+                },
+                CanvasVertex {
+                    pos: ndc[2],
+                    uv: uv_base[2],
+                },
+                CanvasVertex {
+                    pos: ndc[0],
+                    uv: uv_base[0],
+                },
+                CanvasVertex {
+                    pos: ndc[2],
+                    uv: uv_base[2],
+                },
+                CanvasVertex {
+                    pos: ndc[3],
+                    uv: uv_base[3],
+                },
+            ]);
+        }
+        if !verts.is_empty() {
+            queue.write_buffer(&self.tile_vertex_buffer, 0, bytemuck::cast_slice(&verts));
+        }
+    }
+
     fn paint(&self, render_pass: &mut wgpu::RenderPass<'_>, expect_w: u32, expect_h: u32) {
         if self.bind_group.is_none() || self.tex_w != expect_w || self.tex_h != expect_h {
             // Never draw a previous-size white plate after New/Open.
@@ -760,7 +1378,49 @@ impl CanvasGpuResources {
         render_pass.draw(0..6, 0..1);
     }
 
-    fn prepare_gradient_uniforms(&self, queue: &wgpu::Queue, params: &GradientPreviewParams) {
+    fn paint_tiles(&self, render_pass: &mut wgpu::RenderPass<'_>) {
+        if self.tile_draw_list.is_empty() {
+            return;
+        }
+        render_pass.set_pipeline(&self.pipeline);
+        let stride = std::mem::size_of::<CanvasVertex>() as u64;
+        for (i, key) in self.tile_draw_list.iter().enumerate() {
+            let Some(tile) = self.gpu_display_tiles.get(key) else {
+                continue;
+            };
+            let base = (i * 6) as u64 * stride;
+            render_pass.set_bind_group(0, &tile.bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.tile_vertex_buffer.slice(base..base + 6 * stride));
+            render_pass.draw(0..6, 0..1);
+        }
+    }
+
+    fn prepare_gradient(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        params: &GradientPreviewParams,
+    ) {
+        let (clip_origin, clip_size, mask_key, mask_upload) = match params.clip.as_ref() {
+            Some(clip) if clip.width > 0 && clip.height > 0 => {
+                let key = clip_mask_key(clip);
+                (
+                    [clip.origin.0, clip.origin.1],
+                    [clip.size.0.max(1.0), clip.size.1.max(1.0)],
+                    key,
+                    Some(clip),
+                )
+            }
+            _ => ([0.0, 0.0], [0.0, 0.0], 1u64, None),
+        };
+        if mask_key != self.grad_mask_key {
+            if let Some(clip) = mask_upload {
+                self.ensure_grad_mask(device, queue, clip);
+            } else {
+                self.ensure_grad_mask_white(device, queue);
+            }
+            self.grad_mask_key = mask_key;
+        }
         let uniforms = GradUniforms {
             start: [params.start.0, params.start.1],
             end: [params.end.0, params.end.1],
@@ -773,9 +1433,73 @@ impl CanvasGpuResources {
                 0.0,
             ],
             doc_size: [params.doc_w.max(1.0), params.doc_h.max(1.0)],
+            clip_origin,
+            clip_size,
             _pad: [0.0, 0.0],
         };
         queue.write_buffer(&self.grad_uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+    }
+
+    fn ensure_grad_mask_white(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        if self.grad_mask_w != 1 || self.grad_mask_h != 1 {
+            let (tex, view) = create_grad_mask_texture(device, 1, 1);
+            self.grad_mask_tex = tex;
+            self.grad_mask_view = view;
+            self.grad_mask_w = 1;
+            self.grad_mask_h = 1;
+            self.rebuild_grad_bind_group(device);
+        }
+        write_rgba8_texture(queue, &self.grad_mask_tex, 1, 1, &[255, 255, 255, 255]);
+    }
+
+    fn ensure_grad_mask(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        clip: &GradientClipMask,
+    ) {
+        let w = clip.width.max(1);
+        let h = clip.height.max(1);
+        if self.grad_mask_w != w || self.grad_mask_h != h {
+            let (tex, view) = create_grad_mask_texture(device, w, h);
+            self.grad_mask_tex = tex;
+            self.grad_mask_view = view;
+            self.grad_mask_w = w;
+            self.grad_mask_h = h;
+            self.rebuild_grad_bind_group(device);
+        }
+        let mut rgba = vec![0u8; (w as usize).saturating_mul(h as usize).saturating_mul(4)];
+        let n = clip.alpha.len().min(w as usize * h as usize);
+        for i in 0..n {
+            let a = clip.alpha[i];
+            let o = i * 4;
+            rgba[o] = a;
+            rgba[o + 1] = a;
+            rgba[o + 2] = a;
+            rgba[o + 3] = a;
+        }
+        write_rgba8_texture(queue, &self.grad_mask_tex, w, h, &rgba);
+    }
+
+    fn rebuild_grad_bind_group(&mut self, device: &wgpu::Device) {
+        self.grad_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("beautiful_grad_bg"),
+            layout: &self.grad_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.grad_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.grad_mask_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.grad_mask_samp),
+                },
+            ],
+        });
     }
 
     fn paint_gradient(&self, render_pass: &mut wgpu::RenderPass<'_>) {
@@ -886,7 +1610,7 @@ impl CanvasGpuResources {
         } else {
             &self.sampler_nearest
         };
-        // Float is Nearest-baked (or nearest-sampled) for Free Transform — never linear.
+        // Float is Nearest-baked (or nearest-sampled) for Transform — never linear.
         let float_samp = &self.soft_samp_nearest;
         self.soft_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("beautiful_soft_bg"),
@@ -1094,6 +1818,42 @@ pub fn release_softlight_sources(rs: &egui_wgpu::RenderState) {
     gpu.soft_bind_group = None;
 }
 
+/// Upload Soft Light underlay from projection (full-doc UV 0–1).
+/// Docs that exceed the GPU tex cap fall back to CPU Soft Light (no underlay).
+pub fn sync_softlight_underlay(
+    rs: &egui_wgpu::RenderState,
+    document: &Document,
+    linear: bool,
+) -> bool {
+    let w = document.width;
+    let h = document.height;
+    let cap = beautiful_core::MAX_GPU_TEX_SIDE;
+    if w > cap || h > cap {
+        return false;
+    }
+    {
+        let renderer = rs.renderer.read();
+        if let Some(gpu) = renderer.callback_resources.get::<CanvasGpuResources>() {
+            if gpu.texture.is_some() && gpu.tex_w == w && gpu.tex_h == h && gpu.texture_view.is_some()
+            {
+                return true;
+            }
+        }
+    }
+    let Some(pixels) = document.composite.dense_pixels() else {
+        return false;
+    };
+    if pixels.len() < (w as usize).saturating_mul(h as usize).saturating_mul(4) {
+        return false;
+    }
+    let mut renderer = rs.renderer.write();
+    let Some(gpu) = renderer.callback_resources.get_mut::<CanvasGpuResources>() else {
+        return false;
+    };
+    gpu.upload_full(&rs.device, &rs.queue, pixels, w, h, linear);
+    true
+}
+
 /// Upload Free baseline and/or Soft atlas independently (drag must not reupload float).
 pub fn sync_softlight_sources_partial(
     rs: &egui_wgpu::RenderState,
@@ -1201,6 +1961,18 @@ pub fn invalidate(rs: &egui_wgpu::RenderState) {
     gpu.tex_w = 0;
     gpu.tex_h = 0;
     gpu.uploaded_doc = DirtyRect::empty();
+        gpu.clear_gpu_display_tiles();
+    gpu.display_tile_mode = false;
+    // Soft Light / Free atlas can keep the previous canvas size after crop.
+    gpu.float_tex = None;
+    gpu.float_view = None;
+    gpu.float_w = 0;
+    gpu.float_h = 0;
+    gpu.soft_tex = None;
+    gpu.soft_view = None;
+    gpu.soft_tw = 0;
+    gpu.soft_th = 0;
+    gpu.soft_bind_group = None;
     // Poison verts so a prepare-miss cannot flash the previous HD plate.
     let zero = [CanvasVertex {
         pos: [0.0, 0.0],
@@ -1210,127 +1982,204 @@ pub fn invalidate(rs: &egui_wgpu::RenderState) {
         .write_buffer(&gpu.vertex_buffer, 0, bytemuck::cast_slice(&zero));
 }
 
-/// Apply shared mip action with F12 spans/counters.
-fn timed_apply_mip_action(
-    display_mip: &mut DisplayMip,
-    document: &Document,
-    lod: u32,
+/// Present texture size for paint readiness (full-doc / mip paths only).
+pub fn present_ready(rs: &egui_wgpu::RenderState, expect_w: u32, expect_h: u32) -> bool {
+    let renderer = rs.renderer.read();
+    let Some(gpu) = renderer.callback_resources.get::<CanvasGpuResources>() else {
+        return false;
+    };
+    gpu.bind_group.is_some() && gpu.tex_w == expect_w && gpu.tex_h == expect_h
+}
+
+/// True when every display tile for `cover` is on GPU.
+pub fn display_tiles_ready(
+    rs: &egui_wgpu::RenderState,
     cover: DirtyRect,
-    action: beautiful_core::MipAction,
-) -> beautiful_core::ApplyMipResult {
-    let is_view = matches!(
-        action,
-        beautiful_core::MipAction::Seed { .. }
-            | beautiful_core::MipAction::RefillView
-            | beautiful_core::MipAction::FillGap
-    );
-    let is_dirty = matches!(action, beautiful_core::MipAction::Dirty { .. });
-    let span = if is_dirty { "gpu.mip_dirty" } else { "gpu.mip_view" };
-    let _s = crate::perf::Scope::new(crate::perf::Category::Composite, span);
-    let r = apply_mip_action(display_mip, document, lod, cover, action);
-    if r.did_work {
-        if is_view {
-            crate::perf::bump("count.mip_view");
-        } else if is_dirty {
-            crate::perf::bump("count.mip_dirty");
-        }
-        crate::perf::drain_core_probes();
-    }
-    r
+    doc_w: u32,
+    doc_h: u32,
+) -> bool {
+    let renderer = rs.renderer.read();
+    let Some(gpu) = renderer.callback_resources.get::<CanvasGpuResources>() else {
+        return false;
+    };
+    gpu.tiles_cover_ready(cover, doc_w, doc_h)
 }
 
-/// Upload after a view fill. Full-doc fills use `upload_full`; gaps use partial.
-fn timed_upload_after_mip_fill(
-    gpu: &mut CanvasGpuResources,
+/// GPU display-tile inventory for MCP / F12 (not mip — present is tiles).
+pub fn display_tile_gpu_report(
     rs: &egui_wgpu::RenderState,
-    display_mip: &DisplayMip,
-    document: &Document,
     cover: DirtyRect,
-    filled: DirtyRect,
-    force_cover: bool,
-) {
-    let doc_full = DirtyRect::full(document.width, document.height);
-    let doc_area = (document.width as u64)
-        .saturating_mul(document.height as u64)
-        .max(1);
-
-    if filled.is_empty() {
-        if force_cover && !cover.is_empty() {
-            // Fresh present + CPU already covered: push the *view* plate only.
-            // Full-mip upload here made every LOD switch on zoom hitch hard.
-            timed_upload_mip_rect(gpu, rs, display_mip, cover);
-            gpu.set_uploaded_doc(cover);
+    doc_w: u32,
+    doc_h: u32,
+    content_revision: u64,
+    canvas_epoch: u64,
+) -> serde_json::Value {
+    let renderer = rs.renderer.read();
+    let Some(gpu) = renderer.callback_resources.get::<CanvasGpuResources>() else {
+        return serde_json::json!({
+            "gpu": false,
+            "cover_ready": false,
+            "on_gpu": 0,
+            "cache_total": 0,
+        });
+    };
+    let expected: Vec<_> = DisplayTileCache::tiles_in_rect(cover, doc_w, doc_h);
+    let mut missing = Vec::new();
+    let mut stale_rev = 0u32;
+    let mut on_cover = 0u32;
+    for r in &expected {
+        let key = display_tile_key(r);
+        match gpu.gpu_display_tiles.get(&key) {
+            None => {
+                if missing.len() < 32 {
+                    missing.push(format!("{},{}", key.0, key.1));
+                } else if missing.len() == 32 {
+                    missing.push("…".into());
+                }
+            }
+            Some(t) if t.content_rev != content_revision => {
+                on_cover += 1;
+                stale_rev += 1;
+            }
+            Some(_) => on_cover += 1,
         }
-        return;
     }
-
-    let fill_area = (filled.width() as u64).saturating_mul(filled.height() as u64);
-    if filled.contains_rect(doc_full) || fill_area.saturating_mul(2) > doc_area {
-        timed_upload_full_mip(gpu, rs, display_mip);
-        gpu.set_uploaded_doc(doc_full);
-        return;
-    }
-    // Seed / gap: upload the padded view (not the whole mip).
-    let mut upload = cover;
-    if upload.is_empty() {
-        upload = filled;
-    } else if force_cover {
-        // Ensure the present plate matches what we claim covered.
-        upload = cover;
-    }
-    timed_upload_mip_rect(gpu, rs, display_mip, upload);
-    gpu.set_uploaded_doc(upload);
+    let missing_count = expected.len().saturating_sub(on_cover as usize);
+    let epoch_mismatch = gpu.display_tile_epoch != canvas_epoch;
+    let remainder = gpu.tile_upload_remainder.len();
+    let cover_empty = cover.is_empty();
+    let cover_ready = !cover_empty
+        && missing_count == 0
+        && stale_rev == 0
+        && remainder == 0
+        && gpu.display_tile_mode
+        && !epoch_mismatch;
+    serde_json::json!({
+        "gpu": true,
+        "mode": gpu.display_tile_mode,
+        "epoch_gpu": gpu.display_tile_epoch,
+        "epoch_canvas": canvas_epoch,
+        "epoch_mismatch": epoch_mismatch,
+        "on_gpu": on_cover,
+        "cache_total": gpu.gpu_display_tiles.len(),
+        "cover_expected": expected.len(),
+        "cover_empty": cover_empty,
+        "cover_ready": cover_ready,
+        "missing_count": missing_count,
+        "missing": missing,
+        "stale_content_rev": stale_rev,
+        "remainder": remainder,
+        "plate_lod": gpu.tile_plate_lod,
+        "present": "display_tiles",
+        "mip_present": "retired",
+    })
 }
 
-fn timed_upload_full_mip(
-    gpu: &mut CanvasGpuResources,
-    rs: &egui_wgpu::RenderState,
-    display_mip: &DisplayMip,
-) {
-    let _u = crate::perf::Scope::new(crate::perf::Category::Upload, "gpu.upload_full");
-    let _u2 = crate::perf::Scope::new(crate::perf::Category::Upload, "pipe.upload");
-    gpu.upload_full(
-        &rs.device,
-        &rs.queue,
-        &display_mip.pixels,
-        display_mip.width,
-        display_mip.height,
-        true,
-    );
-    crate::perf::bump("count.gpu_uploads");
-    crate::perf::bump("count.upload_full");
+#[allow(dead_code)]
+fn sync_had_upload_work(sync: &beautiful_core::SyncResult) -> bool {
+    sync.full_upload || sync.partial.is_some() || !sync.partials.is_empty()
 }
 
-fn timed_upload_mip_rect(
-    gpu: &mut CanvasGpuResources,
-    rs: &egui_wgpu::RenderState,
-    display_mip: &DisplayMip,
-    doc_dirty: DirtyRect,
-) {
-    let mip_rect = display_mip.mip_rect_for_dirty(doc_dirty);
-    if mip_rect.is_empty() {
+/// Fill projection for gap/missing display tiles.
+/// Direct compose — does **not** go through mark_dirty / offscreen backlog loops.
+///
+/// Compose **per tile**, never the AABB of the batch: zoom-out gaps are a ring
+/// around the old cover, and unioning them re-blends the whole new cover
+/// (including already-valid center) → multi-hundred-ms freezes.
+fn compose_display_tile_regions(document: &mut Document, _view: DirtyRect, tiles: &[DirtyRect]) {
+    if tiles.is_empty() {
         return;
     }
-    let mip_area = (display_mip.width as u64).saturating_mul(display_mip.height as u64);
-    let dirty_area = (mip_rect.width() as u64).saturating_mul(mip_rect.height() as u64);
-    if mip_area > 0 && dirty_area.saturating_mul(2) > mip_area {
-        timed_upload_full_mip(gpu, rs, display_mip);
+    crate::perf::bump("count.compose_display_tile");
+    let mut ensure = DirtyRect::empty();
+    for tile in tiles {
+        ensure.union(*tile);
+    }
+    if ensure.is_empty() {
         return;
     }
-    let pixels = display_mip.extract_mip_rect(mip_rect);
-    let _u = crate::perf::Scope::new(crate::perf::Category::Upload, "gpu.upload_partial");
-    let _u2 = crate::perf::Scope::new(crate::perf::Category::Upload, "pipe.upload");
-    gpu.upload_rect(
-        &rs.device,
-        &rs.queue,
-        &pixels,
-        display_mip.width,
-        display_mip.height,
-        mip_rect,
-        true,
-    );
-    crate::perf::bump("count.gpu_uploads");
-    crate::perf::bump("count.upload_partial");
+    ensure.clamp_to(document.width, document.height);
+    document.composite.ensure_for_view(ensure, 0);
+
+    let floating = document.selection.floating.take();
+    let layer_idx = document
+        .selection
+        .floating_layer
+        .unwrap_or(document.active_layer)
+        .min(document.layers.len().saturating_sub(1));
+    let overlay_only = document.selection.floating_overlay_only;
+    let bg = document.background;
+    let (w, h) = (document.width, document.height);
+
+    // Prefer Dense full buffer. Roi falls back to a one-shot dirty sync on the ROI.
+    if !document.composite.is_roi() {
+        document.composite.ensure_dense();
+        let blit = if overlay_only {
+            None
+        } else {
+            floating.as_ref().map(|f| beautiful_core::FloatingBlit {
+                pixels: f.pixels.as_slice(),
+                width: f.width,
+                height: f.height,
+                x: f.x,
+                y: f.y,
+                layer_idx,
+            })
+        };
+        for tile in tiles {
+            let mut r = *tile;
+            r.clamp_to(w, h);
+            if r.is_empty() {
+                continue;
+            }
+            beautiful_core::composite_region_into(
+                &mut document.composite.pixels,
+                w,
+                h,
+                bg,
+                &document.layers,
+                r,
+                blit,
+            );
+        }
+        document.selection.floating = floating;
+        return;
+    }
+
+    document.selection.floating = floating;
+    for tile in tiles {
+        let mut r = *tile;
+        r.clamp_to(document.width, document.height);
+        if r.is_empty() {
+            continue;
+        }
+        document.composite.mark_dirty(r);
+    }
+    let _ = document.sync_display_view(ensure, 0);
+}
+
+fn tile_zoom_scale_ok(
+    gpu: &CanvasGpuResources,
+    plan: &beautiful_core::DisplayFramePlan,
+    cover: DirtyRect,
+    linear: bool,
+    display_tile_epoch: u64,
+    doc_w: u32,
+    doc_h: u32,
+) -> bool {
+    let plate_lod = plan.viewport_plate.plate_lod.max(1);
+    gpu.display_tile_mode
+        && gpu.tile_plate_lod == plate_lod
+        && gpu.tile_filter_linear == linear
+        && gpu.display_tile_epoch == display_tile_epoch
+        && gpu.tiles_cover_ready(cover, doc_w, doc_h)
+}
+
+/// Result of [`sync_from_document`]: whether present changed, plus eye/opacity
+/// footprint still outside cover (soft pan refresh — no key drop / no holes).
+pub struct PresentSyncResult {
+    pub uploaded: bool,
+    pub stale_outside_cover: DirtyRect,
 }
 
 /// Sync document pixels to the wgpu texture (call once per frame before paint).
@@ -1347,7 +2196,22 @@ pub fn sync_from_document(
     stroke_active: bool,
     view: DirtyRect,
     allow_coarsen: bool,
-) -> bool {
+    gpu_tex_side: u32,
+    view_screen_long_px: f32,
+    canvas_dirty: bool,
+    display_tile_epoch: u64,
+    tile_invalidate: DirtyRect,
+    force_cover_refresh: bool,
+) -> PresentSyncResult {
+    let early_remaining = |cover: DirtyRect| {
+        let mut rem = DirtyRect::empty();
+        for piece in tile_invalidate.subtract(cover) {
+            if !piece.is_empty() {
+                rem.union(piece);
+            }
+        }
+        rem
+    };
     {
         let _e = crate::perf::Scope::new(crate::perf::Category::Composite, "proj.expose_view");
         document.expose_view(view);
@@ -1362,291 +2226,426 @@ pub fn sync_from_document(
         allow_coarsen,
         view,
         display_mip,
+        gpu_tex_side,
+        view_screen_long_px,
+        stroke_active,
     );
-    let lod = plan.lod;
+    let _lod = plan.lod;
     let lod_changed = plan.lod_changed;
     let linear = plan.linear_filter;
     let cover = plan.cover;
+    // Only cover∩invalidate blocks idle early-out.
+    let stale_on_screen = !tile_invalidate.intersect(cover).is_empty();
 
     if !plan.mip_covers_view && plan.raw_lod > 1 {
         crate::perf::bump("count.mip_cover_miss");
     }
 
-    // Gesture + no LOD change + clean plate: sampler only.
-    if !allow_coarsen
+    // Gesture + clean tiles: sampler / early-out only.
+    if !canvas_dirty
+        && !force_cover_refresh
+        && !stale_on_screen
+        && !allow_coarsen
         && !lod_changed
         && !stroke_active
-        && !document.composite.has_pending_work()
+        && !document.composite.has_live_pending_work()
         && plan.mip_covers_view
     {
-        let mut renderer = rs.renderer.write();
-        if let Some(gpu) = renderer.callback_resources.get_mut::<CanvasGpuResources>() {
-            let present_ok = if lod <= 1 {
-                gpu.texture.is_some()
-                    && gpu.tex_w == document.width
-                    && gpu.tex_h == document.height
-            } else {
-                let (ew, eh) = mip_dims(document.width, document.height, lod);
-                gpu.present_covers(cover, ew, eh)
-            };
-            if present_ok {
-                if gpu.filter_linear != linear {
-                    gpu.rebuild_bind_group(&rs.device, linear);
-                }
-                return false;
+        let renderer = rs.renderer.read();
+        if let Some(gpu) = renderer.callback_resources.get::<CanvasGpuResources>() {
+            if tile_zoom_scale_ok(
+                gpu,
+                &plan,
+                cover,
+                linear,
+                display_tile_epoch,
+                document.width,
+                document.height,
+            ) {
+                crate::perf::bump("count.tile_zoom_scale");
+                return PresentSyncResult {
+                    uploaded: false,
+                    stale_outside_cover: early_remaining(cover),
+                };
             }
-            // Fall through: CPU mip claims cover but GPU plate is missing/stale.
         } else {
-            return false;
+            return PresentSyncResult {
+                uploaded: false,
+                stale_outside_cover: early_remaining(cover),
+            };
         }
     }
 
-    // Idle: skip work when LOD already matches and plate is clean.
-    if !lod_changed && !document.composite.has_pending_work() && plan.mip_covers_view {
+    // Idle: skip work when tiles already cover the view.
+    // Must not early-out during a live stroke (extract queue is gpu_dirty_parts).
+    if !canvas_dirty
+        && !force_cover_refresh
+        && !stale_on_screen
+        && !lod_changed
+        && !stroke_active
+        && !document.composite.has_live_pending_work()
+        && plan.mip_covers_view
+    {
         let _lock = crate::perf::Scope::new(crate::perf::Category::Upload, "frame.sync_lock");
         let mut renderer = rs.renderer.write();
         let Some(gpu) = renderer.callback_resources.get_mut::<CanvasGpuResources>() else {
-            return false;
+            return PresentSyncResult {
+                uploaded: false,
+                stale_outside_cover: early_remaining(cover),
+            };
         };
-        let present_ok = if lod <= 1 {
-            gpu.texture.is_some()
-                && gpu.tex_w == document.width
-                && gpu.tex_h == document.height
-        } else {
-            let (ew, eh) = mip_dims(document.width, document.height, lod);
-            gpu.present_covers(cover, ew, eh)
-        };
-        if present_ok {
-            if gpu.filter_linear != linear {
-                gpu.rebuild_bind_group(&rs.device, linear);
-                return true;
-            }
-            return false;
+        if tile_zoom_scale_ok(
+            gpu,
+            &plan,
+            cover,
+            linear,
+            display_tile_epoch,
+            document.width,
+            document.height,
+        ) {
+            return PresentSyncResult {
+                uploaded: false,
+                stale_outside_cover: early_remaining(cover),
+            };
+        }
+        if gpu.tile_filter_linear != linear {
+            gpu.rebuild_tile_bind_groups(&rs.device, linear);
+            return PresentSyncResult {
+                uploaded: true,
+                stale_outside_cover: early_remaining(cover),
+            };
         }
     }
 
-    let sync = {
-        if skip_projection_for_mip(
-            lod,
-            lod_changed,
-            stroke_active,
-            document.composite.has_pending_work(),
-        ) {
-            beautiful_core::SyncResult {
-                full_upload: false,
-                partial: None,
-                partials: Vec::new(),
+    // Always display tiles (full-doc present path removed).
+    {
+        let zoom_gesture = !allow_coarsen && !stroke_active;
+
+        if !canvas_dirty
+            && !force_cover_refresh
+            && !stale_on_screen
+            && zoom_gesture
+            && !document.composite.has_live_pending_work()
+        {
+            let renderer = rs.renderer.read();
+            if let Some(gpu) = renderer.callback_resources.get::<CanvasGpuResources>() {
+                if tile_zoom_scale_ok(
+                    gpu,
+                    &plan,
+                    cover,
+                    linear,
+                    display_tile_epoch,
+                    document.width,
+                    document.height,
+                ) {
+                    crate::perf::bump("count.tile_zoom_scale");
+                    return PresentSyncResult {
+                        uploaded: false,
+                        stale_outside_cover: early_remaining(cover),
+                    };
+                }
             }
-        } else {
+        }
+
+        // Viewport pad only. Cover∩footprint overwrites in place (no key drop —
+        // drop caused zoom-out holes). Off-cover remainder returned for pan.
+        let sync = {
             let _p = crate::perf::Scope::new(crate::perf::Category::Composite, "proj.sync_view");
             let _p2 = crate::perf::Scope::new(crate::perf::Category::Composite, "pipe.projection");
-            if lod_changed && lod <= 1 {
-                document.composite.invalidate_rect(cover);
-                document.composite.ensure_for_view(view, DISPLAY_VIEW_PAD);
-            }
             let r = document.sync_display_view(view, DISPLAY_VIEW_PAD);
             crate::perf::drain_core_probes();
             r
-        }
-    };
-    if lod_changed {
-        crate::action_log::log(
-            "lod",
-            &format!(
-                "gpu zoom={zoom:.4} doc={}x{} lod {} -> {lod} (cap={MAX_GPU_TEX_SIDE})",
-                document.width, document.height, plan.raw_lod
-            ),
-        );
-    }
-
-    let mut renderer = rs.renderer.write();
-    let Some(gpu) = renderer.callback_resources.get_mut::<CanvasGpuResources>() else {
-        // Do not commit LOD without a present target.
-        return false;
-    };
-
-    let mut committed = false;
-    let commit_lod = |display_lod: &mut u32| {
-        *display_lod = lod.max(1);
-    };
-
-    if lod <= 1 {
-        let needs_pixels =
-            sync.full_upload || sync.partial.is_some() || !sync.partials.is_empty();
-        let size_ok = gpu.tex_w == document.width && gpu.tex_h == document.height;
-        // CRITICAL: never take this exit on lod_changed — that marked display LOD as
-        // HQ while skipping upload (paint then blank/soft until a click invalidated).
-        if !lod_changed && !needs_pixels && gpu.texture.is_some() && size_ok {
-            if gpu.filter_linear != linear {
-                gpu.rebuild_bind_group(&rs.device, linear);
-            }
-            let _ = document.composite.take_gpu_dirty();
-            return false;
-        }
-
-        let roi = document.composite.is_roi();
-        if !roi && !document.composite.dense_pixels_ready() {
-            document.composite.ensure_for_view(view, DISPLAY_VIEW_PAD);
-        }
-        if !roi && !document.composite.dense_pixels_ready() {
-            // Keep previous LOD so paint size still matches GPU tex; retry next frame.
-            return false;
-        }
-
-        let can_full = !roi && document.composite.dense_pixels().is_some();
-        let allow_full = can_full;
-        if (sync.full_upload || gpu.texture.is_none() || !size_ok || lod_changed) && allow_full {
-            let _u = crate::perf::Scope::new(crate::perf::Category::Upload, "gpu.upload_full");
-            let _u2 = crate::perf::Scope::new(crate::perf::Category::Upload, "pipe.upload");
-            gpu.upload_full(
-                &rs.device,
-                &rs.queue,
-                document.composite.dense_pixels().unwrap(),
-                document.width,
-                document.height,
-                linear,
+        };
+        if plan.lod_changed {
+            crate::action_log::log(
+                "lod",
+                &format!(
+                    "display_tiles zoom={zoom:.4} doc={}x{} cover={cover:?}",
+                    document.width, document.height
+                ),
             );
-            crate::perf::bump("count.gpu_uploads");
-            crate::perf::bump("count.upload_full");
-            commit_lod(display_lod);
-            committed = true;
-        } else if sync.full_upload || gpu.texture.is_none() || !size_ok || lod_changed {
-            gpu.ensure_texture(&rs.device, document.width, document.height, linear);
-            if gpu.filter_linear != linear {
-                gpu.rebuild_bind_group(&rs.device, linear);
-            }
-            let upload_rects: Vec<DirtyRect> = if !sync.partials.is_empty() {
-                sync.partials.clone()
-            } else if let Some(r) = sync.partial {
-                vec![r]
-            } else if let Some(r) = document.composite.roi_rect() {
-                vec![r]
-            } else if cover.is_empty() {
-                Vec::new()
-            } else {
-                vec![cover]
+        }
+        let mut renderer = rs.renderer.write();
+        let Some(gpu) = renderer.callback_resources.get_mut::<CanvasGpuResources>() else {
+            return PresentSyncResult {
+                uploaded: false,
+                stale_outside_cover: early_remaining(cover),
             };
-            let _u = crate::perf::Scope::new(crate::perf::Category::Upload, "gpu.upload_partial");
-            let _u2 = crate::perf::Scope::new(crate::perf::Category::Upload, "pipe.upload");
-            for rect in upload_rects {
-                if rect.is_empty() {
+        };
+        gpu.tex_side_cap = beautiful_core::clamp_gpu_tex_side(gpu_tex_side);
+        gpu.display_tile_mode = true;
+
+        let plate_lod = 1u32;
+        let epoch_stale = gpu.display_tile_epoch != display_tile_epoch;
+        if gpu.tile_plate_lod != plate_lod || epoch_stale {
+            // Size / epoch change: keys are invalid — must drop. Fill the whole
+            // cover this frame (see budget below) so the wipe is not a crawl.
+            gpu.clear_gpu_display_tiles();
+            gpu.display_tile_mode = true;
+            gpu.tile_plate_lod = plate_lod;
+            if epoch_stale {
+                gpu.display_tile_epoch = display_tile_epoch;
+            }
+        }
+
+        // Do NOT clear on sync.full_upload / sheet switch. Wiping then uploading
+        // 8 tiles/frame left checkerboard holes (transform, crop, tab switch).
+        // Overwrite cover plates in place instead.
+
+        // Sandwich/stroke wrote these — extract-only safe.
+        let sync_dirties: Vec<DirtyRect> = if !sync.partials.is_empty() {
+            sync.partials.clone()
+        } else if let Some(r) = sync.partial {
+            vec![r]
+        } else {
+            Vec::new()
+        };
+        // sync_region may leave gpu_dirty set after returning the same rect.
+        // Drain the flag only — never before sync (that killed live stroke parts).
+        let _ = document.composite.take_gpu_dirty();
+
+        // Prior gap-budget remainder (GPU-side). Do not take composite.gpu_dirty
+        // here — that is the live stroke extract list.
+        // Keep the tile *list*. Unioning leftover 512s into an AABB then
+        // tiles_in_rect() turned a zoom-out ring into the whole new cover.
+        let leftover_tiles = std::mem::take(&mut gpu.tile_upload_remainder);
+        let leftover_keys: HashSet<(i32, i32)> = leftover_tiles
+            .iter()
+            .map(display_tile_key)
+            .collect();
+
+        let doc_w = document.width;
+        let doc_h = document.height;
+        let force_full_cover = epoch_stale
+            || force_cover_refresh
+            || (sync.full_upload && !stroke_active);
+        let mut to_upload: Vec<DirtyRect> = Vec::new();
+        let mut stale_keys: HashSet<(i32, i32)> = HashSet::new();
+
+        if force_full_cover {
+            to_upload = DisplayTileCache::tiles_in_rect(cover, doc_w, doc_h);
+        } else if !sync_dirties.is_empty() {
+            for dirty in &sync_dirties {
+                for tile in DisplayTileCache::tiles_in_rect(dirty.intersect(cover), doc_w, doc_h)
+                {
+                    to_upload.push(tile);
+                }
+            }
+        } else {
+            if !gpu.prev_cover.is_empty() {
+                to_upload.extend(DisplayTileCache::gap_tiles(
+                    gpu.prev_cover,
+                    cover,
+                    doc_w,
+                    doc_h,
+                ));
+            }
+            for tile in DisplayTileCache::tiles_in_rect(cover, doc_w, doc_h) {
+                if !gpu.gpu_display_tiles.contains_key(&display_tile_key(&tile)) {
+                    to_upload.push(tile);
+                }
+            }
+        }
+
+        // Stale eye/gradient off-cover: only newly visible 512s (gap vs prev
+        // cover) that hit the invalidate footprint. tiles_in_rect(AABB of the
+        // ring) re-flattened the already-valid center → zoom-out hitch.
+        if !tile_invalidate.is_empty() && !force_full_cover {
+            let ring = if !gpu.prev_cover.is_empty() {
+                DisplayTileCache::gap_tiles(gpu.prev_cover, cover, doc_w, doc_h)
+            } else {
+                DisplayTileCache::tiles_in_rect(tile_invalidate.intersect(cover), doc_w, doc_h)
+            };
+            for tile in ring {
+                if tile.intersect(tile_invalidate).is_empty() {
                     continue;
                 }
-                let pixels = document.composite.extract(rect);
-                gpu.upload_rect(
-                    &rs.device,
-                    &rs.queue,
-                    &pixels,
-                    document.width,
-                    document.height,
-                    rect,
-                    linear,
-                );
-                crate::perf::bump("count.gpu_uploads");
-                crate::perf::bump("count.upload_partial");
+                stale_keys.insert(display_tile_key(&tile));
+                to_upload.push(tile);
             }
-            commit_lod(display_lod);
-            committed = true;
-        } else if !sync.partials.is_empty() {
-            let _u = crate::perf::Scope::new(crate::perf::Category::Upload, "gpu.upload_partial");
-            let _u2 = crate::perf::Scope::new(crate::perf::Category::Upload, "pipe.upload");
-            for rect in &sync.partials {
-                let pixels = document.composite.extract(*rect);
-                gpu.upload_rect(
-                    &rs.device,
-                    &rs.queue,
-                    &pixels,
-                    document.width,
-                    document.height,
-                    *rect,
-                    linear,
-                );
-                crate::perf::bump("count.gpu_uploads");
-                crate::perf::bump("count.upload_partial");
-            }
-            commit_lod(display_lod);
-            committed = true;
-        } else if let Some(rect) = sync.partial {
-            let _u = crate::perf::Scope::new(crate::perf::Category::Upload, "gpu.upload_partial");
-            let _u2 = crate::perf::Scope::new(crate::perf::Category::Upload, "pipe.upload");
-            let pixels = document.composite.extract(rect);
-            gpu.upload_rect(
-                &rs.device,
-                &rs.queue,
-                &pixels,
-                document.width,
-                document.height,
-                rect,
-                linear,
-            );
-            crate::perf::bump("count.gpu_uploads");
-            crate::perf::bump("count.upload_partial");
-            commit_lod(display_lod);
-            committed = true;
         }
-    } else {
-        let (expect_w, expect_h) = mip_dims(document.width, document.height, lod);
-        let mip_ok = mip_size_matches(display_mip, document.width, document.height, lod);
-        let tex_ok = gpu.tex_w == expect_w && gpu.tex_h == expect_h && gpu.texture.is_some();
-        let covers = display_mip.covers_doc(cover);
-        let action = plan_mip_action(lod_changed, mip_ok, tex_ok, stroke_active, &sync, covers);
+        if !force_full_cover {
+            for tile in leftover_tiles {
+                if tile.intersect(cover).is_empty() {
+                    continue;
+                }
+                to_upload.push(tile);
+            }
+        }
 
-        if matches!(action, beautiful_core::MipAction::None) {
-            // CPU coverage alone is not enough — GPU may still be blank/stale.
-            if !gpu.present_covers(cover, expect_w, expect_h) {
-                if !tex_ok {
-                    gpu.ensure_texture(&rs.device, expect_w, expect_h, linear);
+        let mut remaining_invalidate = DirtyRect::empty();
+        if !tile_invalidate.is_empty() && !force_full_cover {
+            for piece in tile_invalidate.subtract(cover) {
+                if !piece.is_empty() {
+                    remaining_invalidate.union(piece);
                 }
-                if gpu.filter_linear != linear {
-                    gpu.rebuild_bind_group(&rs.device, linear);
-                }
-                timed_upload_mip_rect(gpu, rs, display_mip, cover);
-                gpu.set_uploaded_doc(cover);
-                commit_lod(display_lod);
-                let _ = document.composite.take_gpu_dirty();
-                return true;
             }
-            if gpu.filter_linear != linear {
-                gpu.rebuild_bind_group(&rs.device, linear);
-                let _ = document.composite.take_gpu_dirty();
-                return false;
-            }
-            commit_lod(display_lod);
+        }
+
+        gpu.prev_cover = cover;
+        gpu.evict_tiles_outside_cover(cover, doc_w, doc_h);
+
+        let mut seen = HashSet::new();
+        to_upload.retain(|t| seen.insert(display_tile_key(t)));
+
+        if to_upload.is_empty() {
+            // Drain any leftover upload queue so has_live_pending cannot stick.
             let _ = document.composite.take_gpu_dirty();
-            return false;
+            if gpu.tile_filter_linear != linear {
+                gpu.rebuild_tile_bind_groups(&rs.device, linear);
+                return PresentSyncResult {
+                    uploaded: true,
+                    stale_outside_cover: remaining_invalidate,
+                };
+            }
+            return PresentSyncResult {
+                uploaded: !gpu.tile_upload_remainder.is_empty(),
+                stale_outside_cover: remaining_invalidate,
+            };
         }
 
-        // Ensure present texture exists at mip size before fill/upload.
-        if !tex_ok || lod_changed {
-            gpu.ensure_texture(&rs.device, expect_w, expect_h, linear);
+        let _u =
+            crate::perf::Scope::new(crate::perf::Category::Upload, "gpu.upload_display_tiles");
+        let extract_ok = !force_full_cover && !sync_dirties.is_empty();
+        let cpu_dirty = document.composite.has_cpu_dirty();
+        // Structural / stroke: finish the list. Zoom/pan gaps extract from dense
+        // (already composited at fit-view) — do not wait for the wheel to stop.
+        let budget = if stroke_active && extract_ok {
+            MAX_TILE_UPLOAD_STROKE
+        } else if force_full_cover || extract_ok {
+            to_upload.len().max(1)
+        } else {
+            MAX_TILE_UPLOAD_GAP.min(to_upload.len().max(1))
+        };
+        let batch_len = to_upload.len().min(budget);
+        let mut any = false;
+        let batch: Vec<DirtyRect> = to_upload.drain(..batch_len).collect();
+        let mut compose_batch: Vec<DirtyRect> = Vec::new();
+        let mut extract_batch: Vec<DirtyRect> = Vec::new();
+        let mut patch_keys: HashSet<(i32, i32)> = HashSet::new();
+        for tile in &batch {
+            let key = display_tile_key(tile);
+            let in_sync = sync_dirties.iter().any(|d| !d.intersect(*tile).is_empty());
+            let in_stale = stale_keys.contains(&key);
+            let in_carry = leftover_keys.contains(&key);
+            let has_gpu = gpu.gpu_display_tiles.contains_key(&key);
+            // Sandwich wrote a 64-ROI. Patch existing 512s; never restack them.
+            let can_patch = !force_full_cover
+                && !in_stale
+                && in_sync
+                && has_gpu
+                && plate_lod <= 1;
+            if can_patch {
+                patch_keys.insert(key);
+                continue;
+            }
+            // Eye/opacity/sync wrote CPU dense/roi — upload 512 from extract.
+            let can_extract = !force_full_cover && !in_stale && in_sync && plate_lod <= 1;
+            if can_extract {
+                extract_batch.push(*tile);
+                continue;
+            }
+            // Missing GPU: restack only when projection still has CPU dirty for
+            // this plate. Idle zoom-out of a 4K dense buffer is extract-only —
+            // leftover-as-compose was the hitch we used to "fix" by deferring
+            // the ring, which left holes until click.
+            let tile_needs_compose = match (force_full_cover, in_stale, has_gpu) {
+                (true, _, _) => true,
+                (_, true, _) => true,
+                (_, _, false) => cpu_dirty,
+                _ => in_carry && cpu_dirty,
+            };
+            if tile_needs_compose {
+                compose_batch.push(*tile);
+            }
         }
-        if gpu.filter_linear != linear {
-            gpu.rebuild_bind_group(&rs.device, linear);
+        if !compose_batch.is_empty() {
+            let mut ensure = DirtyRect::empty();
+            for tile in &compose_batch {
+                ensure.union(*tile);
+            }
+            document.composite.ensure_for_view(ensure, 0);
+            compose_display_tile_regions(document, view, &compose_batch);
         }
-
-        let applied = timed_apply_mip_action(display_mip, document, lod, cover, action);
-        timed_upload_after_mip_fill(
-            gpu,
-            rs,
-            display_mip,
-            document,
-            cover,
-            applied.filled,
-            applied.upload_cover_even_if_empty_fill,
-        );
-        if !gpu.present_covers(cover, expect_w, expect_h) && !cover.is_empty() {
-            timed_upload_mip_rect(gpu, rs, display_mip, cover);
-            gpu.set_uploaded_doc(cover);
+        for tile in &batch {
+            let key = display_tile_key(tile);
+            if patch_keys.contains(&key) {
+                for dirty in &sync_dirties {
+                    let mut patch = dirty.intersect(*tile);
+                    patch.clamp_to(doc_w, doc_h);
+                    if patch.is_empty() {
+                        continue;
+                    }
+                    let pixels = document.composite.extract(patch);
+                    if gpu.upload_gpu_display_tile_patch(
+                        &rs.queue,
+                        *tile,
+                        patch,
+                        &pixels,
+                        document.content_revision,
+                    ) {
+                        any = true;
+                        crate::perf::bump("count.gpu_uploads");
+                        crate::perf::bump("count.upload_display_tile");
+                    }
+                }
+                continue;
+            }
+            let from_sync = extract_batch.iter().any(|t| display_tile_key(t) == key);
+            if from_sync {
+                if let Some((pixels, tw, th)) =
+                    extract_display_tile_pixels(document, *tile, plate_lod)
+                {
+                    gpu.upload_gpu_display_tile(
+                        &rs.device,
+                        &rs.queue,
+                        *tile,
+                        &pixels,
+                        tw,
+                        th,
+                        linear,
+                        document.content_revision,
+                    );
+                    any = true;
+                    crate::perf::bump("count.gpu_uploads");
+                    crate::perf::bump("count.upload_display_tile");
+                    continue;
+                }
+                // ROI partial — fall back to single-tile compose.
+                compose_display_tile_regions(document, view, &[*tile]);
+            }
+            if let Some((pixels, tw, th)) =
+                extract_display_tile_pixels(document, *tile, plate_lod)
+            {
+                gpu.upload_gpu_display_tile(
+                    &rs.device,
+                    &rs.queue,
+                    *tile,
+                    &pixels,
+                    tw,
+                    th,
+                    linear,
+                    document.content_revision,
+                );
+                any = true;
+                crate::perf::bump("count.gpu_uploads");
+                crate::perf::bump("count.upload_display_tile");
+            }
         }
-        commit_lod(display_lod);
-        committed = true;
+        let upload_pending = !to_upload.is_empty();
+        if any {
+            *display_lod = 1;
+        }
+        if upload_pending {
+            crate::perf::bump_n("count.display_tile_gap", to_upload.len() as u64);
+            gpu.tile_upload_remainder = to_upload;
+        }
+        PresentSyncResult {
+            uploaded: any || upload_pending,
+            stale_outside_cover: remaining_invalidate,
+        }
     }
-
-    let _ = committed;
-    let _ = document.composite.take_gpu_dirty();
-    true
 }
-
 struct CanvasPaintCallback {
     params: CanvasDrawParams,
     gradient: Option<GradientPreviewParams>,
@@ -1663,9 +2662,18 @@ impl egui_wgpu::CallbackTrait for CanvasPaintCallback {
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         if let Some(gpu) = resources.get_mut::<CanvasGpuResources>() {
-            gpu.prepare_vertices(queue, &self.params);
+            if self.params.display_tiles {
+                gpu.prepare_tile_vertices(queue, &self.params);
+            } else {
+                gpu.prepare_vertices(queue, &self.params);
+            }
+            // Gradient overlay always draws the stage AABB quad (`vertex_buffer`).
+            // Display-tile mode skips that prepare above — rebuild it when needed.
+            if self.gradient.is_some() && self.params.display_tiles {
+                gpu.prepare_vertices(queue, &self.params);
+            }
             if let Some(grad) = self.gradient.as_ref() {
-                gpu.prepare_gradient_uniforms(queue, grad);
+                gpu.prepare_gradient(device, queue, grad);
             }
             if let Some(soft) = self.softlight.as_ref() {
                 gpu.prepare_softlight(device, queue, soft, &self.params);
@@ -1681,11 +2689,15 @@ impl egui_wgpu::CallbackTrait for CanvasPaintCallback {
         resources: &egui_wgpu::CallbackResources,
     ) {
         if let Some(gpu) = resources.get::<CanvasGpuResources>() {
-            gpu.paint(
-                render_pass,
-                self.params.expect_tex_w,
-                self.params.expect_tex_h,
-            );
+            if self.params.display_tiles {
+                gpu.paint_tiles(render_pass);
+            } else {
+                gpu.paint(
+                    render_pass,
+                    self.params.expect_tex_w,
+                    self.params.expect_tex_h,
+                );
+            }
             if self.gradient.is_some() {
                 gpu.paint_gradient(render_pass);
             }

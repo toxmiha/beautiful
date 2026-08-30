@@ -1,5 +1,8 @@
 //! Rolling action log for diagnosing input / zoom / stroke issues.
-//! Writes to `logs/beautiful-actions.log` under the workspace (or cwd).
+//!
+//! Writes next to the executable (`<exe_dir>/logs/beautiful-actions.log`).
+//! Never uses the process cwd — on Windows a GUI launch often has cwd
+//! `C:\Windows\System32`, which used to create logs there.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -15,21 +18,33 @@ struct ActionLogInner {
     lines: u64,
 }
 
+fn try_create(path: PathBuf) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    fs::create_dir_all(parent).ok()?;
+    Some(path)
+}
+
 fn log_path() -> PathBuf {
-    // Prefer repo logs/ when running from workspace; else cwd/logs.
-    let candidates = [
-        PathBuf::from("logs/beautiful-actions.log"),
-        PathBuf::from("C:/modding/beautiful/logs/beautiful-actions.log"),
-        PathBuf::from("C:/modding/beautiful/dist/logs/beautiful-actions.log"),
-    ];
-    for p in &candidates {
-        if let Some(parent) = p.parent() {
-            if fs::create_dir_all(parent).is_ok() {
-                return p.clone();
+    // 1. Folder of the running exe (dist/, cargo target/, installed copy).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Some(p) = try_create(dir.join("logs").join("beautiful-actions.log")) {
+                return p;
             }
         }
     }
-    PathBuf::from("beautiful-actions.log")
+    // 2. %APPDATA%/Beautiful/logs — writable if the exe dir is not (Program Files).
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        let p = PathBuf::from(appdata)
+            .join("Beautiful")
+            .join("logs")
+            .join("beautiful-actions.log");
+        if let Some(p) = try_create(p) {
+            return p;
+        }
+    }
+    // Last resort: temp. Never cwd (System32 / random shortcut directory).
+    std::env::temp_dir().join("beautiful-actions.log")
 }
 
 fn ensure() -> bool {

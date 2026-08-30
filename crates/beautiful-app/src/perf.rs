@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 pub const FRAME_RING: usize = 120;
 pub const EVENT_RING: usize = 32;
-pub const SCHEMA: &str = "beautiful.perf.v3";
+pub const SCHEMA: &str = "beautiful.perf.v4";
 
 /// Canonical pipeline / hotspot span names (avg = total_us / count).
 pub const PIPELINE_SPANS: &[&str] = &[
@@ -30,7 +30,6 @@ pub const PIPELINE_SPANS: &[&str] = &[
     "frame.sync",
     "frame.sync_lock",
     "frame.top_menu",
-    "frame.options_bar",
     "frame.bottom_bar",
     "gpu.mip_view",
     "gpu.mip_dirty",
@@ -48,6 +47,11 @@ pub const PIPELINE_COUNTERS: &[&str] = &[
     "count.dirty_parts",
     "count.offscreen_parts",
     "count.pending_frames",
+    "count.upload_display_tile",
+    "count.compose_display_tile",
+    "count.display_tile_gap",
+    "count.tile_zoom_scale",
+    // Legacy mip present — retired. Counters stay so old dumps still parse.
     "count.mip_view",
     "count.mip_cover_miss",
     "count.upload_full",
@@ -187,6 +191,8 @@ pub struct PerfSnapshot {
     pub cpu_percent: f32,
     /// Peak CPU % since last Reset.
     pub cpu_peak_percent: f32,
+    /// Last display-tile inventory (present = tiles, not mip).
+    pub present: Value,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -242,6 +248,8 @@ struct PerfState {
     cpu_peak_percent: f32,
     cpu_prev_proc_100ns: Option<u64>,
     cpu_prev_wall: Option<Instant>,
+    /// Live display-tile inventory for F12 / MCP (not a counter).
+    present: Value,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -284,6 +292,7 @@ impl Default for PerfState {
             cpu_peak_percent: 0.0,
             cpu_prev_proc_100ns: None,
             cpu_prev_wall: None,
+            present: Value::Null,
         }
     }
 }
@@ -441,6 +450,11 @@ pub fn record(cat: Category, name: &'static str, us: u64) {
 }
 
 /// Increment a named counter (session + current frame).
+/// GPU/CPU display-tile inventory for F12 HUD and dumps. Not a session counter.
+pub fn note_present(v: Value) {
+    let _ = with_state(|s| s.present = v);
+}
+
 pub fn bump(name: &'static str) {
     bump_n(name, 1);
 }
@@ -695,6 +709,7 @@ pub fn snapshot() -> PerfSnapshot {
             memory_baseline: s.memory_baseline.clone(),
             cpu_percent: s.cpu_percent,
             cpu_peak_percent: s.cpu_peak_percent,
+            present: s.present.clone(),
         }
     })
     .unwrap_or_else(|| PerfSnapshot {
@@ -874,6 +889,9 @@ pub fn snapshot_json(extra: Value) -> Value {
         "memory_delta_mb": memory_delta_mb(&snap.memory_baseline, &snap.memory),
         "cpu_percent": snap.cpu_percent,
         "cpu_peak_percent": snap.cpu_peak_percent,
+        "tiles": snap.present,
+        "present": "display_tiles",
+        "mip_present": "retired",
     });
     if let Some(obj) = body.as_object_mut() {
         if let Some(map) = extra.as_object() {

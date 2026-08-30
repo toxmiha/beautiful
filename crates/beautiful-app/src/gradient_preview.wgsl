@@ -22,10 +22,14 @@ struct GradUniforms {
     /// w unused
     params: vec4<f32>,
     doc_size: vec2<f32>,
+    clip_origin: vec2<f32>,
+    clip_size: vec2<f32>,
     _pad: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> u: GradUniforms;
+@group(0) @binding(1) var mask_tex: texture_2d<f32>;
+@group(0) @binding(2) var mask_samp: sampler;
 
 @vertex
 fn vs_main(v: VsIn) -> VsOut {
@@ -138,8 +142,20 @@ fn quantize8(v: f32, n: f32) -> f32 {
 @fragment
 fn fs_main(v: VsOut) -> @location(0) vec4<f32> {
     let px = v.uv * u.doc_size;
+    var clip_a = 1.0;
+    if u.clip_size.x > 0.5 && u.clip_size.y > 0.5 {
+        let local = (px - u.clip_origin) / u.clip_size;
+        if local.x < 0.0 || local.y < 0.0 || local.x >= 1.0 || local.y >= 1.0 {
+            return vec4<f32>(0.0);
+        }
+        clip_a = textureSampleLevel(mask_tex, mask_samp, local, 0.0).r;
+        if clip_a <= 0.001 {
+            return vec4<f32>(0.0);
+        }
+    }
     let t = gradient_t(px, u.start, u.end, u.params.x);
     var c = lerp_colors(u.color0, u.color1, t, u.params.y);
+    c.a = c.a * clip_a;
     if u.params.z > 0.5 {
         let n = bayer8_val(px);
         c = vec4(

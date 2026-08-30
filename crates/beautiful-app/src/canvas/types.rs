@@ -9,6 +9,8 @@ pub(crate) struct SelPixelMoveSession {
     pub(crate) last: (f32, f32),
     pub(crate) lifted: bool,
     pub(crate) moved: bool,
+    /// No selection: shift the whole layer (sparse tiles). Skip mask/float.
+    pub(crate) whole_layer: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -59,7 +61,7 @@ pub struct TransformSession {
     pub layer_holed: TileBuffer,
     pub sel_rect: beautiful_core::SelectionRect,
     pub sel_mask: Option<beautiful_core::SelectionMask>,
-    pub sel_outline: Vec<(f32, f32)>,
+    pub sel_outline: beautiful_core::SelectionOutline,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,9 +77,13 @@ pub struct GradientSession {
     pub layer_before: TileBuffer,
     pub start: (f32, f32),
     pub end: (f32, f32),
-    /// First AтЖТB drag still in progress.
+    /// First A→B drag still in progress.
     pub defining: bool,
     pub(crate) drag: Option<GradientHandle>,
+    /// GPU overlay clip (view space). None = full stage.
+    pub(crate) clip: Option<crate::canvas_gpu::GradientClipMask>,
+    /// True only if a CPU fallback actually wrote tiles (no wgpu).
+    pub(crate) cpu_preview: bool,
 }
 
 /// Live shape preview, stored in document coordinates until release commits pixels.
@@ -130,9 +136,9 @@ pub(crate) enum WarpDragTarget {
     },
 }
 
-/// Free Transform session params (relative to baseline).
+/// Transform session params (relative to baseline).
 #[derive(Clone, Debug)]
-pub(crate) struct FreeXform {
+pub(crate) struct TransformPose {
     /// Signed scale (negative = flipped on that axis).
     pub(crate) scale_x: f32,
     pub(crate) scale_y: f32,
@@ -146,7 +152,7 @@ pub(crate) struct FreeXform {
     pub(crate) scale_anchor: (f32, f32),
 }
 
-impl FreeXform {
+impl TransformPose {
     pub(crate) fn from_baseline(w: u32, h: u32, x: f32, y: f32) -> Self {
         let x = x.round();
         let y = y.round();

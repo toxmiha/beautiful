@@ -1,7 +1,8 @@
-//! Pixel resampling / free-transform / flip helpers.
+//! Pixel resampling / scale-rotate transform / flip helpers.
 
 use crate::tiles::{TileBuffer, TILE_SIZE};
 use crate::Layer;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResampleFilter {
@@ -316,10 +317,10 @@ fn free_scaled_dim(side: u32, scale: f32) -> u32 {
     }
 }
 
-/// Build free-transform pixels from a baseline: signed scale (neg = flip), then rotate.
+/// Build transform pixels from a baseline: signed scale (neg = flip), then rotate.
 ///
 /// Returns `(pixels, width, height)` centered conceptually — caller places by center.
-pub fn apply_free_transform_rgba(
+pub fn apply_transform_rgba(
     src: &[u8],
     sw: u32,
     sh: u32,
@@ -352,8 +353,8 @@ pub fn apply_free_transform_rgba(
     (baked, nw, nh)
 }
 
-/// Output size of [`apply_free_transform_rgba`] (scale then rotate AABB).
-pub fn free_transform_output_size(
+/// Output size of [`apply_transform_rgba`] (scale then rotate AABB).
+pub fn transform_output_size(
     sw: u32,
     sh: u32,
     scale_x: f32,
@@ -374,7 +375,441 @@ pub fn free_transform_output_size(
     rotate_bounds_size(dw, dh, rotation_deg)
 }
 
-fn rotate_bounds_size(w: u32, h: u32, deg: f32) -> (u32, u32) {
+/// Viewport live bake: same pixels as [`apply_transform_rgba`], but only a dest rect.
+///
+/// `dest_*` are bake-pixel indices in the output AABB (`0..nw`, `0..nh`).
+/// `lod` ≥ 1 samples every Nth dest pixel (zoomed-out preview). Confirm still uses
+/// the full [`apply_transform_rgba`] path.
+#[derive(Clone, Debug)]
+pub struct LivePixelRect {
+    pub pixels: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    /// Document-space origin of texel (0, 0) — same convention as floating.x/y.
+    pub x: f32,
+    pub y: f32,
+    pub lod: u32,
+}
+
+pub fn raster_transform_rgba_rect(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    scale_x: f32,
+    scale_y: f32,
+    rotation_deg: f32,
+    filter: ResampleFilter,
+    center_x: f32,
+    center_y: f32,
+    dest_px0: i32,
+    dest_py0: i32,
+    dest_px1: i32,
+    dest_py1: i32,
+    lod: u32,
+) -> LivePixelRect {
+    let empty = || LivePixelRect {
+        pixels: vec![0; 4],
+        width: 1,
+        height: 1,
+        x: center_x,
+        y: center_y,
+        lod: 1,
+    };
+    if sw == 0 || sh == 0 || src.len() < (sw * sh * 4) as usize {
+        return empty();
+    }
+    let (nw, nh) = transform_output_size(sw, sh, scale_x, scale_y, rotation_deg);
+    let out_x = center_x - nw as f32 * 0.5;
+    let out_y = center_y - nh as f32 * 0.5;
+    let lod = lod.max(1);
+    let px0 = dest_px0.max(0);
+    let py0 = dest_py0.max(0);
+    let px1 = dest_px1.min(nw as i32).max(px0);
+    let py1 = dest_py1.min(nh as i32).max(py0);
+    let span_w = (px1 - px0) as u32;
+    let span_h = (py1 - py0) as u32;
+    if span_w == 0 || span_h == 0 {
+        return LivePixelRect {
+            pixels: vec![0; 4],
+            width: 1,
+            height: 1,
+            x: out_x + px0 as f32,
+            y: out_y + py0 as f32,
+            lod,
+        };
+    }
+    let ow = span_w.div_ceil(lod).max(1);
+    let oh = span_h.div_ceil(lod).max(1);
+    let mut out = vec![0u8; (ow as usize) * (oh as usize) * 4];
+    let ctx = TransformSample::new(src, sw, sh, scale_x, scale_y, rotation_deg, filter);
+    out.par_chunks_mut(ow as usize * 4)
+        .enumerate()
+        .for_each(|(ty, row)| {
+            let py = py0 + ty as i32 * lod as i32;
+            if py >= py1 {
+                return;
+            }
+            for tx in 0..ow {
+                let px = px0 + tx as i32 * lod as i32;
+                if px >= px1 {
+                    break;
+                }
+                let sample = ctx.sample_dest(px as u32, py as u32);
+                let di = tx as usize * 4;
+                row[di..di + 4].copy_from_slice(&sample);
+            }
+        });
+    LivePixelRect {
+        pixels: out,
+        width: ow,
+        height: oh,
+        x: out_x + px0 as f32,
+        y: out_y + py0 as f32,
+        lod,
+    }
+}
+
+struct TransformSample<'a> {
+    src: &'a [u8],
+    sw: u32,
+    sh: u32,
+    dw: u32,
+    dh: u32,
+    nw: u32,
+    nh: u32,
+    flip_h: bool,
+    flip_v: bool,
+    filter: ResampleFilter,
+    rot_deg: f32,
+    min_x: f32,
+    min_y: f32,
+    si: f32,
+    ci: f32,
+    cx: f32,
+    cy: f32,
+    cardinal: Option<u32>,
+}
+
+impl<'a> TransformSample<'a> {
+    fn new(
+        src: &'a [u8],
+        sw: u32,
+        sh: u32,
+        scale_x: f32,
+        scale_y: f32,
+        rotation_deg: f32,
+        filter: ResampleFilter,
+    ) -> Self {
+        let flip_h = scale_x < 0.0;
+        let flip_v = scale_y < 0.0;
+        let sx = scale_x.abs().max(0.01);
+        let sy = scale_y.abs().max(0.01);
+        let dw = free_scaled_dim(sw, sx);
+        let dh = free_scaled_dim(sh, sy);
+        let resolved = filter.resolve(dw as f32 / sw.max(1) as f32, dh as f32 / sh.max(1) as f32);
+        let (nw, nh) = transform_output_size(sw, sh, scale_x, scale_y, rotation_deg);
+        let cardinal = if matches!(resolved, ResampleFilter::Nearest) {
+            nearest_cardinal_turns(rotation_deg)
+        } else {
+            None
+        };
+        let (min_x, min_y, si, ci, cx, cy) = if rotation_deg.abs() < 0.05 || cardinal == Some(0) {
+            (0.0, 0.0, 0.0, 1.0, dw as f32 * 0.5, dh as f32 * 0.5)
+        } else {
+            let (min_x, min_y, _, _) = rotate_aabb(dw, dh, rotation_deg);
+            let inv = -rotation_deg.to_radians();
+            let (si, ci) = inv.sin_cos();
+            (min_x, min_y, si, ci, dw as f32 * 0.5, dh as f32 * 0.5)
+        };
+        Self {
+            src,
+            sw,
+            sh,
+            dw,
+            dh,
+            nw,
+            nh,
+            flip_h,
+            flip_v,
+            filter: resolved,
+            rot_deg: rotation_deg,
+            min_x,
+            min_y,
+            si,
+            ci,
+            cx,
+            cy,
+            cardinal,
+        }
+    }
+
+    fn sample_dest(&self, px: u32, py: u32) -> [u8; 4] {
+        if self.rot_deg.abs() < 0.05 || self.cardinal == Some(0) {
+            return self.scaled_texel(px as i32, py as i32);
+        }
+        if let Some(turns) = self.cardinal {
+            if let Some((sx, sy)) = inverse_cardinal(turns, px, py, self.dw, self.dh, self.nw, self.nh)
+            {
+                return self.scaled_texel(sx as i32, sy as i32);
+            }
+            return [0; 4];
+        }
+        let dx = px as f32 + self.min_x;
+        let dy = py as f32 + self.min_y;
+        let sx = self.ci * dx - self.si * dy + self.cx;
+        let sy = self.si * dx + self.ci * dy + self.cy;
+        if sx < -1.0 || sy < -1.0 || sx > self.dw as f32 || sy > self.dh as f32 {
+            return [0; 4];
+        }
+        self.sample_scaled_at(sx, sy)
+    }
+
+    fn scaled_texel(&self, mut ix: i32, mut iy: i32) -> [u8; 4] {
+        if ix < 0 || iy < 0 || ix >= self.dw as i32 || iy >= self.dh as i32 {
+            return [0; 4];
+        }
+        if self.flip_h {
+            ix = self.dw as i32 - 1 - ix;
+        }
+        if self.flip_v {
+            iy = self.dh as i32 - 1 - iy;
+        }
+        let ix = ix as u32;
+        let iy = iy as u32;
+        match self.filter {
+            ResampleFilter::Nearest => {
+                let sx = ((ix as f32 + 0.5) / self.dw as f32 * self.sw as f32) as u32;
+                let sy = ((iy as f32 + 0.5) / self.dh as f32 * self.sh as f32) as u32;
+                let sx = sx.min(self.sw - 1);
+                let sy = sy.min(self.sh - 1);
+                let si = ((sy * self.sw + sx) * 4) as usize;
+                if si + 4 > self.src.len() {
+                    return [0; 4];
+                }
+                [
+                    self.src[si],
+                    self.src[si + 1],
+                    self.src[si + 2],
+                    self.src[si + 3],
+                ]
+            }
+            ResampleFilter::Bilinear => {
+                let sx = (ix as f32 + 0.5) / self.dw as f32 * self.sw as f32 - 0.5;
+                let sy = (iy as f32 + 0.5) / self.dh as f32 * self.sh as f32 - 0.5;
+                sample_bilinear(self.src, self.sw, self.sh, sx, sy)
+            }
+            ResampleFilter::BicubicSmoother => {
+                let sx = (ix as f32 + 0.5) / self.dw as f32 * self.sw as f32 - 0.5;
+                let sy = (iy as f32 + 0.5) / self.dh as f32 * self.sh as f32 - 0.5;
+                sample_bicubic_a(self.src, self.sw, self.sh, sx, sy, -0.25)
+            }
+            ResampleFilter::BicubicSharper => {
+                let sx = (ix as f32 + 0.5) / self.dw as f32 * self.sw as f32 - 0.5;
+                let sy = (iy as f32 + 0.5) / self.dh as f32 * self.sh as f32 - 0.5;
+                sample_bicubic_a(self.src, self.sw, self.sh, sx, sy, -1.0)
+            }
+            ResampleFilter::Lanczos3 => {
+                let sx = (ix as f32 + 0.5) / self.dw as f32 * self.sw as f32 - 0.5;
+                let sy = (iy as f32 + 0.5) / self.dh as f32 * self.sh as f32 - 0.5;
+                sample_lanczos3_px(self.src, self.sw, self.sh, sx, sy)
+            }
+            ResampleFilter::Bicubic | ResampleFilter::BicubicAutomatic => {
+                let sx = (ix as f32 + 0.5) / self.dw as f32 * self.sw as f32 - 0.5;
+                let sy = (iy as f32 + 0.5) / self.dh as f32 * self.sh as f32 - 0.5;
+                sample_bicubic(self.src, self.sw, self.sh, sx, sy)
+            }
+        }
+    }
+
+    fn sample_scaled_at(&self, x: f32, y: f32) -> [u8; 4] {
+        match self.filter {
+            ResampleFilter::Nearest => {
+                let ix = x.round().clamp(0.0, (self.dw - 1) as f32) as i32;
+                let iy = y.round().clamp(0.0, (self.dh - 1) as f32) as i32;
+                self.scaled_texel(ix, iy)
+            }
+            _ => {
+                // Same neighborhood as sample_with_filter on the scaled buffer.
+                let x = x.clamp(0.0, (self.dw - 1) as f32);
+                let y = y.clamp(0.0, (self.dh - 1) as f32);
+                match self.filter {
+                    ResampleFilter::Bilinear => {
+                        let x0 = x.floor() as i32;
+                        let y0 = y.floor() as i32;
+                        let x1 = (x0 + 1).min(self.dw as i32 - 1);
+                        let y1 = (y0 + 1).min(self.dh as i32 - 1);
+                        let tx = x - x0 as f32;
+                        let ty = y - y0 as f32;
+                        let c00 = self.scaled_texel(x0, y0);
+                        let c10 = self.scaled_texel(x1, y0);
+                        let c01 = self.scaled_texel(x0, y1);
+                        let c11 = self.scaled_texel(x1, y1);
+                        let mut out = [0u8; 4];
+                        for i in 0..4 {
+                            let v = bilerp(
+                                c00[i] as f32,
+                                c10[i] as f32,
+                                c01[i] as f32,
+                                c11[i] as f32,
+                                tx,
+                                ty,
+                            );
+                            out[i] = v.round().clamp(0.0, 255.0) as u8;
+                        }
+                        out
+                    }
+                    _ => {
+                        // Cubic / Lanczos rotate of the virtual scaled image (16 taps).
+                        sample_filter_virtual(self, x, y)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn sample_filter_virtual(ctx: &TransformSample<'_>, x: f32, y: f32) -> [u8; 4] {
+    let a = match ctx.filter {
+        ResampleFilter::BicubicSmoother => -0.25,
+        ResampleFilter::BicubicSharper => -1.0,
+        _ => -0.5,
+    };
+    let x_i = x.floor() as i32;
+    let y_i = y.floor() as i32;
+    let fx = x - x_i as f32;
+    let fy = y - y_i as f32;
+    let cubic = |t: f32| -> f32 {
+        let t = t.abs();
+        if t <= 1.0 {
+            ((a + 2.0) * t - (a + 3.0)) * t * t + 1.0
+        } else if t < 2.0 {
+            ((a * t - 5.0 * a) * t + 8.0 * a) * t - 4.0 * a
+        } else {
+            0.0
+        }
+    };
+    let mut acc = [0.0f32; 4];
+    let mut wsum = 0.0f32;
+    for j in -1..=2 {
+        let wy = cubic(fy - j as f32);
+        let yy = (y_i + j).clamp(0, ctx.dh as i32 - 1);
+        for i in -1..=2 {
+            let wx = cubic(fx - i as f32);
+            let weight = wx * wy;
+            if weight.abs() < 1e-8 {
+                continue;
+            }
+            let xx = (x_i + i).clamp(0, ctx.dw as i32 - 1);
+            let p = ctx.scaled_texel(xx, yy);
+            for c in 0..4 {
+                acc[c] += p[c] as f32 * weight;
+            }
+            wsum += weight;
+        }
+    }
+    if wsum.abs() <= 1e-8 {
+        return [0; 4];
+    }
+    let mut out = [0u8; 4];
+    for c in 0..4 {
+        out[c] = (acc[c] / wsum).round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
+fn nearest_cardinal_turns(deg: f32) -> Option<u32> {
+    let r = deg.rem_euclid(360.0);
+    let near = |a: f32| (r - a).abs() < 0.5 || (r - a - 360.0).abs() < 0.5;
+    if near(0.0) {
+        Some(0)
+    } else if near(90.0) {
+        Some(1)
+    } else if near(180.0) {
+        Some(2)
+    } else if near(270.0) {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+fn inverse_cardinal(
+    turns: u32,
+    dx: u32,
+    dy: u32,
+    w: u32,
+    h: u32,
+    nw: u32,
+    nh: u32,
+) -> Option<(u32, u32)> {
+    if dx >= nw || dy >= nh {
+        return None;
+    }
+    match turns % 4 {
+        0 => Some((dx, dy)),
+        1 => {
+            // dest (h-1-y, x) ← src (x, y)
+            Some((dy, h.saturating_sub(1).saturating_sub(dx)))
+        }
+        2 => Some((
+            w.saturating_sub(1).saturating_sub(dx),
+            h.saturating_sub(1).saturating_sub(dy),
+        )),
+        3 => Some((w.saturating_sub(1).saturating_sub(dy), dx)),
+        _ => None,
+    }
+}
+
+fn sample_lanczos3_px(src: &[u8], sw: u32, sh: u32, sx: f32, sy: f32) -> [u8; 4] {
+    let a = 3.0_f32;
+    let lanczos = |x: f32| -> f32 {
+        let x = x.abs();
+        if x < 1e-6 {
+            1.0
+        } else if x < a {
+            let pix = std::f32::consts::PI * x;
+            (a * pix.sin() * (pix / a).sin()) / (pix * pix)
+        } else {
+            0.0
+        }
+    };
+    let mut acc = [0.0_f32; 4];
+    let mut wsum = 0.0_f32;
+    let x0 = (sx - a).floor() as i32;
+    let x1 = (sx + a).ceil() as i32;
+    let y0 = (sy - a).floor() as i32;
+    let y1 = (sy + a).ceil() as i32;
+    for yy in y0..=y1 {
+        if yy < 0 || yy >= sh as i32 {
+            continue;
+        }
+        let wy = lanczos(sy - yy as f32);
+        for xx in x0..=x1 {
+            if xx < 0 || xx >= sw as i32 {
+                continue;
+            }
+            let w = wy * lanczos(sx - xx as f32);
+            if w.abs() < 1e-6 {
+                continue;
+            }
+            let si = ((yy as u32 * sw + xx as u32) * 4) as usize;
+            for c in 0..4 {
+                acc[c] += src[si + c] as f32 * w;
+            }
+            wsum += w;
+        }
+    }
+    if wsum.abs() <= 1e-6 {
+        return [0; 4];
+    }
+    let mut out = [0u8; 4];
+    for c in 0..4 {
+        out[c] = (acc[c] / wsum).round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
+fn rotate_aabb(w: u32, h: u32, deg: f32) -> (f32, f32, u32, u32) {
     let rad = deg.to_radians();
     let (s, c) = rad.sin_cos();
     let cx = w as f32 * 0.5;
@@ -399,10 +834,14 @@ fn rotate_bounds_size(w: u32, h: u32, deg: f32) -> (u32, u32) {
         min_y = min_y.min(ry);
         max_y = max_y.max(ry);
     }
-    (
-        (max_x - min_x).ceil().max(1.0) as u32,
-        (max_y - min_y).ceil().max(1.0) as u32,
-    )
+    let nw = (max_x - min_x).ceil().max(1.0) as u32;
+    let nh = (max_y - min_y).ceil().max(1.0) as u32;
+    (min_x, min_y, nw, nh)
+}
+
+fn rotate_bounds_size(w: u32, h: u32, deg: f32) -> (u32, u32) {
+    let (_, _, nw, nh) = rotate_aabb(w, h, deg);
+    (nw, nh)
 }
 
 pub(crate) fn rotate_rgba(src: &[u8], w: u32, h: u32, deg: f32) -> (Vec<u8>, u32, u32, f32, f32) {
@@ -475,32 +914,11 @@ pub(crate) fn rotate_rgba_with_filter(
         }
     }
 
-    let rad = deg.to_radians();
-    let (s, c) = rad.sin_cos();
-    let corners = [
-        (0.0f32, 0.0),
-        (w as f32, 0.0),
-        (w as f32, h as f32),
-        (0.0, h as f32),
-    ];
+    let (min_x, min_y, nw, nh) = rotate_aabb(w, h, deg);
     let cx = w as f32 * 0.5;
     let cy = h as f32 * 0.5;
-    let mut xs = Vec::new();
-    let mut ys = Vec::new();
-    for (x, y) in corners {
-        let dx = x - cx;
-        let dy = y - cy;
-        xs.push(c * dx - s * dy);
-        ys.push(s * dx + c * dy);
-    }
-    let min_x = xs.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max_x = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let min_y = ys.iter().cloned().fold(f32::INFINITY, f32::min);
-    let max_y = ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let nw = (max_x - min_x).ceil().max(1.0) as u32;
-    let nh = (max_y - min_y).ceil().max(1.0) as u32;
     let mut out = vec![0u8; (nw * nh * 4) as usize];
-    let inv = -rad;
+    let inv = -deg.to_radians();
     let (si, ci) = inv.sin_cos();
     for py in 0..nh {
         for px in 0..nw {
@@ -516,7 +934,7 @@ pub(crate) fn rotate_rgba_with_filter(
             out[di..di + 4].copy_from_slice(&sample);
         }
     }
-    (out, nw, nh, (min_x + max_x) * 0.5, (min_y + max_y) * 0.5)
+    (out, nw, nh, 0.0, 0.0)
 }
 
 pub fn flip_layer_horizontal(layer: &mut Layer) {
@@ -649,5 +1067,115 @@ pub(crate) fn blit_layer_buf(
             let di = ((py as u32 * dw + px as u32) * 4) as usize;
             let _ = blend_src_over(&mut dst[di..di + 4], &src[si..si + 4]);
         }
+    }
+}
+
+#[cfg(test)]
+mod live_pixel_tests {
+    use super::*;
+
+    fn solid_rgba(w: u32, h: u32, c: [u8; 4]) -> Vec<u8> {
+        let mut v = vec![0u8; (w * h * 4) as usize];
+        for px in v.chunks_exact_mut(4) {
+            px.copy_from_slice(&c);
+        }
+        v
+    }
+
+    fn checker(w: u32, h: u32) -> Vec<u8> {
+        let mut v = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let on = ((x / 3) + (y / 3)) % 2 == 0;
+                let i = ((y * w + x) * 4) as usize;
+                let g = if on { 220 } else { 40 };
+                v[i] = g;
+                v[i + 1] = 255 - g;
+                v[i + 2] = (x * 13 + y * 7) as u8;
+                v[i + 3] = 255;
+            }
+        }
+        v
+    }
+
+    fn assert_live_matches_full(
+        src: &[u8],
+        sw: u32,
+        sh: u32,
+        sx: f32,
+        sy: f32,
+        rot: f32,
+        filter: ResampleFilter,
+    ) {
+        let (full, nw, nh) = apply_transform_rgba(src, sw, sh, sx, sy, rot, filter);
+        let live = raster_transform_rgba_rect(
+            src, sw, sh, sx, sy, rot, filter, 0.0, 0.0, 0, 0, nw as i32, nh as i32, 1,
+        );
+        assert_eq!(live.width, nw, "w sx={sx} sy={sy} rot={rot}");
+        assert_eq!(live.height, nh, "h sx={sx} sy={sy} rot={rot}");
+        assert_eq!(live.pixels, full, "pixels sx={sx} sy={sy} rot={rot:?}");
+    }
+
+    #[test]
+    fn live_rect_matches_identity() {
+        let src = checker(16, 10);
+        assert_live_matches_full(&src, 16, 10, 1.0, 1.0, 0.0, ResampleFilter::Nearest);
+        assert_live_matches_full(&src, 16, 10, 1.0, 1.0, 0.0, ResampleFilter::Bilinear);
+    }
+
+    #[test]
+    fn live_rect_matches_scale_nearest() {
+        let src = checker(12, 8);
+        assert_live_matches_full(&src, 12, 8, 2.0, 2.0, 0.0, ResampleFilter::Nearest);
+        assert_live_matches_full(&src, 12, 8, 0.5, 0.5, 0.0, ResampleFilter::Nearest);
+    }
+
+    #[test]
+    fn live_rect_matches_cardinal_nearest() {
+        let src = checker(9, 7);
+        for rot in [90.0, 180.0, 270.0] {
+            assert_live_matches_full(&src, 9, 7, 1.0, 1.0, rot, ResampleFilter::Nearest);
+            assert_live_matches_full(&src, 9, 7, 2.0, 1.0, rot, ResampleFilter::Nearest);
+        }
+    }
+
+    #[test]
+    fn live_rect_matches_bilinear_rotate() {
+        let src = checker(11, 9);
+        assert_live_matches_full(&src, 11, 9, 1.25, 0.8, 33.0, ResampleFilter::Bilinear);
+        assert_live_matches_full(&src, 11, 9, -1.0, 1.0, 15.0, ResampleFilter::Bilinear);
+    }
+
+    #[test]
+    fn live_tiles_stitch_to_full() {
+        let src = checker(14, 10);
+        let (full, nw, nh) = apply_transform_rgba(&src, 14, 10, 1.4, 1.1, 21.0, ResampleFilter::Bilinear);
+        let mid_x = (nw / 2) as i32;
+        let mid_y = (nh / 2) as i32;
+        let a = raster_transform_rgba_rect(
+            &src, 14, 10, 1.4, 1.1, 21.0, ResampleFilter::Bilinear,
+            0.0, 0.0, 0, 0, mid_x, nh as i32, 1,
+        );
+        let b = raster_transform_rgba_rect(
+            &src, 14, 10, 1.4, 1.1, 21.0, ResampleFilter::Bilinear,
+            0.0, 0.0, mid_x, 0, nw as i32, nh as i32, 1,
+        );
+        let mut stitched = vec![0u8; full.len()];
+        for y in 0..nh {
+            for x in 0..nw {
+                let di = ((y * nw + x) * 4) as usize;
+                if (x as i32) < mid_x {
+                    let si = ((y * a.width + x) * 4) as usize;
+                    stitched[di..di + 4].copy_from_slice(&a.pixels[si..si + 4]);
+                } else {
+                    let lx = x - a.width;
+                    let si = ((y * b.width + lx) * 4) as usize;
+                    stitched[di..di + 4].copy_from_slice(&b.pixels[si..si + 4]);
+                }
+            }
+        }
+        let _ = mid_y;
+        assert_eq!(stitched, full);
+        let _ = solid_rgba(1, 1, [0; 4]);
     }
 }

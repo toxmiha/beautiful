@@ -9,7 +9,10 @@ mod graph;
 mod stamp;
 mod tip_mask;
 
-pub use dab_planner::{Dab, DabPlannerState};
+pub use dab_planner::{
+    lerp_angle, plan_contact_dabs_into, plan_segment_dabs_into, Dab, DabPlannerState,
+    FollowHeading, FOLLOW_AIM_CAP,
+};
 pub use def::BrushDef;
 pub use graph::{
     BrushGraphNode, BrushGraphNodeData, BrushGraphWire, BrushNodeGraph, BrushOutField,

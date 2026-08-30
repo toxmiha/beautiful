@@ -8,6 +8,12 @@ use super::def::BrushDef;
 pub const MIN_SPACING: f32 = 0.025;
 pub const MAX_SPACING: f32 = 1.0;
 pub const MIN_SPACING_PX: f32 = 0.35;
+/// Stored aim vector length (document px). Only a seed so the next sample
+/// has a well-scaled direction — not a travel gate.
+pub const FOLLOW_AIM_CAP: f32 = 6.0;
+/// A pointer sample this long (px) is the mouse direction. Shorter samples
+/// are Windows axis stairs (8px + 1px) and must not snap the tip to ±90°.
+const FOLLOW_COMMIT_PX: f32 = 5.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Dab {
@@ -49,6 +55,14 @@ pub struct DabPlannerState {
     pub rng: u32,
     /// Cleared/filled by [`plan_segment_dabs_into`].
     pub dabs: Vec<Dab>,
+    /// Follow-stroke aim (radians) — current pointer direction.
+    pub last_stroke_angle: Option<f32>,
+    /// Aim vector (scaled to [`FOLLOW_AIM_CAP`]), not a lookback chord.
+    pub dir_x: f32,
+    pub dir_y: f32,
+    pub dir_valid: bool,
+    /// Last sample used to seed hover / next stroke.
+    pub heading_anchor: Option<(f32, f32)>,
 }
 
 impl Default for DabPlannerState {
@@ -59,6 +73,11 @@ impl Default for DabPlannerState {
             stroke_dist: 0.0,
             rng: 0,
             dabs: Vec::new(),
+            last_stroke_angle: None,
+            dir_x: 1.0,
+            dir_y: 0.0,
+            dir_valid: false,
+            heading_anchor: None,
         }
     }
 }
@@ -79,6 +98,117 @@ fn lcg_next(state: &mut u32) -> f32 {
 fn smoothstep01(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// Shortest-path angle blend (handles ±π wrap).
+#[inline]
+pub fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
+    let pi = std::f32::consts::PI;
+    let tau = std::f32::consts::TAU;
+    let mut d = b - a;
+    d = (d + pi).rem_euclid(tau) - pi;
+    a + d * t.clamp(0.0, 1.0)
+}
+
+#[inline]
+fn abs_angle_delta(a: f32, b: f32) -> f32 {
+    let pi = std::f32::consts::PI;
+    let tau = std::f32::consts::TAU;
+    let mut d = b - a;
+    d = (d + pi).rem_euclid(tau) - pi;
+    d.abs()
+}
+
+/// Follow-stroke heading = **this pointer move**, not a lookback chord.
+///
+/// Lookback / min-travel / reverse-reject created a dead zone (tip stuck until
+/// you dragged far enough in the new direction) and made the smear twist along
+/// its own path instead of aiming where the mouse is going now.
+#[derive(Debug, Clone, Copy)]
+pub struct FollowHeading {
+    pub angle: f32,
+    pub dir_x: f32,
+    pub dir_y: f32,
+    pub valid: bool,
+    pub anchor: Option<(f32, f32)>,
+}
+
+impl Default for FollowHeading {
+    fn default() -> Self {
+        Self {
+            angle: 0.0,
+            dir_x: 1.0,
+            dir_y: 0.0,
+            valid: false,
+            anchor: None,
+        }
+    }
+}
+
+impl FollowHeading {
+    pub fn from_planner(state: &DabPlannerState) -> Self {
+        Self {
+            angle: state.last_stroke_angle.unwrap_or(0.0),
+            dir_x: state.dir_x,
+            dir_y: state.dir_y,
+            valid: state.dir_valid,
+            anchor: state.heading_anchor,
+        }
+    }
+
+    pub fn apply_to_planner(self, state: &mut DabPlannerState) {
+        state.last_stroke_angle = self.valid.then_some(self.angle);
+        state.dir_x = self.dir_x;
+        state.dir_y = self.dir_y;
+        state.dir_valid = self.valid;
+        state.heading_anchor = self.anchor;
+    }
+
+    /// Aim along this pointer sample — where the mouse is going now.
+    ///
+    /// No lookback / min-travel / reverse-reject (those were the dead zone).
+    /// A real move (≥ `FOLLOW_COMMIT_PX` or a reverse) replaces heading so the
+    /// tip does not slowly twist the smear. Sub-commit samples only blend so a
+    /// 1px Windows stair does not snap to ±90°.
+    pub fn step(&mut self, dx: f32, dy: f32) -> f32 {
+        let seg_len = (dx * dx + dy * dy).sqrt();
+        if seg_len < 0.05 {
+            return self.angle;
+        }
+        let sample_a = dy.atan2(dx);
+        if !self.valid {
+            self.valid = true;
+            self.angle = sample_a;
+            self.write_dir_from_angle();
+            return self.angle;
+        }
+        let reverse = abs_angle_delta(self.angle, sample_a) > 2.0;
+        let t = if reverse {
+            1.0
+        } else {
+            (seg_len / FOLLOW_COMMIT_PX).min(1.0)
+        };
+        if t >= 1.0 {
+            self.angle = sample_a;
+        } else {
+            self.angle = lerp_angle(self.angle, sample_a, t.max(0.2));
+        }
+        self.write_dir_from_angle();
+        self.angle
+    }
+
+    fn write_dir_from_angle(&mut self) {
+        let (s, c) = self.angle.sin_cos();
+        self.dir_x = c * FOLLOW_AIM_CAP;
+        self.dir_y = s * FOLLOW_AIM_CAP;
+    }
+}
+
+fn stabilize_stroke_dir(state: &mut DabPlannerState, dx: f32, dy: f32) -> f32 {
+    let mut h = FollowHeading::from_planner(state);
+    let out = h.step(dx, dy);
+    h.apply_to_planner(state);
+    out
 }
 
 /// Plan dabs along segment into `state.dabs` (reuses capacity).
@@ -108,7 +238,11 @@ pub fn plan_segment_dabs_into(
     let uy = dy / dist;
     let nx = -uy;
     let ny = ux;
-    let stroke_angle = dy.atan2(dx);
+    let stroke_angle = if def.follow_stroke {
+        stabilize_stroke_dir(state, dx, dy)
+    } else {
+        def.angle
+    };
 
     let scatter = def.scatter.clamp(0.0, 1.0);
     let jitter = def.jitter.clamp(0.0, 1.0);
@@ -116,7 +250,8 @@ pub fn plan_segment_dabs_into(
     let taper_in = def.taper_in.clamp(0.0, 1.0);
     let taper_out = def.taper_out.clamp(0.0, 1.0);
     let count = def.scatter_count.clamp(1, 4) as usize;
-    let need_rng = scatter > 1e-6 || jitter > 1e-6 || fuzzy > 1e-6;
+    // Count>1 needs RNG so extra particles leave the path (even at Scatter 0%).
+    let need_rng = scatter > 1e-6 || jitter > 1e-6 || fuzzy > 1e-6 || count > 1;
     // Speed 0..1 from segment travel vs ~2 brush diameters (no timestamps in polyline).
     let speed01 = (dist / (def.size.max(1.0) * 2.0)).clamp(0.0, 1.0);
 
@@ -143,7 +278,8 @@ pub fn plan_segment_dabs_into(
         acc = 0.0;
         let path_x = x0 + ux * traveled;
         let path_y = y0 + uy * traveled;
-        let tp = p0 + (p1 - p0) * (traveled / dist);
+        let u = (traveled / dist).clamp(0.0, 1.0);
+        let tp = p0 + (p1 - p0) * u;
         let base_angle = if def.follow_stroke {
             stroke_angle + def.angle
         } else {
@@ -166,50 +302,158 @@ pub fn plan_segment_dabs_into(
         };
         let taper_scale = (tin * tout).clamp(0.0, 1.0);
 
-        for i in 0..count {
-            let mut x = path_x;
-            let mut y = path_y;
-            let mut angle = base_angle;
-            let mut size_scale = taper_scale;
-            let opacity_scale = taper_scale;
-
-            if need_rng {
-                if i > 0 || scatter > 1e-6 {
-                    let a = lcg_next(&mut state.rng) * std::f32::consts::TAU;
-                    let r = lcg_next(&mut state.rng).sqrt() * scatter * diameter * 0.5;
-                    x += a.cos() * r;
-                    y += a.sin() * r;
-                }
-                if jitter > 1e-6 {
-                    let j = jitter * diameter;
-                    x += (lcg_next(&mut state.rng) * 2.0 - 1.0) * j * 0.5;
-                    y += (lcg_next(&mut state.rng) * 2.0 - 1.0) * j * 0.5;
-                    // Slight along/normal mix for organic feel.
-                    let along = (lcg_next(&mut state.rng) * 2.0 - 1.0) * j * 0.25;
-                    x += ux * along + nx * along * 0.15;
-                    y += uy * along + ny * along * 0.15;
-                }
-                if fuzzy > 1e-6 {
-                    let f = lcg_next(&mut state.rng) * 2.0 - 1.0;
-                    size_scale *= (1.0 - fuzzy * 0.45 + f * fuzzy * 0.45).clamp(0.15, 1.35);
-                    angle += (lcg_next(&mut state.rng) * 2.0 - 1.0) * fuzzy * 0.35;
-                }
-            }
-
-            state.dabs.push(Dab {
-                x,
-                y,
-                pressure: tp,
-                angle,
-                size_scale,
-                opacity_scale,
-                speed: speed01,
-            });
-        }
+        push_scattered_dabs(
+            state,
+            count,
+            path_x,
+            path_y,
+            ux,
+            uy,
+            nx,
+            ny,
+            diameter,
+            base_angle,
+            taper_scale,
+            tp,
+            speed01,
+            scatter,
+            jitter,
+            fuzzy,
+            need_rng,
+        );
     }
 
     state.stroke_dist += dist;
     state.spacing_acc = acc;
+}
+
+fn push_scattered_dabs(
+    state: &mut DabPlannerState,
+    count: usize,
+    path_x: f32,
+    path_y: f32,
+    ux: f32,
+    uy: f32,
+    nx: f32,
+    ny: f32,
+    diameter: f32,
+    base_angle: f32,
+    taper_scale: f32,
+    pressure: f32,
+    speed: f32,
+    scatter: f32,
+    jitter: f32,
+    fuzzy: f32,
+    need_rng: bool,
+) {
+    for i in 0..count {
+        let mut x = path_x;
+        let mut y = path_y;
+        let mut angle = base_angle;
+        let mut size_scale = taper_scale;
+        let opacity_scale = taper_scale;
+
+        if need_rng {
+            if i > 0 || scatter > 1e-6 {
+                // Scatter = fraction of diameter. 100% → up to ±1 diameter across
+                // the stroke (peer-typical), with a smaller along-path component.
+                // Extra particles (count>1) always leave the path even at tiny %.
+                let amount = scatter.max(if i > 0 { 0.08 } else { 0.0 }) * diameter;
+                let across = (lcg_next(&mut state.rng) * 2.0 - 1.0) * amount;
+                let along = (lcg_next(&mut state.rng) * 2.0 - 1.0) * amount * 0.35;
+                x += nx * across + ux * along;
+                y += ny * across + uy * along;
+            }
+            if jitter > 1e-6 {
+                let j = jitter * diameter;
+                x += (lcg_next(&mut state.rng) * 2.0 - 1.0) * j * 0.5;
+                y += (lcg_next(&mut state.rng) * 2.0 - 1.0) * j * 0.5;
+                let along = (lcg_next(&mut state.rng) * 2.0 - 1.0) * j * 0.25;
+                x += ux * along + nx * along * 0.15;
+                y += uy * along + ny * along * 0.15;
+            }
+            if fuzzy > 1e-6 {
+                let f = lcg_next(&mut state.rng) * 2.0 - 1.0;
+                size_scale *= (1.0 - fuzzy * 0.45 + f * fuzzy * 0.45).clamp(0.15, 1.35);
+                angle += (lcg_next(&mut state.rng) * 2.0 - 1.0) * fuzzy * 0.35;
+            }
+        }
+
+        state.dabs.push(Dab {
+            x,
+            y,
+            pressure,
+            angle,
+            size_scale,
+            opacity_scale,
+            speed,
+        });
+    }
+}
+
+/// First-contact dabs (click / stroke start). Scatter/count/jitter/fuzzy apply;
+/// taper stays 1 so the first stamp is visible (same as paint_stamp).
+/// Plan a contact dab (press / single sample). When `follow_stroke`, `stroke_tangent`
+/// is the path direction (hover aim or last segment); `None` falls back to fixed angle only.
+pub fn plan_contact_dabs_into(
+    x: f32,
+    y: f32,
+    pressure: f32,
+    def: &BrushDef,
+    state: &mut DabPlannerState,
+    stroke_tangent: Option<f32>,
+) {
+    state.dabs.clear();
+    let diameter = def.effective_size(pressure).max(1.0);
+    let scatter = def.scatter.clamp(0.0, 1.0);
+    let jitter = def.jitter.clamp(0.0, 1.0);
+    let fuzzy = def.fuzzy.clamp(0.0, 1.0);
+    let count = def.scatter_count.clamp(1, 4) as usize;
+    let need_rng = scatter > 1e-6 || jitter > 1e-6 || fuzzy > 1e-6 || count > 1;
+    let base_angle = if def.follow_stroke {
+        stroke_tangent.unwrap_or(0.0) + def.angle
+    } else {
+        def.angle
+    };
+    let (ux, uy) = if let Some(a) = stroke_tangent {
+        let (s, c) = a.sin_cos();
+        (c, s)
+    } else {
+        (1.0, 0.0)
+    };
+    let nx = -uy;
+    let ny = ux;
+    push_scattered_dabs(
+        state,
+        count,
+        x,
+        y,
+        ux,
+        uy,
+        nx,
+        ny,
+        diameter,
+        base_angle,
+        1.0,
+        pressure,
+        0.0,
+        scatter,
+        jitter,
+        fuzzy,
+        need_rng,
+    );
+    state.stamped = true;
+    state.spacing_acc = 0.0;
+    if def.follow_stroke {
+        if let Some(a) = stroke_tangent {
+            state.last_stroke_angle = Some(a);
+            let (s, c) = a.sin_cos();
+            state.dir_x = c * FOLLOW_AIM_CAP;
+            state.dir_y = s * FOLLOW_AIM_CAP;
+            state.dir_valid = true;
+            state.heading_anchor = Some((x, y));
+        }
+    }
 }
 
 /// Convenience: mid-stroke segment (no taper_out).
@@ -362,5 +606,178 @@ mod tests {
         plan_segment_dabs(0.0, 0.0, 1.0, 200.0, 0.0, 1.0, &def1, &mut a);
         plan_segment_dabs(0.0, 0.0, 1.0, 200.0, 0.0, 1.0, &def3, &mut b);
         assert_eq!(b.dabs.len(), a.dabs.len() * 3);
+    }
+
+    #[test]
+    fn follow_stroke_heading_tracks_right_angle_turn() {
+        let mut s = BrushSettings::preset_pen();
+        s.size = 40.0;
+        s.spacing = 0.5;
+        s.follow_stroke = true;
+        s.roundness = 0.3;
+        s.pressure_size = false;
+        let def = BrushDef::from_settings(&s);
+        let mut st = DabPlannerState::default();
+        plan_segment_dabs(0.0, 0.0, 1.0, 80.0, 0.0, 1.0, &def, &mut st);
+        let a0 = st.last_stroke_angle.expect("heading after run");
+        assert!(a0.abs() < 0.2, "should head right, got {a0}");
+        plan_segment_dabs(80.0, 0.0, 1.0, 80.0, 60.0, 1.0, &def, &mut st);
+        let a1 = st.last_stroke_angle.expect("heading after turn");
+        let err = abs_angle_delta(a1, std::f32::consts::FRAC_PI_2);
+        assert!(
+            err < 0.2,
+            "should head up after turn, got {a1} err={err}"
+        );
+    }
+
+    #[test]
+    fn follow_stroke_small_orthogonal_samples_do_not_freeze() {
+        let mut s = BrushSettings::preset_pen();
+        s.size = 40.0;
+        s.spacing = 0.4;
+        s.follow_stroke = true;
+        s.roundness = 0.3;
+        s.pressure_size = false;
+        let def = BrushDef::from_settings(&s);
+        let mut st = DabPlannerState::default();
+        st.dir_x = 1.0;
+        st.dir_y = 0.0;
+        st.dir_valid = true;
+        st.last_stroke_angle = Some(0.0);
+        st.heading_anchor = Some((80.0, 0.0));
+        let mut y = 0.0_f32;
+        for _ in 0..14 {
+            plan_segment_dabs(80.0, y, 1.0, 80.0, y + 2.5, 1.0, &def, &mut st);
+            y += 2.5;
+        }
+        let a = st.last_stroke_angle.expect("heading");
+        let err = abs_angle_delta(a, std::f32::consts::FRAC_PI_2);
+        assert!(
+            err < 0.5,
+            "tiny up samples must turn the tip, got {a} err={err}"
+        );
+    }
+
+    #[test]
+    fn follow_stroke_dabs_share_mouse_heading() {
+        let mut s = BrushSettings::preset_pen();
+        s.size = 30.0;
+        s.spacing = 0.12;
+        s.follow_stroke = true;
+        s.roundness = 0.25;
+        s.pressure_size = false;
+        s.angle = 0.0;
+        let def = BrushDef::from_settings(&s);
+        let mut st = DabPlannerState::default();
+        plan_segment_dabs(0.0, 0.0, 1.0, 60.0, 0.0, 1.0, &def, &mut st);
+        plan_segment_dabs(60.0, 0.0, 1.0, 60.0, 50.0, 1.0, &def, &mut st);
+        assert!(st.dabs.len() >= 4, "need several dabs, got {}", st.dabs.len());
+        let first = st.dabs[0].angle;
+        for dab in &st.dabs {
+            assert!(
+                abs_angle_delta(dab.angle, first) < 0.02,
+                "dabs must share this move's heading, not twist the smear ({} vs {first})",
+                dab.angle
+            );
+        }
+        let err = abs_angle_delta(first, std::f32::consts::FRAC_PI_2);
+        assert!(
+            err < 0.2,
+            "upward move should aim up, got {first} err={err}"
+        );
+    }
+
+    #[test]
+    fn follow_stroke_turn_has_no_travel_gate() {
+        let mut s = BrushSettings::preset_pen();
+        s.size = 40.0;
+        s.spacing = 0.5;
+        s.follow_stroke = true;
+        s.roundness = 0.3;
+        s.pressure_size = false;
+        let def = BrushDef::from_settings(&s);
+        let mut st = DabPlannerState::default();
+        plan_segment_dabs(0.0, 0.0, 1.0, 40.0, 0.0, 1.0, &def, &mut st);
+        plan_segment_dabs(40.0, 0.0, 1.0, 40.0, 8.0, 1.0, &def, &mut st);
+        let a = st.last_stroke_angle.expect("heading");
+        assert!(
+            abs_angle_delta(a, std::f32::consts::FRAC_PI_2) < 0.2,
+            "8px turn must aim up immediately, got {a}"
+        );
+    }
+
+    #[test]
+    fn follow_stroke_staircase_does_not_oscillate() {
+        let mut s = BrushSettings::preset_pen();
+        s.size = 40.0;
+        s.spacing = 0.5;
+        s.follow_stroke = true;
+        s.roundness = 0.3;
+        s.pressure_size = false;
+        let def = BrushDef::from_settings(&s);
+        let mut st = DabPlannerState::default();
+        let mut x = 0.0_f32;
+        let mut y = 0.0_f32;
+        let mut min_a = 0.0_f32;
+        let mut max_a = 0.0_f32;
+        let mut seeded = false;
+        // Absolute-mouse stairs: 8px right, 1px up, repeat (sideways stroke).
+        for i in 0..24 {
+            let (nx, ny) = if i % 2 == 0 {
+                (x + 8.0, y)
+            } else {
+                (x, y + 1.0)
+            };
+            plan_segment_dabs(x, y, 1.0, nx, ny, 1.0, &def, &mut st);
+            x = nx;
+            y = ny;
+            if let Some(a) = st.last_stroke_angle {
+                if !seeded {
+                    min_a = a;
+                    max_a = a;
+                    seeded = true;
+                } else {
+                    min_a = min_a.min(a);
+                    max_a = max_a.max(a);
+                }
+            }
+        }
+        assert!(seeded);
+        let swing = max_a - min_a;
+        assert!(
+            swing < 0.75,
+            "sideways staircase must not flip ~90°, swing={swing} [{min_a}, {max_a}]"
+        );
+        let a = st.last_stroke_angle.unwrap();
+        assert!(
+            a.abs() < 0.45,
+            "net heading should stay near right, got {a}"
+        );
+    }
+
+    #[test]
+    fn follow_stroke_reverse_is_not_a_dead_zone() {
+        let mut s = BrushSettings::preset_pen();
+        s.size = 40.0;
+        s.spacing = 0.4;
+        s.follow_stroke = true;
+        s.roundness = 0.3;
+        s.pressure_size = false;
+        let def = BrushDef::from_settings(&s);
+        let mut st = DabPlannerState::default();
+        plan_segment_dabs(0.0, 0.0, 1.0, 80.0, 0.0, 1.0, &def, &mut st);
+        assert!(st.last_stroke_angle.unwrap().abs() < 0.2);
+        let mut x = 80.0_f32;
+        for _ in 0..20 {
+            plan_segment_dabs(x, 0.0, 1.0, x - 2.5, 0.0, 1.0, &def, &mut st);
+            x -= 2.5;
+        }
+        let a = st.last_stroke_angle.unwrap().abs();
+        let err = (a - std::f32::consts::PI).abs().min(a);
+        assert!(
+            err < 0.7,
+            "slow reverse must turn the tip, got {}",
+            st.last_stroke_angle.unwrap()
+        );
     }
 }

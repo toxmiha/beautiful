@@ -18,6 +18,27 @@ use crate::selection::SelectionMask;
 use crate::tiles::{TileBuffer, TILE_SIZE};
 use crate::{BrushShape, BrushTexture, Layer, PaintMode, StrokeState};
 
+/// opaque_linearize for Build-up: convert stroke Opacity into
+/// per-dab alpha so ~`1/spacing` overlaps approximate the slider value.
+/// Without this, mid Opacity saturates after a few dense dabs (50% ≈ 100%).
+#[inline]
+fn opaque_linearize(opacity: f32, spacing: f32) -> f32 {
+    let o = opacity.clamp(0.0, 1.0);
+    if o <= 1e-6 {
+        return 0.0;
+    }
+    if o >= 0.999 {
+        return 1.0;
+    }
+    // Spacing is fraction of diameter; dabs along a stroke line ≈ 1/spacing.
+    let spacing = spacing.clamp(0.025, 1.0);
+    let mut dabs = (1.0 / spacing).clamp(1.0, 64.0);
+    // Soften opaque_linearize≈0.9 (full correction is harsh on edges).
+    const LINEARIZE: f32 = 0.9;
+    dabs = 1.0 + LINEARIZE * (dabs - 1.0);
+    1.0 - (1.0 - o).powf(1.0 / dabs)
+}
+
 impl Layer {
     /// v2 stamp into paint tiles. Caller flushes.
     pub fn draw_stamp_v2(
@@ -102,7 +123,13 @@ impl Layer {
             [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b)]
         };
 
-        let extent = tip.ensure(radius, def.hardness, def.shape);
+        let extent = tip.ensure_shape(
+            radius,
+            def.hardness,
+            def.shape,
+            &def.shape_path,
+            def.shape_invert,
+        );
         let x = dab.x;
         let y = dab.y;
         let x0 = (x - extent as f32).floor() as i32;
@@ -153,7 +180,8 @@ impl Layer {
             def.shape,
             BrushShape::SimpleCircle | BrushShape::SoftEdge
         ) && (roundness - 1.0).abs() < 1e-4
-            && !flip;
+            && !flip
+            && def.shape_path.trim().is_empty();
         let identity = circle_invariant
             || (dab.angle.abs() < 1e-6 && (roundness - 1.0).abs() < 1e-4 && !flip);
         let (sin_n, cos_n) = if identity {
@@ -161,18 +189,59 @@ impl Layer {
         } else {
             (-dab.angle).sin_cos()
         };
-        let has_tex = def.texture != BrushTexture::None && def.texture_intensity > 1e-5;
+        let paper_map = if !def.paper_path.trim().is_empty() {
+            crate::brush_assets::load_gray(
+                &def.paper_path,
+                def.texture_invert,
+                crate::brush_assets::GrayPolarity::LightSolid,
+            )
+        } else {
+            None
+        };
+        let has_tex = def.texture_intensity > 1e-5
+            && (paper_map.is_some() || def.texture != BrushTexture::None);
+        let has_bitmap = tip.has_bitmap();
+        // Paper is a coverage multiply — it must not eject the Phase 1b kernel.
+        // Circular opaque-core spans are only valid for true circular tips
+        // (`circle_invariant`). Posed / elliptic / slash / square must sample
+        // every pixel — otherwise the core paints a round blob (visible on
+        // fast sparse dabs where shape should still show).
         let simple_buildup = !wash
             && !def.eraser
             && dilution <= 1e-5
             && !def.keep_opacity
-            && !has_tex
-            && clip.is_none();
+            && clip.is_none()
+            && !has_bitmap
+            && circle_invariant;
         let simple_wash = wash
             && !def.eraser
-            && dilution <= 1e-5
-            && !has_tex
-            && clip.is_none();
+            && clip.is_none()
+            && !has_bitmap
+            && circle_invariant;
+
+        let tex_ang = def.texture_angle
+            + if def.texture_move_with_stroke {
+                dab.angle
+            } else {
+                0.0
+            };
+        let (tex_sin, tex_cos) = if has_tex {
+            tex_ang.sin_cos()
+        } else {
+            (0.0, 1.0)
+        };
+        let tex_scale = def.texture_scale.max(0.05);
+        let tex_t = def.texture_intensity.clamp(0.0, 1.0);
+        let tex_bias = 1.0 - tex_t;
+        let (paper_inv_tw, paper_inv_th, paper_lod) = if let Some(ref map) = paper_map {
+            let tw = (map.width as f32 * tex_scale).max(1e-4);
+            let th = (map.height as f32 * tex_scale).max(1e-4);
+            let texels = (1.0 / tex_scale).max(1.0);
+            (1.0 / tw, 1.0 / th, texels.log2().max(0.0))
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+        let proc_inv_period = tex_scale / 18.0;
 
         let params = StampParams {
             x,
@@ -184,7 +253,15 @@ impl Layer {
             outer2: (extent as f32) * (extent as f32),
             opacity,
             flow,
-            opac_flow: (opacity * flow).clamp(0.0, 1.0),
+            // Accumulate (Build-up): opaque_linearize so Opacity ≈
+            // stroke coverage after ~1/spacing overlaps — without this, mid
+            // Opacity saturates to full after a few dabs (50% feels like 100%).
+            // Wash already locks stroke opacity via coverage; leave opac_flow raw.
+            opac_flow: if wash {
+                (opacity * flow).clamp(0.0, 1.0)
+            } else {
+                opaque_linearize((opacity * flow).clamp(0.0, 1.0), def.spacing)
+            },
             wash,
             eraser: def.eraser,
             dilution,
@@ -197,17 +274,18 @@ impl Layer {
             flip_x: def.tip_flip_x,
             flip_y: def.tip_flip_y,
             has_tex,
+            paper: paper_map,
             texture: def.texture,
-            texture_scale: def.texture_scale,
-            texture_intensity: def.texture_intensity,
             texture_invert: def.texture_invert,
-            texture_angle: def.texture_angle
-                + if def.texture_move_with_stroke {
-                    dab.angle
-                } else {
-                    0.0
-                },
             texture_move_with_stroke: def.texture_move_with_stroke,
+            tex_cos,
+            tex_sin,
+            paper_inv_tw,
+            paper_inv_th,
+            paper_lod,
+            proc_inv_period,
+            tex_t,
+            tex_bias,
             simple_buildup,
             simple_wash,
             hard_tip: tip.is_hard() && identity,
@@ -379,7 +457,7 @@ impl Layer {
             }
             if dual {
                 let diam = def.effective_size_ex(dab.pressure, dab.speed) * dab.size_scale.max(0.05);
-                let off = def.dual_scatter * diam * 0.5;
+                let off = def.dual_scatter * diam;
                 // Offset along tip normal (perpendicular to pose angle).
                 let n = dab.angle + std::f32::consts::FRAC_PI_2;
                 let mut d2 = dab;
@@ -429,15 +507,21 @@ struct StampParams {
     flip_x: bool,
     flip_y: bool,
     has_tex: bool,
+    paper: Option<std::sync::Arc<crate::brush_assets::GrayMap>>,
     texture: BrushTexture,
-    texture_scale: f32,
-    texture_intensity: f32,
     texture_invert: bool,
-    texture_angle: f32,
     texture_move_with_stroke: bool,
-    /// Build-up paint without clip/tex/dilution/eraser extras.
+    tex_cos: f32,
+    tex_sin: f32,
+    paper_inv_tw: f32,
+    paper_inv_th: f32,
+    paper_lod: f32,
+    proc_inv_period: f32,
+    tex_t: f32,
+    tex_bias: f32,
+    /// Build-up paint without clip/dilution/eraser extras (texture allowed).
     simple_buildup: bool,
-    /// Wash without clip/tex/eraser — fast coverage path.
+    /// Wash without clip/eraser — fast coverage path (texture allowed).
     simple_wash: bool,
     hard_tip: bool,
     /// Document-space geometric radius (for hard analytical path).
@@ -451,6 +535,27 @@ fn sample_tip_cov(tip: &TipMask, dx: f32, dy: f32, p: &StampParams) -> f32 {
     let dx = if p.flip_x { -dx } else { dx };
     let dy = if p.flip_y { -dy } else { dy };
     tip.coverage_posed_pre(dx, dy, p.cos_n, p.sin_n, p.inv_round, p.identity)
+}
+
+/// Coverage modulator: `1 - t + t * tex`. Identity when `!has_tex`.
+#[inline]
+fn stamp_tex_mod(p: &StampParams, dx: f32, dy: f32, px: i32, py: i32) -> f32 {
+    if !p.has_tex {
+        return 1.0;
+    }
+    let (x, y) = if p.texture_move_with_stroke {
+        (dx, dy)
+    } else {
+        (px as f32 + 0.5, py as f32 + 0.5)
+    };
+    let rx = x * p.tex_cos - y * p.tex_sin;
+    let ry = x * p.tex_sin + y * p.tex_cos;
+    let tex = if let Some(map) = p.paper.as_ref() {
+        map.sample(rx * p.paper_inv_tw, ry * p.paper_inv_th, p.paper_lod, true)
+    } else {
+        texture_sample_xy(p.texture, rx, ry, p.proc_inv_period, p.texture_invert)
+    };
+    p.tex_bias + p.tex_t * tex
 }
 
 fn stamp_tile(
@@ -570,7 +675,7 @@ fn stamp_tile_buildup_simple(
     tip: &TipMask,
     p: &StampParams,
 ) -> bool {
-    if p.hard_tip {
+    if p.hard_tip && !p.has_tex {
         return stamp_tile_buildup_hard(tx, ty, pf, p);
     }
     let ts = TILE_SIZE as i32;
@@ -603,6 +708,7 @@ fn stamp_tile_buildup_simple(
         let row = ly * TILE_SIZE as usize;
 
         // Opaque core span — no LUT / sqrt per pixel (identical coverage=1 region).
+        // With paper, coverage is not uniform — keep the core LUT skip, drop the solid span.
         let (cx0, cx1) = if core_in2 > dy2 && core_in > 0.5 {
             let dxc = (core_in2 - dy2).sqrt();
             let c0 = ((p.x - dxc).ceil() as i32).max(px0);
@@ -612,16 +718,24 @@ fn stamp_tile_buildup_simple(
             (px0, px0)
         };
 
-        if cx1 > cx0 {
+        if !p.has_tex && cx1 > cx0 {
             wrote |= blend_row_span(pf, row, ox, cx0, cx1, ink0, ink1, ink2, of);
         }
 
         for px in px0..px1 {
-            if px >= cx0 && px < cx1 {
+            let in_core = px >= cx0 && px < cx1;
+            if !p.has_tex && in_core {
                 continue;
             }
             let dx = (px as f32 + 0.5) - p.x;
-            let cov = sample_tip_cov(tip, dx, dy, p);
+            let mut cov = if in_core {
+                1.0
+            } else {
+                sample_tip_cov(tip, dx, dy, p)
+            };
+            if p.has_tex {
+                cov *= stamp_tex_mod(p, dx, dy, px, py);
+            }
             if cov <= 1e-5 {
                 continue;
             }
@@ -631,7 +745,8 @@ fn stamp_tile_buildup_simple(
             }
             let lx = (px - ox) as usize;
             let i = (row + lx) * 4;
-            if already_opaque_same_ink(pf, i, ink0, ink1, ink2) {
+            // Skip saturated same-ink only when dab can reach opaque (saves CPU at high Opacity).
+            if of > 0.25 && already_opaque_same_ink(pf, i, ink0, ink1, ink2) {
                 continue;
             }
             if solid && sa >= 0.999 {
@@ -841,6 +956,11 @@ fn stamp_tile_wash_simple(
                 1.0
             } else {
                 sample_tip_cov(tip, dx, dy, p)
+            };
+            let cov = if p.has_tex {
+                cov * stamp_tex_mod(p, dx, dy, px, py)
+            } else {
+                cov
             };
             if cov <= 1e-5 {
                 continue;
@@ -1057,21 +1177,7 @@ fn tip_coverage(
         return None;
     }
     if p.has_tex {
-        let (tx, ty) = if p.texture_move_with_stroke {
-            (dx, dy)
-        } else {
-            (px as f32 + 0.5, py as f32 + 0.5)
-        };
-        let tex = texture_sample(
-            p.texture,
-            tx,
-            ty,
-            p.texture_scale,
-            p.texture_invert,
-            p.texture_angle,
-        );
-        let t = p.texture_intensity.clamp(0.0, 1.0);
-        cov *= 1.0 - t + t * tex;
+        cov *= stamp_tex_mod(p, dx, dy, px, py);
         if cov <= 1e-5 {
             return None;
         }
@@ -1100,20 +1206,15 @@ fn color_jitter_offsets(x: f32, y: f32, jitter: f32) -> (f32, f32, f32) {
     )
 }
 
-fn texture_sample(
+fn texture_sample_xy(
     texture: BrushTexture,
-    x: f32,
-    y: f32,
-    scale: f32,
+    rx: f32,
+    ry: f32,
+    inv_period: f32,
     invert: bool,
-    angle: f32,
 ) -> f32 {
-    let scale = scale.max(0.05);
-    let (s, c) = angle.sin_cos();
-    let rx = x * c - y * s;
-    let ry = x * s + y * c;
-    let u = rx / (18.0 / scale);
-    let v = ry / (18.0 / scale);
+    let u = rx * inv_period;
+    let v = ry * inv_period;
     let value = match texture {
         BrushTexture::None => 1.0,
         BrushTexture::Paper => {
@@ -1270,6 +1371,8 @@ mod tests {
         brush.paint_mode = PaintMode::BuildUp;
         brush.size = 18.0;
         brush.hardness = 1.0;
+        // Wide spacing → opaque_linearize barely compresses Opacity (stable assert).
+        brush.spacing = 1.0;
         let def = BrushDef::from_settings(&brush);
         let mut stroke = StrokeState::new(brush.color);
         let mut tip = TipMask::default();
@@ -1296,6 +1399,7 @@ mod tests {
         doc.brush.paint_mode = PaintMode::BuildUp;
         doc.brush.size = 20.0;
         doc.brush.hardness = 1.0;
+        doc.brush.spacing = 1.0;
         doc.brush.pressure_size = false;
         doc.brush.pressure_density = false;
         doc.brush.pressure_flow = false;

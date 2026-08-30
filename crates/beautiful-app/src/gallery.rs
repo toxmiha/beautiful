@@ -1,13 +1,23 @@
 //! Home / gallery screen — library-style layout.
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 
-use eframe::egui::{self, TextureHandle};
+use eframe::egui::{self, ColorImage, TextureHandle};
 
 use crate::canvas::CanvasState;
 use crate::file::{FileState, LibraryEntry, COLLECTION_ALL, COLLECTION_RECENT};
 use crate::theme;
 use beautiful_core::Document;
+
+#[derive(Clone, Debug)]
+pub enum GalleryAction {
+    Open(std::path::PathBuf),
+    PlayDemo(std::path::PathBuf),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortMode {
@@ -28,6 +38,21 @@ impl SortMode {
     }
 }
 
+struct ThumbJobOk {
+    gen: u64,
+    path: PathBuf,
+    modified: u64,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    blur: ColorImage,
+}
+
+enum ThumbJob {
+    Ok(ThumbJobOk),
+    Err { gen: u64, path: PathBuf, modified: u64 },
+}
+
 pub struct GalleryState {
     pub search: String,
     pub search_name: bool,
@@ -44,14 +69,18 @@ pub struct GalleryState {
     pub new_collection_buf: String,
     pub show_new_collection: bool,
     filter_anchor: Option<egui::Pos2>,
-    thumbs: std::collections::HashMap<PathBuf, TextureHandle>,
+    thumbs: HashMap<PathBuf, TextureHandle>,
     /// `entry.modified` for the last preview attempt (hit or known miss).
-    thumb_rev: std::collections::HashMap<PathBuf, u64>,
-    footer_blurs: std::collections::HashMap<PathBuf, TextureHandle>,
-    /// Soft limit: decode at most N previews per frame (keeps home responsive).
-    thumbs_loaded_this_frame: u32,
+    thumb_rev: HashMap<PathBuf, u64>,
+    footer_blurs: HashMap<PathBuf, TextureHandle>,
     /// Once per session: retry previously failed thumbs (e.g. after PSD fallback fix).
     thumb_miss_cleared: bool,
+    thumb_queue: VecDeque<(PathBuf, u64)>,
+    thumb_pending: HashSet<PathBuf>,
+    thumb_inflight: usize,
+    thumb_gen: u64,
+    thumb_tx: Option<mpsc::Sender<ThumbJob>>,
+    thumb_rx: Option<Receiver<ThumbJob>>,
 }
 
 impl Default for GalleryState {
@@ -70,33 +99,39 @@ impl Default for GalleryState {
             new_collection_buf: String::new(),
             show_new_collection: false,
             filter_anchor: None,
-            thumbs: std::collections::HashMap::new(),
-            thumb_rev: std::collections::HashMap::new(),
-            footer_blurs: std::collections::HashMap::new(),
-            thumbs_loaded_this_frame: 0,
+            thumbs: HashMap::new(),
+            thumb_rev: HashMap::new(),
+            footer_blurs: HashMap::new(),
             thumb_miss_cleared: false,
+            thumb_queue: VecDeque::new(),
+            thumb_pending: HashSet::new(),
+            thumb_inflight: 0,
+            thumb_gen: 0,
+            thumb_tx: None,
+            thumb_rx: None,
         }
     }
 }
 
 /// Library-inspired home screen.
-/// Returns a path the user wants to open as a canvas tab (caller opens it).
 pub fn show(
     ctx: &egui::Context,
     state: &mut GalleryState,
     file: &mut FileState,
     document: &mut Document,
     canvas: &mut CanvasState,
-) -> Option<PathBuf> {
+) -> Option<GalleryAction> {
     let _ = (document, canvas);
     let mut open_path: Option<PathBuf> = None;
-    state.thumbs_loaded_this_frame = 0;
+    let mut play_demo: Option<PathBuf> = None;
     if !state.thumb_miss_cleared {
         state
             .thumb_rev
             .retain(|path, _| state.thumbs.contains_key(path));
         state.thumb_miss_cleared = true;
     }
+    poll_gallery_thumbs(ctx, state);
+    kick_gallery_thumbs(ctx, state);
 
     // Darker acrylic (not pure black, not clear) so DWM blur shows with depth.
     let gallery_fill = egui::Color32::from_rgba_unmultiplied(18, 18, 22, 210);
@@ -142,6 +177,7 @@ pub fn show(
                         top_delta,
                         file,
                         &mut open_path,
+                        &mut play_demo,
                     );
 
                     ui.add_space(22.0);
@@ -179,6 +215,7 @@ pub fn show(
                             imp_delta,
                             file,
                             &mut open_path,
+                            &mut play_demo,
                         );
                     }
 
@@ -191,7 +228,7 @@ pub fn show(
                     let grid_src = collection_entries(file, &state.grid_collection);
                     let mut all = filter_entries(&grid_src, state);
                     sort_entries(&mut all, state.sort);
-                    poster_grid(ui, state, &all, file, &mut open_path);
+                    poster_grid(ui, state, &all, file, &mut open_path, &mut play_demo);
 
                     ui.add_space(40.0);
                 });
@@ -200,7 +237,7 @@ pub fn show(
     show_filter_popup(ctx, state);
 
     if state.show_new_collection {
-        egui::Window::new("Новая коллекция")
+        egui::Window::new(crate::i18n::t("Новая коллекция"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -228,21 +265,25 @@ pub fn show(
             });
     }
 
-    open_path
+    if let Some(path) = play_demo {
+        return Some(GalleryAction::PlayDemo(path));
+    }
+    open_path.map(GalleryAction::Open)
 }
 
 fn header_row(ui: &mut egui::Ui, state: &mut GalleryState, file: &FileState) {
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.heading(
-                egui::RichText::new("Моя галерея")
+                    ui.heading(
+                egui::RichText::new(crate::i18n::t("Моя галерея"))
                     .color(egui::Color32::from_rgb(250, 250, 252))
                     .size(30.0)
                     .strong(),
             );
             ui.label(
                 egui::RichText::new(format!(
-                    "Общее время в программе: {}",
+                    "{}: {}",
+                    crate::i18n::t("Общее время в программе"),
                     format_duration(file.total_app_secs())
                 ))
                 .color(egui::Color32::from_rgb(190, 190, 198))
@@ -287,7 +328,7 @@ fn show_filter_popup(ctx: &egui::Context, state: &mut GalleryState) {
         return;
     }
     let mut open = true;
-    let mut win = egui::Window::new("Критерии поиска")
+    let mut win = egui::Window::new(crate::i18n::t("Критерии поиска"))
         .id(egui::Id::new("gallery_filter_popup"))
         .collapsible(false)
         .resizable(false)
@@ -600,6 +641,7 @@ fn horizontal_strip(
     scroll_delta: f32,
     file: &mut FileState,
     open_path: &mut Option<PathBuf>,
+    play_demo: &mut Option<PathBuf>,
 ) {
     egui::ScrollArea::horizontal()
         .id_salt(scroll_id)
@@ -614,7 +656,7 @@ fn horizontal_strip(
                     create_canvas_tile(ui, file, &state.active_collection);
                 }
                 for entry in entries {
-                    canvas_card(ui, state, entry, file, open_path, CardStyle::Square);
+                    canvas_card(ui, state, entry, file, open_path, play_demo, CardStyle::Square);
                 }
             });
         });
@@ -626,6 +668,7 @@ fn poster_grid(
     entries: &[LibraryEntry],
     file: &mut FileState,
     open_path: &mut Option<PathBuf>,
+    play_demo: &mut Option<PathBuf>,
 ) {
     if entries.is_empty() {
         ui.label(theme::label_dim(
@@ -636,7 +679,7 @@ fn poster_grid(
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(12.0, 14.0);
         for entry in entries {
-            canvas_card(ui, state, entry, file, open_path, CardStyle::Poster);
+            canvas_card(ui, state, entry, file, open_path, play_demo, CardStyle::Poster);
         }
     });
 }
@@ -788,6 +831,7 @@ fn canvas_card(
     entry: &LibraryEntry,
     file: &mut FileState,
     open_path: &mut Option<PathBuf>,
+    play_demo: &mut Option<PathBuf>,
     style: CardStyle,
 ) {
     let base = match style {
@@ -823,6 +867,12 @@ fn canvas_card(
             egui::Image::from_texture(sized)
                 .fit_to_exact_size(cover.size())
                 .paint_at(ui, cover);
+        } else {
+            // `put` advances the wrap cursor → staircase grid while thumbs load.
+            ui.place(
+                egui::Rect::from_center_size(draw.center(), egui::vec2(28.0, 28.0)),
+                egui::Spinner::new(),
+            );
         }
         if entry.nsfw {
             // Heavy frost so NSFW thumbs stay blurred on the home page.
@@ -963,6 +1013,14 @@ fn canvas_card(
             .clicked()
         {
             file.toggle_entry_nsfw(&entry.path);
+            ui.close();
+        }
+
+        if ui
+            .button(crate::i18n::t("Посмотреть запись"))
+            .clicked()
+        {
+            *play_demo = Some(entry.path.clone());
             ui.close();
         }
 
@@ -1145,7 +1203,8 @@ fn show_hover_popup(
                     }
                     ui.label(
                         egui::RichText::new(format!(
-                            "Время в холсте: {}",
+                            "{}: {}",
+                            crate::i18n::t("Время в холсте"),
                             format_duration(entry.time_spent_secs)
                         ))
                         .color(egui::Color32::from_rgb(245, 245, 250))
@@ -1177,44 +1236,211 @@ fn ensure_card_textures(ctx: &egui::Context, state: &mut GalleryState, entry: &L
     if state.thumb_rev.get(&entry.path) == Some(&entry.modified) {
         return;
     }
+    if state.thumbs.contains_key(&entry.path) || state.thumb_pending.contains(&entry.path) {
+        return;
+    }
     if !entry.path.is_file() {
         state.thumb_rev.insert(entry.path.clone(), entry.modified);
         return;
     }
-    // Spread disk/decode work across frames so the home page stays interactive.
-    const MAX_PER_FRAME: u32 = 4;
-    if state.thumbs_loaded_this_frame >= MAX_PER_FRAME {
-        ctx.request_repaint();
-        return;
+    // Queue only — decode + blur run off the UI thread (PSD thumbs were hitching boot).
+    if !state
+        .thumb_queue
+        .iter()
+        .any(|(p, _)| p == &entry.path)
+    {
+        state
+            .thumb_queue
+            .push_back((entry.path.clone(), entry.modified));
     }
-    state.thumbs_loaded_this_frame += 1;
+    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+}
 
-    // Embedded only: TXMH preview.jpg / PSD IR1036 / PSD merged fallback / raster.
-    // Prefer a sharper card thumb (320) — old 160 looked soft on retina UIs.
-    let preview = beautiful_core::load_file_preview_max(&entry.path, 320);
-
-    state.thumb_rev.insert(entry.path.clone(), entry.modified);
-    let Some(preview) = preview else {
+fn poll_gallery_thumbs(ctx: &egui::Context, state: &mut GalleryState) {
+    let Some(rx) = state.thumb_rx.as_ref() else {
         return;
     };
+    let mut got = false;
+    loop {
+        match rx.try_recv() {
+            Ok(ThumbJob::Ok(job)) => {
+                state.thumb_inflight = state.thumb_inflight.saturating_sub(1);
+                state.thumb_pending.remove(&job.path);
+                if job.gen != state.thumb_gen {
+                    continue;
+                }
+                got = true;
+                state.thumb_rev.insert(job.path.clone(), job.modified);
+                let w = job.width as usize;
+                let h = job.height as usize;
+                let tex = ctx.load_texture(
+                    format!("gallery_thumb_{}", job.path.display()),
+                    ColorImage::from_rgba_unmultiplied([w, h], &job.rgba),
+                    egui::TextureOptions::LINEAR,
+                );
+                let blur = ctx.load_texture(
+                    format!("gallery_blur_{}", job.path.display()),
+                    job.blur,
+                    egui::TextureOptions::LINEAR,
+                );
+                state.thumbs.insert(job.path.clone(), tex);
+                state.footer_blurs.insert(job.path, blur);
+            }
+            Ok(ThumbJob::Err {
+                gen,
+                path,
+                modified,
+            }) => {
+                state.thumb_inflight = state.thumb_inflight.saturating_sub(1);
+                state.thumb_pending.remove(&path);
+                if gen == state.thumb_gen {
+                    state.thumb_rev.insert(path, modified);
+                }
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                state.thumb_rx = None;
+                state.thumb_tx = None;
+                state.thumb_inflight = 0;
+                break;
+            }
+        }
+    }
+    if got || state.thumb_inflight > 0 || !state.thumb_queue.is_empty() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+}
 
-    let w = preview.width as usize;
-    let h = preview.height as usize;
-    let tex = ctx.load_texture(
-        format!("gallery_thumb_{}", entry.path.display()),
-        egui::ColorImage::from_rgba_unmultiplied([w, h], &preview.rgba),
-        egui::TextureOptions::LINEAR,
-    );
-    let rgba_img = image::RgbaImage::from_raw(preview.width, preview.height, preview.rgba)
-        .unwrap_or_else(|| image::RgbaImage::new(preview.width, preview.height));
-    let blur_img = make_footer_blur(&rgba_img);
-    let blur = ctx.load_texture(
-        format!("gallery_blur_{}", entry.path.display()),
-        blur_img,
-        egui::TextureOptions::LINEAR,
-    );
-    state.thumbs.insert(entry.path.clone(), tex);
-    state.footer_blurs.insert(entry.path.clone(), blur);
+fn kick_gallery_thumbs(ctx: &egui::Context, state: &mut GalleryState) {
+    // Parallel decode + disk cache. Do not bump gen per spawn — that dropped
+    // every in-flight thumb except the last and made the gallery crawl.
+    const MAX_PARALLEL: usize = 6;
+    while state.thumb_inflight < MAX_PARALLEL {
+        let Some((path, modified)) = state.thumb_queue.pop_front() else {
+            break;
+        };
+        if state.thumbs.contains_key(&path)
+            || state.thumb_rev.get(&path) == Some(&modified)
+            || state.thumb_pending.contains(&path)
+        {
+            continue;
+        }
+        if state.thumb_rx.is_none() {
+            let (tx, rx) = mpsc::channel();
+            state.thumb_tx = Some(tx);
+            state.thumb_rx = Some(rx);
+        }
+        let Some(tx) = state.thumb_tx.clone() else {
+            break;
+        };
+        let gen = state.thumb_gen;
+        state.thumb_pending.insert(path.clone());
+        state.thumb_inflight += 1;
+        thread::spawn(move || {
+            let result = match load_gallery_thumb(&path, modified) {
+                Some(preview) => {
+                    let rgba_img = image::RgbaImage::from_raw(
+                        preview.width,
+                        preview.height,
+                        preview.rgba.clone(),
+                    )
+                    .unwrap_or_else(|| image::RgbaImage::new(preview.width, preview.height));
+                    let blur = make_footer_blur(&rgba_img);
+                    ThumbJob::Ok(ThumbJobOk {
+                        gen,
+                        path,
+                        modified,
+                        width: preview.width,
+                        height: preview.height,
+                        rgba: preview.rgba,
+                        blur,
+                    })
+                }
+                None => ThumbJob::Err {
+                    gen,
+                    path,
+                    modified,
+                },
+            };
+            let _ = tx.send(result);
+        });
+    }
+    if state.thumb_inflight > 0 || !state.thumb_queue.is_empty() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+    }
+}
+
+fn thumbs_cache_dir() -> PathBuf {
+    if let Some(dir) = crate::settings::AppSettings::cache_dir() {
+        return dir.join("thumbs");
+    }
+    PathBuf::from("beautiful-thumbs")
+}
+
+fn thumb_should_disk_cache(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("psd")
+    )
+}
+
+fn load_gallery_thumb(path: &Path, modified: u64) -> Option<beautiful_core::FilePreview> {
+    if thumb_should_disk_cache(path) {
+        if let Some(cached) = load_thumb_disk_cache(path, modified) {
+            return Some(cached);
+        }
+    }
+    let preview = beautiful_core::load_file_preview_max(path, 320)?;
+    if thumb_should_disk_cache(path) {
+        save_thumb_disk_cache(path, modified, &preview);
+    }
+    Some(preview)
+}
+
+fn thumb_cache_file(path: &Path, modified: u64) -> PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    thumbs_cache_dir().join(format!("{:016x}_{modified}.jpg", hasher.finish()))
+}
+
+fn load_thumb_disk_cache(path: &Path, modified: u64) -> Option<beautiful_core::FilePreview> {
+    let file = thumb_cache_file(path, modified);
+    let bytes = std::fs::read(file).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    Some(beautiful_core::FilePreview {
+        width: img.width(),
+        height: img.height(),
+        rgba: img.into_raw(),
+    })
+}
+
+fn save_thumb_disk_cache(path: &Path, modified: u64, preview: &beautiful_core::FilePreview) {
+    let dir = thumbs_cache_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let file = thumb_cache_file(path, modified);
+    let img = image::RgbaImage::from_raw(preview.width, preview.height, preview.rgba.clone());
+    let Some(img) = img else {
+        return;
+    };
+    let rgb = image::DynamicImage::ImageRgba8(img).into_rgb8();
+    let mut buf = Vec::new();
+    let mut cur = std::io::Cursor::new(&mut buf);
+    let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cur, 70);
+    use image::ImageEncoder;
+    if enc
+        .write_image(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .is_ok()
+    {
+        let _ = std::fs::write(file, buf);
+    }
 }
 
 /// Downsample → upsample bottom strip so the acrylic meta bar looks frosted.

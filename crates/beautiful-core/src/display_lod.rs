@@ -162,9 +162,16 @@ impl CoverageMask {
 /// Hard cap for document width/height (pixels). Beyond this, expand/crop refuse.
 pub const MAX_DOC_SIDE: u32 = 16384;
 
-/// Max side length of the GPU display texture. Larger docs stay on a coarser LOD
+/// Default GPU present plate cap (Normal). Larger docs stay on a coarser LOD
 /// even when zoomed in — prevents VRAM/RAM spikes that kill the process.
 pub const MAX_GPU_TEX_SIDE: u32 = 4096;
+/// Low-performance GPU present cap (~2K). Settings: Display performance → Low.
+pub const GPU_TEX_SIDE_LOW: u32 = 2048;
+
+/// Clamp a user/settings GPU plate cap to the supported range.
+pub fn clamp_gpu_tex_side(side: u32) -> u32 {
+    side.clamp(GPU_TEX_SIDE_LOW, MAX_GPU_TEX_SIDE)
+}
 
 /// Soft peak RAM budget for a live document (bytes).
 /// Layers are sparse tiles; projection and stroke-below are expected to be
@@ -283,15 +290,91 @@ pub fn lod_factor_for_zoom_hysteresis(zoom: f32, current: u32) -> u32 {
     }
 }
 
-/// Size-aware zoom LOD + hard cap so GPU texture side never exceeds [`MAX_GPU_TEX_SIDE`].
-pub fn lod_factor_for_document(zoom: f32, current: u32, doc_w: u32, doc_h: u32) -> u32 {
-    let z = size_adjusted_zoom(zoom, doc_w, doc_h);
-    let mut lod = lod_factor_for_zoom_hysteresis(z, current).max(1);
-    let max_side = doc_w.max(doc_h).max(1);
-    while (max_side + lod - 1) / lod > MAX_GPU_TEX_SIDE && lod < 128 {
+/// Highest power-of-two LOD that avoids upsampling blur at this zoom.
+/// When `zoom * lod <= 1`, each plate texel maps to at most one screen pixel.
+pub fn lod_max_sharp_for_zoom(zoom: f32) -> u32 {
+    let z = zoom.max(1e-4);
+    let max_lod = (1.0 / z).floor().max(1.0) as u32;
+    prev_pow2_u32(max_lod)
+}
+
+fn prev_pow2_u32(n: u32) -> u32 {
+    if n <= 1 {
+        1
+    } else {
+        1u32 << (31 - n.leading_zeros())
+    }
+}
+
+/// Minimum LOD so the full-document plate fits in `gpu_tex_side`.
+pub fn lod_min_for_gpu_cap(doc_w: u32, doc_h: u32, gpu_tex_side: u32) -> u32 {
+    let cap = clamp_gpu_tex_side(gpu_tex_side);
+    if doc_w <= cap && doc_h <= cap {
+        return 1;
+    }
+    let mut lod = 1u32;
+    while (((doc_w + lod - 1) / lod > cap) || ((doc_h + lod - 1) / lod > cap)) && lod < 128 {
         lod = (lod.saturating_mul(2)).max(2).min(128);
     }
     lod
+}
+
+/// Screen-aware LOD: sharp while zoomed in, coarsen only when zoomed out or GPU cap forces it.
+pub fn lod_factor_for_document(
+    zoom: f32,
+    current: u32,
+    doc_w: u32,
+    doc_h: u32,
+    gpu_tex_side: u32,
+) -> u32 {
+    lod_factor_for_document_with_view(zoom, current, doc_w, doc_h, gpu_tex_side, 0.0)
+}
+
+/// Same as [`lod_factor_for_document`] but uses viewport size (screen px) to avoid
+/// over-coarsening non-standard / wide canvases that only fill part of the screen.
+pub fn lod_factor_for_document_with_view(
+    zoom: f32,
+    current: u32,
+    doc_w: u32,
+    doc_h: u32,
+    gpu_tex_side: u32,
+    view_screen_long_px: f32,
+) -> u32 {
+    let z = zoom.max(1e-4);
+    let max_side = doc_w.max(doc_h).max(1);
+
+    let lod_min = lod_min_for_gpu_cap(doc_w, doc_h, gpu_tex_side);
+    // Full doc fits the GPU plate — stay at LOD 1 always. Zoom-out minify is free on
+    // the GPU (Linear/Nearest sampler); CPU box-mips here caused "мыло"/"шакал" on
+    // non-standard sizes (2400×400 @ fit) and unlike Krita/GIMP which never
+    // pre-downsample the whole doc when it fits in display memory.
+    if lod_min == 1 {
+        return 1;
+    }
+
+    let lod_sharp = lod_max_sharp_for_zoom(z);
+
+    // Take the sharper of raw vs size-adjusted zoom thresholds.
+    let lod_zoom = lod_factor_for_zoom_hysteresis(z, current).min(
+        lod_factor_for_zoom_hysteresis(size_adjusted_zoom(z, doc_w, doc_h), current),
+    );
+
+    // Viewport: visible doc span may be smaller than full doc — don't coarsen beyond that.
+    let lod_view = if view_screen_long_px > 1.0 {
+        let vis_doc_long = (view_screen_long_px / z).min(max_side as f32).max(1.0);
+        let max_lod = (max_side as f32 / vis_doc_long).floor().max(1.0) as u32;
+        prev_pow2_u32(max_lod)
+    } else {
+        u32::MAX
+    };
+
+    let lod_ceiling = lod_sharp.min(lod_view);
+
+    let mut want = lod_min.max(lod_zoom);
+    if lod_min <= lod_ceiling {
+        want = want.min(lod_ceiling);
+    }
+    want.max(1)
 }
 
 /// Which LOD factor to show on screen.
@@ -310,7 +393,11 @@ pub fn resolve_display_lod(current: u32, want: u32, allow_coarsen: bool) -> u32 
         return cur;
     }
     if want < cur {
-        // Sharpen one power-of-two step (8→4→2→1).
+        if allow_coarsen {
+            // Idle: jump to target — non-standard canvases should not linger on coarse mips.
+            return want.max(1);
+        }
+        // Mid-gesture: one octave per frame to avoid hitch.
         (cur / 2).max(want).max(1)
     } else if allow_coarsen {
         // Coarsen one step (1→2→4→8…).
@@ -350,6 +437,11 @@ impl DisplayMip {
     /// True if every tile overlapping `need` (document space) is already composed.
     pub fn covers_doc(&self, need: DirtyRect) -> bool {
         self.coverage.covers_rect(need)
+    }
+
+    /// Coverage grid tracks this document size (false after crop/resize until reseed).
+    pub fn cov_doc_matches(&self, doc_w: u32, doc_h: u32) -> bool {
+        self.cov_doc_w == doc_w && self.cov_doc_h == doc_h
     }
 
     /// Coverage grid size in document-tile cells (for debug overlays).
@@ -847,29 +939,79 @@ pub fn build_navigator_thumb_from_layers(
     doc_h: u32,
     max_edge: u32,
 ) -> (u32, u32, Vec<u8>) {
-    let max_edge = max_edge.max(32);
-    if doc_w == 0 || doc_h == 0 {
-        return (1, 1, vec![0; 4]);
-    }
-    let scale = (doc_w.max(doc_h) as f32 / max_edge as f32).max(1.0);
-    let w = ((doc_w as f32) / scale).round().max(1.0) as u32;
-    let h = ((doc_h as f32) / scale).round().max(1.0) as u32;
-    let factor = ((doc_w.max(doc_h) + w.max(h) - 1) / w.max(h)).max(1);
-    let mip_w = ((doc_w + factor - 1) / factor).max(1);
-    let mip_h = ((doc_h + factor - 1) / factor).max(1);
-    let mut mip = vec![0u8; (mip_w as usize) * (mip_h as usize) * 4];
-    crate::composite::composite_display_mip(
-        &mut mip,
-        mip_w,
-        mip_h,
-        factor,
-        doc_w,
-        doc_h,
+    build_navigator_thumb_from_layers_roi(
         background,
         layers,
         floating,
-    );
-    // If mip already ≈ max_edge, return it; else point-sample down.
+        doc_w,
+        doc_h,
+        DirtyRect {
+            x0: 0,
+            y0: 0,
+            x1: doc_w,
+            y1: doc_h,
+        },
+        max_edge,
+    )
+}
+
+/// Navigator thumb composited only over `roi` (stage — skip pasteboard margins).
+pub fn build_navigator_thumb_from_layers_roi(
+    background: Rgba,
+    layers: &[Layer],
+    floating: Option<crate::composite::FloatingBlit<'_>>,
+    doc_w: u32,
+    doc_h: u32,
+    roi: DirtyRect,
+    max_edge: u32,
+) -> (u32, u32, Vec<u8>) {
+    let max_edge = max_edge.max(32);
+    let mut roi = roi;
+    roi.clamp_to(doc_w, doc_h);
+    let rw = roi.width();
+    let rh = roi.height();
+    if rw == 0 || rh == 0 {
+        return (1, 1, vec![0; 4]);
+    }
+    let scale = (rw.max(rh) as f32 / max_edge as f32).max(1.0);
+    let w = ((rw as f32) / scale).round().max(1.0) as u32;
+    let h = ((rh as f32) / scale).round().max(1.0) as u32;
+    let factor = ((rw.max(rh) + w.max(h) - 1) / w.max(h)).max(1);
+    let mip_w = ((rw + factor - 1) / factor).max(1);
+    let mip_h = ((rh + factor - 1) / factor).max(1);
+    let mut mip = vec![0u8; (mip_w as usize) * (mip_h as usize) * 4];
+    {
+        use rayon::prelude::*;
+        let omit = crate::omit_above::snapshot();
+        let stride = mip_w as usize * 4;
+        mip.par_chunks_mut(stride).enumerate().for_each_init(
+            || crate::omit_above::WorkerTlsGuard::install(&omit),
+            |_g, (my, row)| {
+                let sy = roi.y0.saturating_add(
+                    (my as u32)
+                        .saturating_mul(factor)
+                        .saturating_add(factor / 2)
+                        .min(rh.saturating_sub(1)),
+                );
+                for mx in 0..mip_w as usize {
+                    let sx = roi.x0.saturating_add(
+                        (mx as u32)
+                            .saturating_mul(factor)
+                            .saturating_add(factor / 2)
+                            .min(rw.saturating_sub(1)),
+                    );
+                    crate::composite::composite_point_rgba(
+                        &mut row[mx * 4..mx * 4 + 4],
+                        sx as i32,
+                        sy as i32,
+                        background,
+                        layers,
+                        floating,
+                    );
+                }
+            },
+        );
+    }
     if mip_w <= max_edge && mip_h <= max_edge {
         return (mip_w, mip_h, mip);
     }
@@ -957,8 +1099,28 @@ pub fn build_navigator_thumb_box(
 /// Sparse-layer thumbnail: sample tiles into a small buffer (never densify the
 /// full content AABB — that was O(bounds²) and spiked CPU after large soft strokes).
 pub fn build_navigator_thumb_from_tiles(tiles: &TileBuffer, max_edge: u32) -> (u32, u32, Vec<u8>) {
-    let doc_w = tiles.width;
-    let doc_h = tiles.height;
+    build_navigator_thumb_from_tiles_roi(
+        tiles,
+        DirtyRect {
+            x0: 0,
+            y0: 0,
+            x1: tiles.width,
+            y1: tiles.height,
+        },
+        max_edge,
+    )
+}
+
+/// Layer / navigator thumb sampled only inside `roi` (stage — skip pasteboard).
+pub fn build_navigator_thumb_from_tiles_roi(
+    tiles: &TileBuffer,
+    roi: DirtyRect,
+    max_edge: u32,
+) -> (u32, u32, Vec<u8>) {
+    let mut roi = roi;
+    roi.clamp_to(tiles.width, tiles.height);
+    let doc_w = roi.width();
+    let doc_h = roi.height();
     if doc_w == 0 || doc_h == 0 || tiles.painted_tile_count() == 0 {
         return (1, 1, vec![0; 4]);
     }
@@ -972,8 +1134,10 @@ pub fn build_navigator_thumb_from_tiles(tiles: &TileBuffer, max_edge: u32) -> (u
         std::collections::HashMap::new();
     for y in 0..th {
         for x in 0..tw {
-            let sx = ((x as f32 + 0.5) / tw as f32 * doc_w as f32) as i32;
-            let sy = ((y as f32 + 0.5) / th as f32 * doc_h as f32) as i32;
+            let sx = roi.x0 as i32
+                + ((x as f32 + 0.5) / tw as f32 * doc_w as f32) as i32;
+            let sy = roi.y0 as i32
+                + ((y as f32 + 0.5) / th as f32 * doc_h as f32) as i32;
             let rgba = tiles.get_rgba_hot_or_cold(sx, sy, &mut cold_cache);
             let di = ((y * tw + x) * 4) as usize;
             out[di..di + 4].copy_from_slice(&rgba);
@@ -991,6 +1155,16 @@ mod tests {
         assert_eq!(lod_factor_for_zoom(1.0), 1);
         assert_eq!(lod_factor_for_zoom(0.5), 2);
         assert!(lod_factor_for_zoom(0.1) >= 8);
+    }
+
+    #[test]
+    fn gpu_tex_cap_coarsens_above_plate() {
+        assert_eq!(
+            lod_factor_for_document(1.0, 1, 4096, 4096, MAX_GPU_TEX_SIDE),
+            1
+        );
+        assert!(lod_factor_for_document(1.0, 1, 6000, 4000, MAX_GPU_TEX_SIDE) >= 2);
+        assert!(lod_factor_for_document(1.0, 1, 6000, 4000, GPU_TEX_SIDE_LOW) >= 4);
     }
 
     #[test]
@@ -1015,14 +1189,44 @@ mod tests {
 
     #[test]
     fn resolve_display_lod_steps_one_octave_when_idle() {
-        // Idle: at most one octave per call (no 8→1 / 1→8 death hitch).
-        assert_eq!(resolve_display_lod(8, 1, true), 4);
-        assert_eq!(resolve_display_lod(4, 1, true), 2);
+        // Idle sharpen: jump directly to target (sharp preview for odd-sized canvases).
+        assert_eq!(resolve_display_lod(8, 1, true), 1);
+        assert_eq!(resolve_display_lod(4, 1, true), 1);
         assert_eq!(resolve_display_lod(2, 1, true), 1);
+        // Idle coarsen: still one octave per call.
         assert_eq!(resolve_display_lod(1, 8, true), 2);
         assert_eq!(resolve_display_lod(2, 8, true), 4);
         assert_eq!(resolve_display_lod(4, 8, true), 8);
         assert_eq!(resolve_display_lod(2, 2, true), 2);
+    }
+
+    #[test]
+    fn gpu_fitting_doc_stays_lod1_at_any_zoom() {
+        // Wide strip fits 4096 cap — never voluntary CPU mip (peer-like).
+        assert_eq!(
+            lod_factor_for_document_with_view(0.25, 4, 2400, 400, MAX_GPU_TEX_SIDE, 900.0),
+            1
+        );
+        assert_eq!(
+            lod_factor_for_document_with_view(0.35, 2, 3000, 800, MAX_GPU_TEX_SIDE, 1100.0),
+            1
+        );
+    }
+
+    #[test]
+    fn screen_aware_lod_stays_sharp_when_zoomed_in() {
+        // Wide strip fits GPU cap; zoom 0.82 → LOD 1 (not size-adjusted LOD 2).
+        assert_eq!(
+            lod_factor_for_document_with_view(0.82, 1, 2400, 400, MAX_GPU_TEX_SIDE, 1100.0),
+            1
+        );
+        assert_eq!(lod_max_sharp_for_zoom(1.0), 1);
+        assert_eq!(lod_max_sharp_for_zoom(0.5), 2);
+    }
+
+    #[test]
+    fn gpu_cap_still_coarsens_huge_docs() {
+        assert!(lod_factor_for_document(1.0, 1, 6000, 4000, MAX_GPU_TEX_SIDE) >= 2);
     }
 
     #[test]
@@ -1034,11 +1238,11 @@ mod tests {
             4,
             "raw zoom alone still picks LOD4"
         );
-        let lod_4k = lod_factor_for_document(zoom_4k, 0, 3840, 2160);
+        let lod_4k = lod_factor_for_document(zoom_4k, 0, 3840, 2160, MAX_GPU_TEX_SIDE);
         assert!(lod_4k <= 2, "4k size-adjusted stock lod={lod_4k}");
 
         let zoom_2k = 1400.0 / 2048.0; // ~0.68
-        let lod_2k = lod_factor_for_document(zoom_2k, 0, 2048, 2048);
+        let lod_2k = lod_factor_for_document(zoom_2k, 0, 2048, 2048, MAX_GPU_TEX_SIDE);
         assert!(lod_2k <= 2, "2k stock lod={lod_2k}");
     }
 

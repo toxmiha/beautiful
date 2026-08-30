@@ -153,6 +153,31 @@ impl FillEngine {
         clip: Option<&SelectionMask>,
         cancel: Option<&CancelToken>,
     ) -> DirtyRect {
+        Self::run_ex(
+            active,
+            composite,
+            seed_x,
+            seed_y,
+            color,
+            opts,
+            clip,
+            cancel,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_ex(
+        active: &mut Layer,
+        composite: Option<&[u8]>,
+        seed_x: i32,
+        seed_y: i32,
+        color: Rgba,
+        opts: &FillOptions,
+        clip: Option<&SelectionMask>,
+        cancel: Option<&CancelToken>,
+        pigment: Option<(&str, f32)>,
+    ) -> DirtyRect {
         let w = active.width as i32;
         let h = active.height as i32;
         if seed_x < 0 || seed_y < 0 || seed_x >= w || seed_y >= h {
@@ -200,8 +225,16 @@ impl FillEngine {
             (mask, work_bbox)
         };
 
-        // Phase 3: composite the solid color into the active layer only.
-        apply_fill(active, &coverage, cov_bbox, color, opts, cancel)
+        // Phase 3: composite the solid color (or tiled RGB pattern) into the active layer.
+        apply_fill(
+            active,
+            &coverage,
+            cov_bbox,
+            color,
+            opts,
+            cancel,
+            pigment,
+        )
     }
 }
 
@@ -300,11 +333,20 @@ fn apply_fill(
     color: Rgba,
     opts: &FillOptions,
     cancel: Option<&CancelToken>,
+    pigment: Option<(&str, f32)>,
 ) -> DirtyRect {
     let w = active.width as usize;
     let opacity = opts.opacity.clamp(0.0, 1.0);
     let color_a = color.a as f32 / 255.0;
     let src_rgb = [color.r, color.g, color.b];
+    let pattern_map = pigment.and_then(|(p, s)| {
+        let p = p.trim();
+        if p.is_empty() {
+            None
+        } else {
+            crate::brush_assets::load_rgb(p).map(|m| (m, s.max(0.05)))
+        }
+    });
 
     let mut min_x = i32::MAX;
     let mut min_y = i32::MAX;
@@ -328,6 +370,11 @@ fn apply_fill(
             if src_a <= 0.0 {
                 continue;
             }
+            let src_rgb = if let Some((map, scale)) = pattern_map.as_ref() {
+                map.sample_doc(x as f32 + 0.5, y as f32 + 0.5, *scale)
+            } else {
+                src_rgb
+            };
             let mut px = dst;
             blend_over(&mut px, &src_rgb, src_a, opts.blend_mode);
             if opts.preserve_alpha {

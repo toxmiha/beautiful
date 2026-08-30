@@ -1,12 +1,38 @@
-use beautiful_core::{DirtyRect, Document, SelectionCombine, SelectionSnap, TileBuffer};
+use beautiful_core::{DemoStrokeKind, DirtyRect, Document, SelectionCombine, SelectionSnap, TileBuffer};
 use eframe::egui::{
-    self, ColorImage, Context, PointerButton, TextureFilter, TextureHandle, TextureOptions, Vec2,
+    self, ColorImage, Context, PointerButton, Pos2, TextureFilter, TextureHandle, TextureOptions,
+    Vec2,
 };
 
 use crate::pen_input::PenInput;
 use crate::theme;
 use crate::ui::WorkspaceTool;
 use beautiful_core::SelectionRect;
+
+#[derive(Clone, Copy)]
+pub(crate) enum CropDrag {
+    Draw,
+    Move { start: SelectionRect },
+    Resize {
+        start: SelectionRect,
+        left: bool,
+        right: bool,
+        top: bool,
+        bottom: bool,
+    },
+}
+
+pub(crate) fn demo_stroke_kind(tool: WorkspaceTool, editing_mask: bool) -> DemoStrokeKind {
+    if editing_mask {
+        return DemoStrokeKind::Mask;
+    }
+    match tool {
+        WorkspaceTool::Smudge => DemoStrokeKind::Smudge,
+        WorkspaceTool::Blur => DemoStrokeKind::Blur,
+        WorkspaceTool::CloneBrush => DemoStrokeKind::Clone,
+        _ => DemoStrokeKind::Paint,
+    }
+}
 
 pub struct CanvasState {
     texture: Option<TextureHandle>,
@@ -26,6 +52,10 @@ pub struct CanvasState {
     pub last_viewport: egui::Rect,
     /// Last placed canvas rect before rotation (axis-aligned), screen coords.
     pub last_canvas_rect: egui::Rect,
+    /// Gamepad brush aim (screen). Center mode = viewport center.
+    pub gamepad_cursor: Option<egui::Pos2>,
+    /// Previous frame: analog paint/erase was down.
+    pub gamepad_paint_down: bool,
     /// Hold *coarser* LOD until the wheel gesture goes idle.
     /// Sharpen always steps (see asymmetric `resolve_display_lod`).
     coarsen_hold_until: Option<std::time::Instant>,
@@ -39,6 +69,10 @@ pub struct CanvasState {
     drag_doc_start: Option<(f32, f32)>,
     /// Last pointer position in document space during selection drag.
     drag_doc_last: Option<(f32, f32)>,
+    /// Screen-space press position for marquee cancel threshold (not doc pixels).
+    drag_screen_start: Option<egui::Pos2>,
+    /// Max screen-space travel during the current selection gesture.
+    drag_screen_travel: f32,
     /// Scale factor at transform drag start.
     transform_start_scale: f32,
     /// Mesh warp control points in local floating space.
@@ -57,7 +91,7 @@ pub struct CanvasState {
     warp_proxy: Option<(Vec<u8>, u32, u32, u32)>,
     /// Throttle live warp recomposite (seconds).
     last_warp_preview_at: f64,
-    /// Throttle Free Transform scale/rotate live bake.
+    /// Throttle Transform scale/rotate live bake.
     last_free_preview_at: f64,
     /// Free / Distort / Mesh transform UI mode.
     pub transform_mode: TransformMode,
@@ -65,8 +99,8 @@ pub struct CanvasState {
     pub mesh_grid_n: usize,
     /// Original floating pixels for high-quality transform (Lanczos final).
     transform_baseline: Option<(Vec<u8>, u32, u32, f32, f32)>,
-    /// Free Transform: move / rotate / signed-scale (flip).
-    free_xform: Option<FreeXform>,
+    /// Transform: move / rotate / signed-scale (flip).
+    transform_pose: Option<TransformPose>,
     /// Active Free/Distort/Mesh edit — Confirm/Cancel required.
     pub transform_session: Option<TransformSession>,
     /// Active gradient edit — Apply/Cancel required.
@@ -79,18 +113,47 @@ pub struct CanvasState {
     pub crop_straighten: f32,
     /// Active crop marquee (document space); independent of selection.
     pub crop_rect: Option<SelectionRect>,
+    /// Crop is a session: entering seeds from the stage, while Escape can clear it.
+    pub crop_session_active: bool,
+    pub(crate) crop_drag: Option<CropDrag>,
+    /// Cached magnet guides (rebuilt when doc revision / size changes — not every drag frame).
+    pub(crate) crop_snap_xs: Vec<f32>,
+    pub(crate) crop_snap_ys: Vec<f32>,
+    pub(crate) crop_snap_key: Option<(u64, u32, u32)>,
     /// Last brush tip for Shift+click straight lines.
     line_anchor: Option<(f32, f32, f32)>,
+    /// Buffer/stage geometry last seen by the view — invalidate display tiles on change.
+    last_display_geom: Option<(u32, u32, Option<(u32, u32, u32, u32)>)>,
     /// Origin for Shift+drag 45° constrain while painting.
     shift_constrain_origin: Option<(f32, f32)>,
     /// After Shift+click line, ignore freehand until LMB release.
     suppress_paint_until_release: bool,
+    /// Press started on a panel/menu — hold while buttons are down.
+    suppress_nav_until_release: bool,
+    /// Keep ignoring canvas pan after a slider/menu gesture. Release must not
+    /// clear this: Windows Ink often starts a PanGesture *after* the lift.
+    nav_block_until: f64,
+    /// Touch ids dropped on an off-canvas press. Ignore their lingering Move
+    /// events until a fresh Start (Windows Ink often never sends End).
+    suppressed_touch_ids: std::collections::HashSet<u64>,
     /// Set when Ctrl(+Shift)+click picks a layer; consumed by the app to sync layer UI.
     pub pending_layer_pick: Option<usize>,
     /// Source set by Alt-click for clone stamping.
     clone_source: Option<(f32, f32)>,
-    /// Target point where the current clone stroke began.
+    /// Target point where the current clone stroke began (non-aligned / stroke start).
     clone_anchor: Option<(f32, f32)>,
+    /// Aligned: keep Δ after first paint until Alt resets. Non-aligned: restart each stroke.
+    pub clone_aligned: bool,
+    /// Locked source−target offset for Aligned mode (set on first dab after Alt).
+    clone_offset: Option<(f32, f32)>,
+    /// Tip-masked source preview under the cursor.
+    pub clone_show_preview: bool,
+    /// Overlay opacity 0..1 (panel).
+    pub clone_preview_opacity: f32,
+    /// Cached tip-masked source preview texture.
+    clone_preview_tex: Option<TextureHandle>,
+    /// Cache key: sample ix/iy, size×100, hardness×100, layer, content_revision.
+    clone_preview_key: Option<(i32, i32, u32, u32, usize, u64)>,
     pub resample_drag: beautiful_core::ResampleFilter,
     pub resample_preview: beautiful_core::ResampleFilter,
     pub resample_final: beautiful_core::ResampleFilter,
@@ -99,8 +162,25 @@ pub struct CanvasState {
     xform_bake_gen: u64,
     /// Primary button held (tracked across frames from raw events).
     pub lmb_down: bool,
+    /// Last flood-fill seed cell this pointer-down (Fill tool drag).
+    pub last_fill_cell: Option<(i32, i32)>,
     /// Space held (pan modifier) from raw key events.
     pub space_down: bool,
+    /// Active `Event::Touch` ids. First finger is also emulated as LMB.
+    touch_active: std::collections::HashSet<u64>,
+    /// Once 2+ fingers were down, leftover contact must not paint until lift.
+    touch_nav_lock: bool,
+    last_touch_event_at: f64,
+    touch_gesture_peak: u8,
+    touch_gesture_travel: f32,
+    touch_gesture_t0: f64,
+    touch_pos: std::collections::HashMap<u64, Pos2>,
+    /// Ids whose last sample had stylus force — never two-finger pan these.
+    touch_pen_ids: std::collections::HashSet<u64>,
+    /// How many contacts actually changed position this frame.
+    touch_moved_this_frame: u8,
+    touch_centroid_prev: Option<Pos2>,
+    touch_pending_pan: Vec2,
     /// Stroke samples already stamped this frame in `raw_input_hook`.
     pub stroke_input_done: bool,
     /// Calibrates `Event::MouseMoved` → screen points for high-rate densify.
@@ -111,6 +191,15 @@ pub struct CanvasState {
     display_mip: beautiful_core::DisplayMip,
     display_mip_tex: Option<TextureHandle>,
     display_lod: u32,
+    /// CPU display tiles (large doc, no wgpu).
+    cpu_display_tiles: std::collections::HashMap<(i32, i32), TextureHandle>,
+    tile_plate_lod: u32,
+    prev_tile_cover: beautiful_core::DirtyRect,
+    display_tiles: beautiful_core::DisplayTileCache,
+    /// Last committed present sampler (shared frame plan).
+    present_linear_filter: bool,
+    /// GPU/CPU present plate cap from settings (2K or 4K).
+    gpu_tex_side: u32,
     /// Tiny navigator preview (avoids sampling full-res canvas tex every frame).
     nav_thumb: Option<TextureHandle>,
     nav_thumb_rev: u64,
@@ -126,19 +215,24 @@ pub struct CanvasState {
     mask_thumbs: std::collections::HashMap<usize, (u64, TextureHandle)>,
     /// Orange alpha mask texture for irregular selections.
     selection_mask_texture: Option<(u64, u32, u32, u32, u32, TextureHandle)>,
-    /// Baseline pixels as egui texture for live Free Transform (pose-only drag).
+    /// Baseline pixels as egui texture for live Transform (pose-only drag).
     xform_live_tex: Option<TextureHandle>,
-    /// Re-upload live tex from floating (after warp resample).
+    /// Re-upload live tex when baseline pixels change (flip / mode bake).
     xform_live_stale: bool,
-    /// Zoom used for `xform_live_tex` filter bucket (NEAREST vs LINEAR).
-    xform_live_filter_zoom: f32,
+    /// Last `xform_live_tex` sampler: true = Nearest (pixel-art Dragging).
+    xform_live_tex_nearest: bool,
+    /// Viewport pixel live buffer (same inverse as Confirm, clipped to view).
+    xform_pixel_scratch: Vec<u8>,
+    /// `(x, y, tex_w, tex_h, lod)` — draw size is `tex * lod` document pixels.
+    xform_pixel_meta: Option<(f32, f32, u32, u32, u32)>,
+    xform_pixel_key: Option<u64>,
     /// Layers above the transform slot (frozen plate), painted after the float.
     xform_above_tex: Option<(TextureHandle, u32, u32, u32, u32, u64)>,
     /// Skip Soft Light GPU re-upload while float/Soft Light pixels & ROI are unchanged.
     /// `(content_revision, float_w, float_h, atlas_w, atlas_h, clip_qx0, clip_qy0, clip_qx1, clip_qy1)`.
     softlight_gpu_upload_key: Option<(u64, u32, u32, u32, u32, u32, u32, u32, u32)>,
-    /// Float tex uploaded for this baked pose (rev + size + pose bits).
-    softlight_gpu_float_key: Option<(u64, u32, u32, u32, u32, u32, u32, u32)>,
+    /// Float tex uploaded for this baseline (rev + size + bake gen). Pose is a GPU uniform.
+    softlight_gpu_float_key: Option<(u64, u32, u32, u32, u32)>,
     /// Expand-only Soft∪float clip for this transform session (prevents z-order flicker).
     softlight_clip_frozen: Option<beautiful_core::DirtyRect>,
     /// Soft Light GPU pass armed for this frame (skip egui float).
@@ -155,24 +249,50 @@ pub struct CanvasState {
     opacity_dragging: bool,
     /// Opacity written during drag but display invalidate still pending (throttle).
     opacity_touch_pending: bool,
+    /// Layer the opacity throttle is bound to (cleared on active-layer change).
+    opacity_layer: Option<usize>,
     /// Paint into active layer mask instead of pixels.
     pub editing_mask: bool,
     /// Drop wgpu canvas texture on next paint (after New/Open size change).
     gpu_invalidate: bool,
-    /// Ctrl+drag selection pixel move (not Free Transform).
+    /// Sheet/tab warm switch / transform: overwrite cover tiles without wipe.
+    gpu_force_cover_refresh: bool,
+    /// Cover∩stale tiles to overwrite this frame (eye/opacity/gradient).
+    pub gpu_tile_invalidate: beautiful_core::DirtyRect,
+    /// Visibility/opacity/gradient pixels still stale on GPU (off-cover keep-ring).
+    visibility_stale: beautiful_core::DirtyRect,
+    /// Union of covers already overwritten since the last visibility edit. Never
+    /// shrink on zoom-in — that re-invalidated the whole view and froze zoom.
+    visibility_refreshed: beautiful_core::DirtyRect,
+    /// Bumped on opacity/blend/visibility/filter/gradient display edits — GPU tile cache must rebuild.
+    display_tile_epoch: u64,
+    /// Ctrl+drag selection pixel move (not Transform).
     sel_pixel_move: Option<SelPixelMoveSession>,
-    /// КРУЛЕР Free Transform (Ctrl+LKM float + CPU bake — no GPU overlay session).
+    /// КРУЛЕР Transform (Ctrl+LKM float + CPU bake — no GPU overlay session).
     pub kruler_xform: Option<KrulerXformSession>,
     /// Kruler-only: underlay (hole) uploaded once; drag skips sync (does not touch Transform flags).
     kruler_underlay_frozen: bool,
     /// Kruler-only float ColorImage tex (separate from `xform_live_tex`).
     kruler_float_tex: Option<TextureHandle>,
     kruler_float_stale: bool,
+    /// Text live overlay (frozen hole + cache tex). Same skip_sync idea as Kruler.
+    text_underlay_frozen: bool,
+    text_overlay_frozen_idx: Option<usize>,
+    text_float_tex: Option<TextureHandle>,
+    text_float_stale: bool,
+    text_float_gen: u64,
+    text_live_atlas: crate::text_live::TextLiveAtlas,
     /// Selection shape before marquee/lasso gesture (for undo).
     sel_gesture_before: Option<SelectionSnap>,
-    /// Base mask for Add/Subtract live preview.
+    /// Base mask for Add/Subtract/Invert live preview.
     sel_combine_base: Option<beautiful_core::SelectionMask>,
     sel_combine_op: SelectionCombine,
+    /// Sticky selection combine mode (options bar / tool settings).
+    pub sel_mode: SelectionCombine,
+    /// Inline text caret / selection / Ctrl-move.
+    pub text_edit: crate::text_edit::TextEditUi,
+    /// Copied from keymap each frame (touch prefs).
+    pub touch_cfg: crate::keymap::TouchSettings,
 }
 
 impl Default for CanvasState {
@@ -189,12 +309,16 @@ impl Default for CanvasState {
             rotation_deg: 0.0,
             last_viewport: egui::Rect::NOTHING,
             last_canvas_rect: egui::Rect::NOTHING,
+            gamepad_cursor: None,
+            gamepad_paint_down: false,
             coarsen_hold_until: None,
             zoom_screen_pivot: None,
             zoom_dir_until: None,
             wheel_accum: 0.0,
             drag_doc_start: None,
             drag_doc_last: None,
+            drag_screen_start: None,
+            drag_screen_travel: 0.0,
             transform_start_scale: 1.0,
             warp_controls: None,
             warp_node_handles: None,
@@ -208,17 +332,32 @@ impl Default for CanvasState {
             transform_mode: TransformMode::Free,
             mesh_grid_n: 2,
             transform_baseline: None,
-            free_xform: None,
+            transform_pose: None,
             transform_session: None,
             crop_aspect: CropAspect::Free,
             crop_straighten: 0.0,
             crop_rect: None,
+            crop_session_active: false,
+            crop_drag: None,
+            crop_snap_xs: Vec::new(),
+            crop_snap_ys: Vec::new(),
+            crop_snap_key: None,
             line_anchor: None,
+            last_display_geom: None,
             shift_constrain_origin: None,
             suppress_paint_until_release: false,
+            suppress_nav_until_release: false,
+            nav_block_until: 0.0,
+            suppressed_touch_ids: std::collections::HashSet::new(),
             pending_layer_pick: None,
             clone_source: None,
             clone_anchor: None,
+            clone_aligned: true,
+            clone_offset: None,
+            clone_show_preview: true,
+            clone_preview_opacity: 0.55,
+            clone_preview_tex: None,
+            clone_preview_key: None,
             gradient_session: None,
             shape_drag: None,
             resample_drag: beautiful_core::ResampleFilter::Bilinear,
@@ -226,13 +365,31 @@ impl Default for CanvasState {
             resample_final: beautiful_core::ResampleFilter::BicubicAutomatic,
             xform_bake_gen: 0,
             lmb_down: false,
+            last_fill_cell: None,
             space_down: false,
+            touch_active: std::collections::HashSet::new(),
+            touch_nav_lock: false,
+            last_touch_event_at: 0.0,
+            touch_gesture_peak: 0,
+            touch_gesture_travel: 0.0,
+            touch_gesture_t0: 0.0,
+            touch_pos: std::collections::HashMap::new(),
+            touch_pen_ids: std::collections::HashSet::new(),
+            touch_moved_this_frame: 0,
+            touch_centroid_prev: None,
+            touch_pending_pan: Vec2::ZERO,
             stroke_input_done: false,
             motion: crate::stroke_input::MotionCalibrator::default(),
             trajectory: crate::stroke_input::TrajectoryBuilder::default(),
             display_mip: beautiful_core::DisplayMip::empty(),
             display_mip_tex: None,
             display_lod: 1,
+            cpu_display_tiles: std::collections::HashMap::new(),
+            tile_plate_lod: 1,
+            prev_tile_cover: beautiful_core::DirtyRect::empty(),
+            display_tiles: beautiful_core::DisplayTileCache::new(),
+            present_linear_filter: true,
+            gpu_tex_side: beautiful_core::MAX_GPU_TEX_SIDE,
             nav_thumb: None,
             nav_thumb_rev: u64::MAX,
             nav_pending: false,
@@ -243,7 +400,10 @@ impl Default for CanvasState {
             selection_mask_texture: None,
             xform_live_tex: None,
             xform_live_stale: false,
-            xform_live_filter_zoom: 0.0,
+            xform_live_tex_nearest: true,
+            xform_pixel_scratch: Vec::new(),
+            xform_pixel_meta: None,
+            xform_pixel_key: None,
             xform_above_tex: None,
             softlight_gpu_upload_key: None,
             softlight_gpu_float_key: None,
@@ -255,23 +415,152 @@ impl Default for CanvasState {
             opacity_touch_at: 0.0,
             opacity_dragging: false,
             opacity_touch_pending: false,
+            opacity_layer: None,
             editing_mask: false,
             gpu_invalidate: false,
+            gpu_force_cover_refresh: false,
+            gpu_tile_invalidate: beautiful_core::DirtyRect::empty(),
+            visibility_stale: beautiful_core::DirtyRect::empty(),
+            visibility_refreshed: beautiful_core::DirtyRect::empty(),
+            display_tile_epoch: 0,
             sel_pixel_move: None,
             kruler_xform: None,
             kruler_underlay_frozen: false,
             kruler_float_tex: None,
             kruler_float_stale: false,
+            text_underlay_frozen: false,
+            text_overlay_frozen_idx: None,
+            text_float_tex: None,
+            text_float_stale: false,
+            text_float_gen: 0,
+            text_live_atlas: crate::text_live::TextLiveAtlas::default(),
             sel_gesture_before: None,
             sel_combine_base: None,
             sel_combine_op: SelectionCombine::Replace,
+            sel_mode: SelectionCombine::Replace,
+            text_edit: crate::text_edit::TextEditUi::default(),
+            touch_cfg: crate::keymap::TouchSettings::default(),
         }
     }
+}
+
+/// Finger-tap commands (paint-app standard: 2-finger undo, 3-finger redo).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchTapCmd {
+    Undo,
+    Redo,
+}
+
+pub fn zoom_max_for_doc(doc_w: f32, doc_h: f32) -> f32 {
+    let side = doc_w.max(doc_h).max(1.0);
+    (64.0 * (2048.0 / side).clamp(1.0, 8.0)).clamp(64.0, 512.0)
 }
 
 impl CanvasState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Clone sample center for cursor/target. `lock_offset` sets Aligned Δ on first paint.
+    pub fn clone_sample_for_target(
+        &mut self,
+        target: (f32, f32),
+        lock_offset: bool,
+    ) -> Option<(f32, f32)> {
+        let source = self.clone_source?;
+        if self.clone_aligned {
+            if lock_offset {
+                let offset = *self
+                    .clone_offset
+                    .get_or_insert_with(|| (source.0 - target.0, source.1 - target.1));
+                Some((target.0 + offset.0, target.1 + offset.1))
+            } else if let Some(offset) = self.clone_offset {
+                Some((target.0 + offset.0, target.1 + offset.1))
+            } else {
+                // Before first paint: preview stamps S onto C.
+                Some(source)
+            }
+        } else {
+            let anchor = self.clone_anchor.unwrap_or(target);
+            Some((
+                source.0 + target.0 - anchor.0,
+                source.1 + target.1 - anchor.1,
+            ))
+        }
+    }
+
+    /// Lock clone Δ for this stroke and publish it to the document.
+    pub fn prepare_clone_stroke(
+        &mut self,
+        document: &mut Document,
+        first_target: (f32, f32),
+    ) -> bool {
+        if self.clone_source.is_none() {
+            return false;
+        }
+        if self.clone_anchor.is_none() {
+            self.clone_anchor = Some(first_target);
+            if !self.clone_aligned {
+                self.clone_offset = None;
+            }
+        }
+        let Some(sample) = self.clone_sample_for_target(first_target, true) else {
+            return false;
+        };
+        document.clone_stroke_offset =
+            Some((sample.0 - first_target.0, sample.1 - first_target.1));
+        true
+    }
+
+    /// Bake/upload overlay for a document-space cursor position.
+    pub fn ensure_clone_preview_at(
+        &mut self,
+        ctx: &Context,
+        document: &Document,
+        cursor_doc: (f32, f32),
+    ) {
+        if !self.clone_show_preview || self.clone_source.is_none() {
+            return;
+        }
+        let Some(sample) = self.clone_sample_for_target(cursor_doc, false) else {
+            return;
+        };
+        let sx_i = sample.0.round() as i32;
+        let sy_i = sample.1.round() as i32;
+        let size_q = (document.brush.size.clamp(1.0, 600.0) * 100.0).round() as u32;
+        let hard_q = (document.brush.hardness.clamp(0.0, 1.0) * 100.0).round() as u32;
+        let key = (
+            sx_i,
+            sy_i,
+            size_q,
+            hard_q,
+            document.active_layer,
+            document.content_revision,
+        );
+        if self.clone_preview_key == Some(key) && self.clone_preview_tex.is_some() {
+            return;
+        }
+        let Some((w, h, pixels)) = document.bake_clone_source_preview(sample.0, sample.1) else {
+            return;
+        };
+        if w == 0 || h == 0 || pixels.len() < (w as usize * h as usize * 4) {
+            return;
+        }
+        let image = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
+        let opts = TextureOptions {
+            magnification: TextureFilter::Nearest,
+            minification: TextureFilter::Linear,
+            ..TextureOptions::default()
+        };
+        match self.clone_preview_tex.as_mut() {
+            Some(tex) => {
+                tex.set(image, opts);
+            }
+            None => {
+                self.clone_preview_tex = Some(ctx.load_texture("clone_source_preview", image, opts));
+            }
+        }
+        self.clone_preview_key = Some(key);
     }
 
     pub fn clear_warp_controls(&mut self) {
@@ -300,6 +589,7 @@ impl CanvasState {
     pub fn note_xform_bake(&mut self) {
         self.xform_bake_gen = self.xform_bake_gen.wrapping_add(1);
         self.xform_live_stale = true;
+        self.xform_pixel_key = None;
         self.softlight_gpu_float_key = None;
     }
 
@@ -312,39 +602,21 @@ impl CanvasState {
         if !self.transform_editing() {
             return;
         }
-        let keep_overlay = document.selection.floating_overlay_only;
-        match self.transform_mode {
-            TransformMode::Free => {
-                let posed = self.free_xform.as_ref().is_some_and(|fx| {
-                    (fx.scale_x - 1.0).abs() > 1e-4
-                        || (fx.scale_y - 1.0).abs() > 1e-4
-                        || fx.rotation_deg.abs() > 1e-3
-                });
-                if posed {
-                    crate::canvas::transform_free::refresh_free_transform_preview(
-                        self,
-                        document,
-                        self.resample_drag,
-                    );
-                }
-            }
-            TransformMode::Distort | TransformMode::Mesh => {
-                if self.warp_lattice_edited || self.warp_controls.is_some() {
-                    crate::canvas::transform_warp::refresh_warp_preview_full(self, document);
-                }
-            }
-        }
-        if keep_overlay {
-            document.selection.floating_overlay_only = true;
+        if document.selection.floating_overlay_only {
+            self.invalidate_xform_pixel_live();
+            return;
         }
     }
 
     #[allow(dead_code)]
-    pub fn clear_free_xform(&mut self) {
-        self.free_xform = None;
+    pub fn clear_xform(&mut self) {
+        self.transform_pose = None;
         self.xform_live_tex = None;
         self.xform_live_stale = false;
-        self.xform_live_filter_zoom = 0.0;
+        self.xform_live_tex_nearest = true;
+        self.xform_pixel_scratch.clear();
+        self.xform_pixel_meta = None;
+        self.xform_pixel_key = None;
         self.xform_above_tex = None;
         self.softlight_gpu_upload_key = None;
         self.softlight_gpu_float_key = None;
@@ -372,31 +644,28 @@ impl CanvasState {
         document.release_transform_plates();
     }
 
-    /// Upload live Free Transform tex from the **baked** floating buffer (Nearest).
-    /// Drawing is 1 doc-px → screen mapping — never stretch the baseline.
+    /// Upload live Transform tex from the viewport pixel bake (1:1 dest pixels).
     pub fn ensure_xform_live_tex(&mut self, ctx: &Context, document: &Document) {
-        let filter_changed = self.xform_live_tex.is_some()
-            && texture_filter_bucket(self.zoom)
-                != texture_filter_bucket(self.xform_live_filter_zoom);
-        if self.xform_live_tex.is_some() && !self.xform_live_stale && !filter_changed {
-            return;
-        }
-        let (pix, w, h) = if let Some(f) = document.selection.floating.as_ref() {
-            if f.width == 0 || f.height == 0 || f.pixels.len() < (f.width as usize) * (f.height as usize) * 4
-            {
-                return;
-            }
-            (&f.pixels, f.width, f.height)
-        } else if let Some((pix, w, h, _, _)) = self.transform_baseline.as_ref() {
-            if *w == 0 || *h == 0 || pix.len() < (*w as usize) * (*h as usize) * 4 {
-                return;
-            }
-            (pix, *w, *h)
-        } else {
+        self.rebuild_xform_pixel_live(document);
+        let Some((x, y, w, h, lod)) = self.xform_pixel_meta else {
             return;
         };
-        let image = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], pix);
-        // Always NEAREST for transform preview — pixel grid must stay crisp.
+        let _ = (x, y, lod);
+        if w == 0 || h == 0 {
+            return;
+        }
+        let need = w as usize * h as usize * 4;
+        if self.xform_pixel_scratch.len() < need {
+            return;
+        }
+        if self.xform_live_tex.is_some() && !self.xform_live_stale {
+            return;
+        }
+        let image = ColorImage::from_rgba_unmultiplied(
+            [w as usize, h as usize],
+            &self.xform_pixel_scratch[..need],
+        );
+        // Dest pixels are already filtered; blit with Nearest so they stay sharp.
         let opts = TextureOptions::NEAREST;
         if let Some(tex) = self.xform_live_tex.as_mut() {
             tex.set(image, opts);
@@ -404,7 +673,7 @@ impl CanvasState {
             self.xform_live_tex = Some(ctx.load_texture("xform_live", image, opts));
         }
         self.xform_live_stale = false;
-        self.xform_live_filter_zoom = self.zoom;
+        self.xform_live_tex_nearest = true;
     }
 
     /// Sync frozen "layers above" plate for correct z-order over the live float.
@@ -483,7 +752,7 @@ impl CanvasState {
         if !document.selection.floating_overlay_only {
             return false;
         }
-        let (fx, bw, bh) = match (self.free_xform.as_ref(), self.transform_baseline.as_ref()) {
+        let (fx, bw, bh) = match (self.transform_pose.as_ref(), self.transform_baseline.as_ref()) {
             (Some(fx), Some((_, bw, bh, _, _))) => (fx, *bw, *bh),
             _ => return false,
         };
@@ -524,7 +793,7 @@ impl CanvasState {
         if self.xform_underlay_frozen && want_omit != self.xform_underlay_omit_latched {
             self.xform_underlay_frozen = false;
             document.composite.mark_full();
-            self.gpu_invalidate = true;
+            self.request_cover_refresh();
             self.mark_dirty();
         }
     }
@@ -547,7 +816,7 @@ impl CanvasState {
         &self,
         document: &Document,
     ) -> Option<beautiful_core::DirtyRect> {
-        let (fx, bw, bh) = match (self.free_xform.as_ref(), self.transform_baseline.as_ref()) {
+        let (fx, bw, bh) = match (self.transform_pose.as_ref(), self.transform_baseline.as_ref()) {
             (Some(fx), Some((_, bw, bh, _, _))) => (fx, *bw, *bh),
             _ => return None,
         };
@@ -624,7 +893,7 @@ impl CanvasState {
         let mut out = Vec::new();
         let mut has_live = false;
         for (li, layer) in document.layers.iter().enumerate().skip(float_idx + 1) {
-            if !layer.visible || layer.is_folder {
+            if !beautiful_core::layer_effectively_visible(&document.layers, li) || layer.is_folder {
                 continue;
             }
             let opacity = (layer.opacity.clamp(0.0, 1.0)
@@ -667,28 +936,23 @@ impl CanvasState {
         if out.is_empty() || !has_live {
             return None;
         }
-        // Resolve clip base like CPU `nearest_paintable_alpha` (not stack dst.a).
+        // Resolve clip base like CPU `clip_base_index` (not the neighbor below,
+        // and not stack dst.a). Consecutive clips share one base.
         let mut coded: Vec<(usize, u32, u32, u32, u32, u32, f32, u32)> =
             Vec::with_capacity(out.len());
         for &(li, ox, oy, w, h, mode_u, opacity, wants_clip) in &out {
             let clip_code = if !wants_clip {
                 0u32
-            } else {
-                let mut j = li;
-                let mut code = 0u32;
-                while j > 0 {
-                    j -= 1;
-                    if document.layers[j].is_folder {
-                        continue;
-                    }
-                    if j == float_idx {
-                        code = 1;
-                    } else if let Some(slot) = out.iter().position(|&(idx, ..)| idx == j) {
-                        code = 2 + slot as u32;
-                    }
-                    break;
+            } else if let Some(j) = beautiful_core::clip_base_index(&document.layers, li) {
+                if j == float_idx {
+                    1
+                } else if let Some(slot) = out.iter().position(|&(idx, ..)| idx == j) {
+                    2 + slot as u32
+                } else {
+                    0
                 }
-                code
+            } else {
+                0
             };
             coded.push((li, ox, oy, w, h, mode_u, opacity, clip_code));
         }
@@ -779,45 +1043,10 @@ impl CanvasState {
         Some(atlas)
     }
 
-    /// Pointer-up: sync Free pose into floating for commit; CPU Soft Light plate removed (GPU InStack).
+    /// Pointer-up: overlay live is viewport pixel raster. CPU Confirm bake stays
+    /// on Apply (Final filter) so pointer-up does not allocate a posed AABB.
     pub fn finish_xform_above_live(&mut self, _ctx: &Context, document: &mut Document) {
-        if matches!(
-            self.transform_mode,
-            TransformMode::Distort | TransformMode::Mesh
-        ) && document.selection.floating_overlay_only
-        {
-            crate::canvas::transform_warp::refresh_warp_preview_full(self, document);
-        }
-        if matches!(self.transform_mode, TransformMode::Free)
-            && document.selection.floating_overlay_only
-        {
-            if let (Some(fx), Some((base, bw, bh, _, _))) =
-                (self.free_xform.clone(), self.transform_baseline.clone())
-            {
-                let posed = (fx.scale_x - 1.0).abs() > 1e-4
-                    || (fx.scale_y - 1.0).abs() > 1e-4
-                    || fx.rotation_deg.abs() > 1e-3;
-                if posed {
-                    let (pixels, nw, nh) = beautiful_core::apply_free_transform_rgba(
-                        &base,
-                        bw,
-                        bh,
-                        fx.scale_x,
-                        fx.scale_y,
-                        fx.rotation_deg,
-                        self.resample_preview,
-                    );
-                    if let Some(f) = document.selection.floating.as_mut() {
-                        f.pixels = pixels;
-                        f.width = nw;
-                        f.height = nh;
-                        f.x = (fx.center_x - nw as f32 * 0.5).round();
-                        f.y = (fx.center_y - nh as f32 * 0.5).round();
-                        f.rotation_deg = 0.0;
-                    }
-                }
-            }
-        }
+        let _ = document;
     }
 
     /// Upload InStack GPU atlas when Soft∪float cell changes; float tex once per baseline.
@@ -830,57 +1059,33 @@ impl CanvasState {
         if !self.softlight_gpu_xform_active(document) {
             return None;
         }
-        let (fx, (base, bw, bh, _, _)) = match (
-            self.free_xform.as_ref(),
-            self.transform_baseline.as_ref(),
-        ) {
-            (Some(fx), Some(b)) => (fx, b),
-            _ => return None,
-        };
-        // Prefer Nearest-baked floating drawn 1:1. Fall back to baseline + GPU pose
-        // only when bake size does not match the current Free pose yet.
-        let posed = (fx.scale_x - 1.0).abs() > 1e-4
-            || (fx.scale_y - 1.0).abs() > 1e-4
-            || fx.rotation_deg.abs() > 1e-3;
-        let (ew, eh) = beautiful_core::free_transform_output_size(
-            *bw,
-            *bh,
-            fx.scale_x,
-            fx.scale_y,
-            fx.rotation_deg,
-        );
-        let (float_pix, float_w, float_h, center, scale, rot) =
-            if let Some(f) = document.selection.floating.as_ref() {
-                let pixels_ok = f.width > 0
-                    && f.height > 0
-                    && f.pixels.len() >= (f.width as usize) * (f.height as usize) * 4;
-                // Identity: floating buffer is the cutout. Posed: require bake size.
-                let use_baked = pixels_ok
-                    && if posed {
-                        f.width == ew && f.height == eh
-                    } else {
-                        true
-                    };
-                if use_baked {
-                    (
-                        f.pixels.as_slice(),
-                        f.width,
-                        f.height,
-                        (f.x + f.width as f32 * 0.5, f.y + f.height as f32 * 0.5),
-                        (1.0_f32, 1.0_f32),
-                        0.0_f32,
-                    )
-                } else {
-                    (
-                        base.as_slice(),
-                        *bw,
-                        *bh,
-                        (fx.center_x, fx.center_y),
-                        (fx.scale_x, fx.scale_y),
-                        fx.rotation_deg,
-                    )
+        self.rebuild_xform_pixel_live(document);
+        let (float_pix, float_w, float_h, center, scale, rot, baseline_w, baseline_h) =
+            if let Some((x, y, w, h, lod)) = self.xform_pixel_meta {
+                let need = w as usize * h as usize * 4;
+                if w == 0 || h == 0 || self.xform_pixel_scratch.len() < need {
+                    return None;
                 }
+                let lod_f = lod.max(1) as f32;
+                (
+                    self.xform_pixel_scratch.as_slice(),
+                    w,
+                    h,
+                    (x + w as f32 * lod_f * 0.5, y + h as f32 * lod_f * 0.5),
+                    (lod_f, lod_f),
+                    0.0,
+                    w as f32,
+                    h as f32,
+                )
             } else {
+                // Fallback: baseline + pose (should be rare — live bake not ready).
+                let (fx, (base, bw, bh, _, _)) = match (
+                    self.transform_pose.as_ref(),
+                    self.transform_baseline.as_ref(),
+                ) {
+                    (Some(fx), Some(b)) => (fx, b),
+                    _ => return None,
+                };
                 (
                     base.as_slice(),
                     *bw,
@@ -888,6 +1093,8 @@ impl CanvasState {
                     (fx.center_x, fx.center_y),
                     (fx.scale_x, fx.scale_y),
                     fx.rotation_deg,
+                    *bw as f32,
+                    *bh as f32,
                 )
             };
         let layers = self.instack_gpu_layers(document)?;
@@ -897,12 +1104,9 @@ impl CanvasState {
         self.softlight_clip_frozen = Some(clip);
         // Invalidate float tex when bake content changes (same size ≠ same pixels).
         let float_key = (
-            document.content_revision,
+            self.xform_pixel_key.unwrap_or(document.content_revision),
             float_w,
             float_h,
-            fx.scale_x.to_bits(),
-            fx.scale_y.to_bits(),
-            fx.rotation_deg.to_bits(),
             self.xform_bake_gen as u32,
             Self::resample_filter_key(self.resample_drag),
         );
@@ -948,12 +1152,17 @@ impl CanvasState {
                 crate::action_log::flush();
                 return None;
             }
+            // Soft Light FS samples underlay at doc UV 0–1 — keep a full-doc plate for that.
+            let _ = crate::canvas_gpu::sync_softlight_underlay(rs, document, true);
             if need_float {
                 self.softlight_gpu_float_key = Some(float_key);
             }
             if need_atlas {
                 self.softlight_gpu_upload_key = Some(atlas_key);
             }
+        } else {
+            // Sources warm — still ensure underlay exists after tile-only present.
+            let _ = crate::canvas_gpu::sync_softlight_underlay(rs, document, true);
         }
         self.softlight_gpu_drew = true;
         Some(crate::canvas_gpu::SoftLightXformParams {
@@ -962,8 +1171,8 @@ impl CanvasState {
             free_center: center,
             free_scale: scale,
             free_rot_deg: rot,
-            baseline_w: float_w as f32,
-            baseline_h: float_h as f32,
+            baseline_w,
+            baseline_h,
             float_opacity: document.floating_transform_opacity(),
             float_mode: Self::blend_mode_gpu_u(document.floating_transform_blend_mode())
                 .unwrap_or(5),
@@ -1013,6 +1222,77 @@ impl CanvasState {
             && document.selection.floating_overlay_only
             && self.kruler_underlay_frozen
             && self.transform_session.is_none()
+    }
+
+    pub fn text_live_overlay_active(&self, document: &Document) -> bool {
+        self.text_underlay_frozen && document.text_live_overlay_active()
+    }
+
+    pub fn ensure_text_float_tex(&mut self, ctx: &Context, document: &Document) {
+        let Some(idx) = document.text_overlay_idx else {
+            self.text_float_tex = None;
+            return;
+        };
+        let Some(payload) = document.layers.get(idx).and_then(|l| l.text.as_ref()) else {
+            self.text_float_tex = None;
+            return;
+        };
+        let c = &payload.cache;
+        if c.is_empty() {
+            self.text_float_tex = None;
+            self.text_float_stale = false;
+            return;
+        }
+        if self.text_float_tex.is_some()
+            && !self.text_float_stale
+            && self.text_float_gen == c.gen
+        {
+            return;
+        }
+        let need = c.width as usize * c.height as usize * 4;
+        if c.pixels.len() < need {
+            return;
+        }
+        let image = ColorImage::from_rgba_unmultiplied(
+            [c.width as usize, c.height as usize],
+            &c.pixels[..need],
+        );
+        let opts = TextureOptions::NEAREST;
+        if let Some(tex) = self.text_float_tex.as_mut() {
+            tex.set(image, opts);
+        } else {
+            self.text_float_tex = Some(ctx.load_texture("text_live_float", image, opts));
+        }
+        self.text_float_stale = false;
+        self.text_float_gen = c.gen;
+    }
+
+    pub fn note_text_underlay_synced(&mut self, document: &Document) {
+        if !document.text_live_overlay_active() || self.text_underlay_frozen {
+            return;
+        }
+        let idx = document.text_overlay_idx.unwrap();
+        // Freeze as soon as the punched underlay is on the GPU. Waiting for
+        // xform_above_tex never finished when Soft/Hard Light blocked the plate
+        // (or the plate lagged a frame) — every keystroke then marked the whole
+        // canvas dirty and typing felt like the lag we already removed.
+        self.text_underlay_frozen = true;
+        self.text_overlay_frozen_idx = Some(idx);
+        let _ = idx;
+    }
+
+    pub fn clear_text_overlay(&mut self) {
+        self.text_underlay_frozen = false;
+        self.text_overlay_frozen_idx = None;
+        self.text_float_tex = None;
+        self.text_float_stale = false;
+        self.text_float_gen = 0;
+        self.text_live_atlas.clear();
+    }
+
+    /// Keep the float tex; next frame re-punches the underlay hole (Enter / paste).
+    pub fn thaw_text_underlay(&mut self) {
+        self.text_underlay_frozen = false;
     }
 
     /// Upload Kruler float tex from baked floating pixels (CPU). Move only repositions paint rect.
@@ -1080,13 +1360,13 @@ impl CanvasState {
         if !matches!(self.transform_mode, TransformMode::Free) {
             return;
         }
-        let Some(fx) = self.free_xform.clone() else {
+        let Some(fx) = self.transform_pose.clone() else {
             return;
         };
         let Some((pix, w, h, _ox, _oy)) = self.transform_baseline.clone() else {
             return;
         };
-        let (pixels, nw, nh) = beautiful_core::apply_free_transform_rgba(
+        let (pixels, nw, nh) = beautiful_core::apply_transform_rgba(
             &pix,
             w,
             h,
@@ -1115,7 +1395,7 @@ impl CanvasState {
         }
         document.selection.resync_mask_from_floating();
         self.transform_baseline = Some((pixels, nw, nh, x, y));
-        self.free_xform = Some(FreeXform::from_baseline(nw, nh, x, y));
+        self.transform_pose = Some(TransformPose::from_baseline(nw, nh, x, y));
         self.xform_live_tex = None;
         self.xform_live_stale = true;
     }
@@ -1135,11 +1415,11 @@ impl CanvasState {
         document.selection.floating_overlay_only = overlay;
         if let Some(f) = document.selection.floating.as_ref() {
             self.transform_baseline = Some((f.pixels.clone(), f.width, f.height, f.x, f.y));
-            if let Some(fx) = self.free_xform.as_mut() {
-                *fx = FreeXform::from_baseline(f.width, f.height, f.x, f.y);
+            if let Some(fx) = self.transform_pose.as_mut() {
+                *fx = TransformPose::from_baseline(f.width, f.height, f.x, f.y);
             } else {
-                self.free_xform =
-                    Some(FreeXform::from_baseline(f.width, f.height, f.x, f.y));
+                self.transform_pose =
+                    Some(TransformPose::from_baseline(f.width, f.height, f.x, f.y));
             }
         }
         self.clear_warp_controls();
@@ -1175,8 +1455,9 @@ impl CanvasState {
             self.xform_above_tex = None;
                     self.display_mip_tex = None;
             self.display_mip = beautiful_core::DisplayMip::empty();
+            self.clear_display_tiles_cpu();
             self.display_lod = 1;
-            self.gpu_invalidate = true;
+            self.request_cover_refresh();
             self.mark_dirty();
         }
     }
@@ -1231,7 +1512,7 @@ impl CanvasState {
         } else if self.transform_session.is_some() {
             // Free on baked baseline (identity pose = last Mesh/Distort/Free result).
             if let Some((_, w, h, ox, oy)) = self.transform_baseline.as_ref() {
-                self.free_xform = Some(FreeXform::from_baseline(*w, *h, *ox, *oy));
+                self.transform_pose = Some(TransformPose::from_baseline(*w, *h, *ox, *oy));
             }
             self.arm_overlay_live(document, false);
             sync_free_floating_pose(self, document);
@@ -1277,11 +1558,19 @@ impl CanvasState {
         self.transform_session.is_some()
     }
 
+    pub fn warp_nudge_active(&self) -> bool {
+        matches!(
+            self.transform_mode,
+            TransformMode::Distort | TransformMode::Mesh
+        ) && self.transform_editing()
+            && !self.warp_selected.is_empty()
+    }
+
     pub fn gradient_editing(&self) -> bool {
         self.gradient_session.is_some()
     }
 
-    /// Transform / gradient / КРУЛЕР Free Transform — other tools locked.
+    /// Transform / gradient / КРУЛЕР Transform — other tools locked.
     pub fn tool_edit_lock(&self) -> bool {
         self.transform_editing() || self.gradient_editing() || kruler_editing(self)
     }
@@ -1290,11 +1579,18 @@ impl CanvasState {
         if let Some(sess) = self.gradient_session.as_mut() {
             std::mem::swap(&mut sess.start, &mut sess.end);
         }
-        if document.selection.mask.is_some() || document.selection.rect.is_some() {
+        // GPU overlay reads session ends; CPU fallback only when we already wrote tiles.
+        if self
+            .gradient_session
+            .as_ref()
+            .is_some_and(|s| s.cpu_preview)
+        {
             if let Some(sess) = self.gradient_session.as_ref() {
-                document.gradient_live_from(&sess.layer_before, sess.start, sess.end, false);
+                let start = document.view_to_buffer(sess.start.0, sess.start.1);
+                let end = document.view_to_buffer(sess.end.0, sess.end.1);
+                document.gradient_live_from(&sess.layer_before, start, end, false);
+                self.mark_dirty();
             }
-            self.mark_dirty();
         }
     }
 
@@ -1302,7 +1598,24 @@ impl CanvasState {
         let Some(sess) = self.gradient_session.take() else {
             return;
         };
-        document.gradient_commit_from(sess.layer_before, sess.start, sess.end);
+        let start = document.view_to_buffer(sess.start.0, sess.start.1);
+        let end = document.view_to_buffer(sess.end.0, sess.end.1);
+        if sess.layer_idx < document.layers.len() {
+            document.active_layer = sess.layer_idx;
+        }
+        let dirty = document.gradient_commit_from(sess.layer_before, start, end);
+        // Snap to 512 display plates so extract matches sandwich write (no tile ghosts).
+        // Do not set gpu_tile_invalidate: that forces a second full-stack compose.
+        if !dirty.is_empty() {
+            let view = self.view_dirty_rect(document);
+            let cover = view.padded(beautiful_core::DISPLAY_VIEW_PAD, document.width, document.height);
+            document.composite.confine_pending_to_view(cover);
+            document.composite.offscreen_dirty.clear();
+            expand_pending_display_tiles(document);
+            // Off-cover 512s stay until pan/zoom-out ring — same as eye. Without
+            // this, zoom-out showed pre-gradient tiles until LMB.
+            self.queue_visibility_gpu_refresh(dirty, cover);
+        }
         self.thumbs_deferred = false;
         self.nav_pending = true;
         self.layer_thumb_pending = Some(document.active_layer);
@@ -1310,13 +1623,32 @@ impl CanvasState {
     }
 
     pub fn cancel_gradient_session(&mut self, document: &mut Document) {
-        // Selection-aware path may have written a CPU live preview — restore tiles.
-        if let Some(sess) = self.gradient_session.take() {
+        let Some(sess) = self.gradient_session.take() else {
+            self.thumbs_deferred = false;
+            self.mark_dirty();
+            return;
+        };
+        if sess.cpu_preview {
+            let mut dirty = DirtyRect::empty();
             if let Some(layer) = document.layers.get_mut(sess.layer_idx) {
+                if let Some(b) = layer.content_bounds() {
+                    dirty.union(b);
+                }
                 layer.tiles.restore_shared(&sess.layer_before);
                 layer.invalidate_paint_f();
+                if let Some(b) = layer.content_bounds() {
+                    dirty.union(b);
+                }
             }
-            document.invalidate_full();
+            if !dirty.is_empty() {
+                document.touch_region_paint(dirty);
+                let view = self.view_dirty_rect(document);
+                let cover =
+                    view.padded(beautiful_core::DISPLAY_VIEW_PAD, document.width, document.height);
+                document.composite.confine_pending_to_view(cover);
+                document.composite.offscreen_dirty.clear();
+                expand_pending_display_tiles(document);
+            }
         }
         self.thumbs_deferred = false;
         self.mark_dirty();
@@ -1330,6 +1662,11 @@ impl CanvasState {
         if document.active_is_locked() {
             let _ = document.require_paintable("Трансформация");
             return false;
+        }
+        if document.selection.rect.is_none() && document.selection.floating.is_none() {
+            if !document.select_opaque_content() {
+                return false;
+            }
         }
         let Some(rect) = document.selection.rect else {
             return false;
@@ -1350,29 +1687,36 @@ impl CanvasState {
                 .selection
                 .lift_from_layer(&mut document.layers[idx], idx);
             document.layers[idx].invalidate_paint_f();
-            document.selection.rect = Some(rect);
+            // lift_from_layer already trimmed empty pixels + resynced mask/outline/rect.
             document.invalidate_selection_footprint();
             let holed = document.layers[idx].tiles.clone_shared();
             (before, holed)
         };
 
         document.selection.resync_mask_from_floating();
-        if let Some(f) = &document.selection.floating {
-            self.transform_baseline = Some((f.pixels.clone(), f.width, f.height, f.x, f.y));
-            self.free_xform = Some(FreeXform::from_baseline(f.width, f.height, f.x, f.y));
-            self.warp_proxy = None;
-        } else {
+        let Some(f) = document.selection.floating.as_ref() else {
             return false;
-        }
+        };
+        self.transform_baseline = Some((f.pixels.clone(), f.width, f.height, f.x, f.y));
+        self.transform_pose = Some(TransformPose::from_baseline(f.width, f.height, f.x, f.y));
+        self.warp_proxy = None;
+        // Cancel restores pre-lift selection; live session tracks trimmed float footprint.
+        let live_rect = document.selection.rect.unwrap_or(rect);
+        let live_mask = document.selection.mask.clone().or(sel_mask);
+        let live_outline = if beautiful_core::outline_is_ready(&document.selection.outline) {
+            document.selection.outline.clone()
+        } else {
+            sel_outline
+        };
         self.transform_session = Some(TransformSession {
             layer_idx: idx,
             layer_before,
             layer_holed,
-            sel_rect: rect,
-            sel_mask,
-            sel_outline,
+            sel_rect: live_rect,
+            sel_mask: live_mask,
+            sel_outline: live_outline,
         });
-        // Gradient-style live Free Transform: composite underlay (hole) once;
+        // Gradient-style live Transform: composite underlay (hole) once;
         // drag paints baseline tex with a pose matrix — no per-frame CPU bake.
         document.end_transform_sandwich();
         document.selection.floating_overlay_only = true;
@@ -1391,11 +1735,13 @@ impl CanvasState {
         self.softlight_gpu_float_key = None;
         self.softlight_clip_frozen = None;
         self.softlight_gpu_drew = false;
-        // Drop mip/GPU caches — zoomed tiles must not keep pre-lift content.
+        // Drop CPU mip caches — zoomed tiles must not keep pre-lift content.
+        // Do NOT gpu_invalidate (full wipe): overwrite cover in one frame instead.
         self.display_mip_tex = None;
         self.display_mip = beautiful_core::DisplayMip::empty();
+        self.clear_display_tiles_cpu();
         self.display_lod = 1;
-        self.gpu_invalidate = true;
+        self.request_cover_refresh();
         self.mark_dirty();
         crate::action_log::log(
             "transform",
@@ -1459,10 +1805,10 @@ impl CanvasState {
         } else if let Some((pix, w, h, _ox, _oy)) = self.transform_baseline.clone() {
             let old_footprint = document.floating_selection_dirty_rect();
             let fx = self
-                .free_xform
+                .transform_pose
                 .clone()
-                .unwrap_or_else(|| FreeXform::from_baseline(w, h, 0.0, 0.0));
-            let (pixels, nw, nh) = beautiful_core::apply_free_transform_rgba(
+                .unwrap_or_else(|| TransformPose::from_baseline(w, h, 0.0, 0.0));
+            let (pixels, nw, nh) = beautiful_core::apply_transform_rgba(
                 &pix,
                 w,
                 h,
@@ -1488,6 +1834,22 @@ impl CanvasState {
             .as_ref()
             .map(|s| s.layer_idx)
             .unwrap_or(document.active_layer);
+        let apply_dirty = document
+            .floating_selection_dirty_rect()
+            .or_else(|| {
+                document.selection.rect.map(|r| DirtyRect {
+                    x0: r.x0.floor().max(0.0) as u32,
+                    y0: r.y0.floor().max(0.0) as u32,
+                    x1: r.x1.ceil().clamp(0.0, document.width as f32) as u32,
+                    y1: r.y1.ceil().clamp(0.0, document.height as f32) as u32,
+                })
+            })
+            .unwrap_or_else(DirtyRect::empty);
+        let geom_before = (
+            document.width,
+            document.height,
+            document.stage.map(|s| (s.x, s.y, s.w, s.h)),
+        );
         if let Some(session) = self.transform_session.take() {
             document.commit_transform_from_snapshot(
                 session.layer_idx,
@@ -1500,8 +1862,18 @@ impl CanvasState {
         } else {
             document.commit_selection();
         }
+        let geom_after = (
+            document.width,
+            document.height,
+            document.stage.map(|s| (s.x, s.y, s.w, s.h)),
+        );
+        if geom_before != geom_after {
+            // Pasteboard expand/compact changes buffer size — drop stale display tiles.
+            self.invalidate_display_tiles();
+            self.request_cover_refresh();
+        }
         self.transform_baseline = None;
-        self.free_xform = None;
+        self.transform_pose = None;
         self.xform_live_tex = None;
         self.xform_above_tex = None;
         self.xform_underlay_frozen = false;
@@ -1525,9 +1897,14 @@ impl CanvasState {
         self.thumbs_deferred = true;
         self.layer_thumb_pending = Some(confirm_layer);
         self.nav_pending = true;
-        // Overlay underlay had layers-above stripped — force full stack rebuild
-        // (partial dirty left stale tiles until eye toggle).
-        document.touch();
+        // Regional present — document.touch() was invalidate_full (~90% CPU on Apply).
+        if !apply_dirty.is_empty() {
+            document.touch_region(apply_dirty);
+            expand_pending_display_tiles(document);
+            self.gpu_tile_invalidate.union(apply_dirty);
+        } else {
+            document.revision = document.revision.wrapping_add(1);
+        }
         self.mark_dirty();
     }
 
@@ -1544,8 +1921,39 @@ impl CanvasState {
             // No session snapshot — refuse to leave a hole: just commit as last resort.
             document.commit_selection();
         }
+        self.clear_transform_ui_state(document, tool);
+        // Cancel restores tiles via snapshot — regional, not invalidate_full.
+        if let Some(d) = document.selection.rect.map(|r| DirtyRect {
+            x0: r.x0.floor().max(0.0) as u32,
+            y0: r.y0.floor().max(0.0) as u32,
+            x1: r.x1.ceil().clamp(0.0, document.width as f32) as u32,
+            y1: r.y1.ceil().clamp(0.0, document.height as f32) as u32,
+        }) {
+            document.touch_region(d);
+            expand_pending_display_tiles(document);
+            self.gpu_tile_invalidate.union(d);
+        } else {
+            document.revision = document.revision.wrapping_add(1);
+        }
+        self.mark_dirty();
+    }
+
+    /// Drop transform chrome without restoring pixels (Delete keeps the hole).
+    /// Returns the pre-lift tile snapshot for undo.
+    pub fn abandon_transform_for_delete(
+        &mut self,
+        document: &mut Document,
+        tool: &mut WorkspaceTool,
+    ) -> Option<(usize, TileBuffer)> {
+        let session = self.transform_session.take()?;
+        let out = (session.layer_idx, session.layer_before);
+        self.clear_transform_ui_state(document, tool);
+        Some(out)
+    }
+
+    fn clear_transform_ui_state(&mut self, document: &mut Document, tool: &mut WorkspaceTool) {
         self.transform_baseline = None;
-        self.free_xform = None;
+        self.transform_pose = None;
         self.xform_live_tex = None;
         self.xform_above_tex = None;
         self.xform_underlay_frozen = false;
@@ -1564,8 +1972,6 @@ impl CanvasState {
         self.warp_proxy = None;
         *tool = WorkspaceTool::SelectRect;
         self.transform_mode = TransformMode::Free;
-        document.touch();
-        self.mark_dirty();
     }
 
     fn selection_mask_texture_id(
@@ -1634,10 +2040,20 @@ impl CanvasState {
             raw,
             &mut self.lmb_down,
             &mut self.space_down,
-            temp_hand,
+            // Space = TempHand — disable while typing on a text layer.
+            if document.text_editing.is_some() {
+                None
+            } else {
+                temp_hand
+            },
         );
+        if document.text_editing.is_some() {
+            self.space_down = false;
+        }
+        self.ingest_touch_events(raw, ctx.input(|i| i.time));
+        let now = ctx.input(|i| i.time);
 
-        // Press started off-canvas (UI / panels / workspace surround) — don't paint until release.
+        // Press off the plate (desk / panels) — allow paint once the pointer enters the canvas.
         let pressed = raw.events.iter().any(|e| {
             matches!(
                 e,
@@ -1648,31 +2064,21 @@ impl CanvasState {
                 }
             )
         });
-        if pressed && !self.is_drawing {
-            let on_canvas = crate::stroke_input::primary_press_screen_pos(raw)
-                .map(|p| self.pointer_on_document(p))
-                .unwrap_or(false);
-            if !on_canvas {
-                self.suppress_paint_until_release = true;
-            }
+        let press_pos = crate::stroke_input::primary_press_screen_pos(raw);
+        let on_canvas_press = press_pos
+            .map(|p| self.pointer_on_document(p))
+            .unwrap_or(false);
+        let ui_press = pressed
+            && press_pos
+                .map(|p| self.pointer_over_ui(p))
+                .unwrap_or(true);
+        if ui_press {
+            self.suppress_paint_until_release = true;
+            self.suppress_nav_until_release = true;
+            self.block_nav(now);
+            self.forget_stale_touches(raw);
         }
 
-        let can_paint = matches!(
-            tool,
-            WorkspaceTool::Brush
-                | WorkspaceTool::Pencil
-                | WorkspaceTool::PixelBrush
-                | WorkspaceTool::Airbrush
-                | WorkspaceTool::Mixer
-                | WorkspaceTool::Eraser
-                | WorkspaceTool::Smudge
-                | WorkspaceTool::SelectionBrush
-                | WorkspaceTool::SelectionEraser
-        );
-        let hand = matches!(tool, WorkspaceTool::Hand);
-        let space = self.space_down || hand;
-
-        // End stroke on release even without a valid view.
         let released = raw.events.iter().any(|e| {
             matches!(
                 e,
@@ -1685,16 +2091,82 @@ impl CanvasState {
         });
         if released {
             self.suppress_paint_until_release = false;
+            self.suppress_nav_until_release = false;
+            // Do not zero `nav_block_until` — Ink pan often starts *after* lift.
         }
-        if released && self.is_drawing {
-            let smudge = matches!(tool, WorkspaceTool::Smudge);
-            let flushed = self.trajectory.flush(document, smudge);
+
+        // Slider drag / panel hover-with-contact: keep the lock alive without a
+        // fresh press event (stylus often skips PointerButton while already down).
+        let latest = ctx.input(|i| i.pointer.latest_pos());
+        let over_ui = latest.map(|p| self.pointer_over_ui(p)).unwrap_or(false);
+        let any_down = self.lmb_down || ctx.input(|i| i.pointer.any_down());
+        if over_ui && (any_down || pressed || released || !self.touch_active.is_empty()) {
+            self.block_nav(now);
+            self.touch_pending_pan = Vec2::ZERO;
+            if any_down {
+                self.suppress_nav_until_release = true;
+            }
+        }
+
+        if pressed && !on_canvas_press && !ui_press {
+            // Desk (in viewport, off document): still don't start a stroke.
+            self.suppress_paint_until_release = true;
+        }
+
+        // Don't undo an in-progress stroke just because the UI tap looked like
+        // a second finger — that stroke is committed below.
+        if self.touch_blocks_paint(ctx) && !(ui_press && self.is_drawing) {
+            self.abort_paint_for_navigation(document);
+            self.stroke_input_done = true;
+            return false;
+        }
+
+        let can_paint = matches!(
+            tool,
+            WorkspaceTool::Brush
+                | WorkspaceTool::Pencil
+                | WorkspaceTool::PixelBrush
+                | WorkspaceTool::Airbrush
+                | WorkspaceTool::Mixer
+                | WorkspaceTool::Eraser
+                | WorkspaceTool::Smudge
+                | WorkspaceTool::Blur
+                | WorkspaceTool::CloneBrush
+                | WorkspaceTool::SelectionBrush
+                | WorkspaceTool::SelectionEraser
+        );
+        let hand = matches!(tool, WorkspaceTool::Hand);
+        let space = self.space_down || hand;
+
+        // Hover + mid-stroke: aim from live pointer, not only pre-LMB hover.
+        if can_paint && !space && self.has_view() {
+            self.track_hover_brush_aim(ctx, document, raw);
+        }
+
+        // End stroke on release even without a valid view.
+        let end_stroke = (released && self.is_drawing) || (ui_press && self.is_drawing);
+        if end_stroke {
+            if matches!(tool, WorkspaceTool::CloneBrush)
+                && document.brush.taper_out > 1e-5
+            {
+                if let Some(b) = self.trajectory.tip().or(self.last_point) {
+                    let stub_len = (document.brush.taper_out * document.brush.size * 2.0).max(1.0);
+                    let stub = (b.0 + stub_len, b.1, b.2 * 0.15);
+                    if document.clone_brush_polyline(&[b, stub], true) {
+                        self.mark_dirty();
+                    }
+                }
+            }
+            let flushed = self.trajectory.flush(document, matches!(tool, WorkspaceTool::Smudge));
             if let Some(tip) = self.trajectory.tip().or(self.last_point) {
                 self.line_anchor = Some(tip);
             }
             self.is_drawing = false;
             self.last_point = None;
             self.shift_constrain_origin = None;
+            if matches!(tool, WorkspaceTool::CloneBrush) {
+                self.clone_anchor = None;
+            }
             self.motion.reset();
             self.trajectory.reset();
             document.stabilizer.reset();
@@ -1718,11 +2190,27 @@ impl CanvasState {
         }
 
         if self.suppress_paint_until_release {
-            self.stroke_input_done = true;
-            return false;
+            // Desk/panel press → drag onto the plate: start painting on entry (peer feel).
+            let entered = ctx
+                .input(|i| i.pointer.latest_pos())
+                .map(|p| self.pointer_on_document(p))
+                .unwrap_or(false);
+            if entered && !released {
+                self.suppress_paint_until_release = false;
+            } else {
+                self.stroke_input_done = true;
+                return false;
+            }
         }
 
         if !can_paint || space || !self.has_view() {
+            return false;
+        }
+
+        if matches!(tool, WorkspaceTool::CloneBrush)
+            && (raw.modifiers.alt || self.clone_source.is_none())
+        {
+            self.stroke_input_done = true;
             return false;
         }
 
@@ -1734,10 +2222,11 @@ impl CanvasState {
             return false;
         }
 
-        if document.active_is_folder() && !self.editing_mask {
+        if document.active_is_non_paintable() && !self.editing_mask {
             if pressed {
                 let _ = document.require_paintable("Рисование");
             }
+            self.stroke_input_done = true;
             return false;
         }
 
@@ -1746,6 +2235,7 @@ impl CanvasState {
             if pressed {
                 let _ = document.require_paintable("Рисование");
             }
+            self.stroke_input_done = true;
             return false;
         }
 
@@ -1754,15 +2244,22 @@ impl CanvasState {
             if pressed {
                 let _ = document.require_paintable("Рисование");
             }
+            self.stroke_input_done = true;
             return false;
         }
 
         let shift = raw.modifiers.shift;
-        let doc_w = document.width as f32;
-        let doc_h = document.height as f32;
+        let (canvas_w, canvas_h) = document.canvas_size();
+        let doc_w = canvas_w as f32;
+        let doc_h = canvas_h as f32;
         let rect = self.last_canvas_rect;
         let pressure = pen.sample_pressure_from_raw(raw);
-        let smudge = matches!(tool, WorkspaceTool::Smudge);
+        let stroke_kind = match tool {
+            WorkspaceTool::Smudge => crate::stroke_input::LayerStrokeKind::Smudge,
+            WorkspaceTool::Blur => crate::stroke_input::LayerStrokeKind::Blur,
+            WorkspaceTool::CloneBrush => crate::stroke_input::LayerStrokeKind::Clone,
+            _ => crate::stroke_input::LayerStrokeKind::Paint,
+        };
         let mode = if self.editing_mask
             && !matches!(
                 tool,
@@ -1779,7 +2276,7 @@ impl CanvasState {
                 WorkspaceTool::SelectionEraser => {
                     crate::stroke_input::PaintMode::Selection { erase: true }
                 }
-                _ => crate::stroke_input::PaintMode::Layer { smudge },
+                _ => crate::stroke_input::PaintMode::Layer { kind: stroke_kind },
             }
         };
         let selection_paint = matches!(
@@ -1800,8 +2297,18 @@ impl CanvasState {
                         document.view_flip_h,
                     ) {
                         if !selection_paint {
-                            document.begin_stroke_undo();
+                            document.begin_stroke_undo_kind(demo_stroke_kind(
+                                tool,
+                                self.editing_mask,
+                            ));
                             document.prepare_stroke_stack_view(self.view_dirty_rect(document));
+                        }
+                        if matches!(tool, WorkspaceTool::CloneBrush)
+                            && !self.prepare_clone_stroke(document, (x, y))
+                        {
+                            document.end_stroke_undo();
+                            self.stroke_input_done = true;
+                            return false;
                         }
                         document.stabilizer.reset();
                         let mut traj = crate::stroke_input::TrajectoryBuilder::default();
@@ -1850,6 +2357,47 @@ impl CanvasState {
             &mut self.motion,
             self.is_drawing || self.lmb_down,
         );
+        // Stage/view-local samples → buffer pixels; keep only on-stage (no pasteboard ink).
+        let stage = document.stage_bounds();
+        let sx0 = stage.x as f32;
+        let sy0 = stage.y as f32;
+        let sx1 = (stage.x + stage.w) as f32;
+        let sy1 = (stage.y + stage.h) as f32;
+        for s in &mut samples {
+            let (bx, by) = document.view_to_buffer(s.0, s.1);
+            s.0 = bx;
+            s.1 = by;
+        }
+        samples.retain(|s| s.0 >= sx0 && s.1 >= sy0 && s.0 < sx1 && s.1 < sy1);
+
+        // Mid-stroke leave: pointer outside soft margin → drop tip so re-entry
+        // does not weld a straight chord across the gray desk.
+        if self.is_drawing {
+            if let Some(pos) = ctx
+                .input(|i| i.pointer.latest_pos())
+                .or_else(|| crate::stroke_input::primary_press_screen_pos(raw))
+            {
+                if crate::stroke_input::screen_to_doc(
+                    pos,
+                    rect,
+                    doc_w,
+                    doc_h,
+                    self.rotation_deg,
+                    document.view_flip_h,
+                    false,
+                )
+                .is_none()
+                {
+                    self.trajectory.clear_tip();
+                    document.stabilizer.reset();
+                    self.last_point = None;
+                }
+            }
+        }
+
+        // Keep tip aim live while stroking (cursor + next contact).
+        // Do NOT run hover deadzone here — paint path owns stabilized angle;
+        // feeding raw samples back in made the tip fight itself mid-stroke.
 
         // Shift+drag: snap freehand to 45°/90° from stroke origin.
         if shift {
@@ -1873,11 +2421,19 @@ impl CanvasState {
         if !samples.is_empty() {
             if !self.is_drawing {
                 if !selection_paint {
-                    document.begin_stroke_undo();
+                    document.begin_stroke_undo_kind(demo_stroke_kind(tool, self.editing_mask));
                     document.prepare_stroke_stack_view(self.view_dirty_rect(document));
                 }
                 document.stabilizer.reset();
                 self.trajectory.reset();
+            }
+            if matches!(tool, WorkspaceTool::CloneBrush) {
+                if let Some(&(x, y, _)) = samples.first() {
+                    if !self.prepare_clone_stroke(document, (x, y)) {
+                        self.stroke_input_done = true;
+                        return false;
+                    }
+                }
             }
             if crate::stroke_input::paint_samples_mode(
                 document,
@@ -1915,14 +2471,105 @@ impl CanvasState {
         painted
     }
 
+    pub fn toggle_view_flip_h(&mut self, document: &mut Document) {
+        document.view_flip_h = !document.view_flip_h;
+        // UV flip is around the canvas quad center. Reflect pan along the
+        // canvas local X axis so the same document region stays on screen.
+        let rot = egui::emath::Rot2::from_angle(self.rotation_deg.to_radians());
+        let axis = rot * Vec2::new(1.0, 0.0);
+        let d = self.pan.dot(axis);
+        self.pan -= axis * (2.0 * d);
+        document.touch();
+    }
+
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }
 
-    /// Skip nav/layer-thumb rebuild this frame (eye spam, opacity drag, etc.).
+    /// Drop cached display tiles (GPU epoch bump). Call on display-global edits
+    /// (document replace, pasteboard geometry, filter that needs full wipe) —
+    /// not per opacity/eye/gradient (those use regional overwrite).
+    pub fn invalidate_display_tiles(&mut self) {
+        self.display_tile_epoch = self.display_tile_epoch.wrapping_add(1);
+        self.clear_display_tiles_cpu();
+        self.mark_dirty();
+    }
+
+    /// Regional GPU overwrite without epoch nuke (filter preview / property edits).
+    pub fn refresh_gpu_region(
+        &mut self,
+        document: &beautiful_core::Document,
+        footprint: beautiful_core::DirtyRect,
+    ) {
+        if footprint.is_empty() {
+            self.mark_dirty();
+            return;
+        }
+        let view = self.view_dirty_rect(document);
+        let cover = view.padded(
+            beautiful_core::DISPLAY_VIEW_PAD,
+            document.width,
+            document.height,
+        );
+        self.queue_visibility_gpu_refresh(footprint, cover);
+        self.mark_dirty();
+    }
+
+    pub fn display_tile_epoch(&self) -> u64 {
+        self.display_tile_epoch
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// MCP / F12: CPU-side present flags (GPU inventory is separate).
+    pub fn tile_present_cpu_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "epoch": self.display_tile_epoch,
+            "canvas_dirty": self.dirty,
+            "cpu_tiles": self.cpu_display_tiles.len(),
+            "gpu_invalidate": !self.gpu_tile_invalidate.is_empty(),
+            "visibility_stale": !self.visibility_stale.is_empty(),
+            "tile_plate_lod": self.tile_plate_lod,
+            "mip_present": "retired",
+        })
+    }
+
+    /// True when a GPU/egui canvas texture is still cached (Warm park).
+    /// Display-tile present keeps plates in wgpu callback resources — `texture`
+    /// is retired, so warm park is "not cold-invalidated".
+    pub fn has_display_texture(&self) -> bool {
+        self.texture.is_some() || !self.gpu_invalidate
+    }
+
+    /// Force GPU resource rebuild (Cold restore / document replace).
+    pub fn request_gpu_invalidate(&mut self) {
+        self.gpu_invalidate = true;
+        self.dirty = true;
+    }
+
+    /// Warm sheet/tab / structural refresh: overwrite cover tiles in place.
+    /// Does **not** wipe to checkerboard (that caused progressive "gpu 8/N" holes).
+    pub fn request_cover_refresh(&mut self) {
+        self.gpu_force_cover_refresh = true;
+        self.dirty = true;
+    }
+
+    /// Skip nav/layer-thumb rebuild this frame (eye spam, opacity drag, stroke end).
     pub fn defer_nav_thumbs(&mut self) {
         self.nav_pending = true;
         self.thumbs_deferred = true;
+    }
+
+    /// End the stroke-release deferral so the next UI frame can rebuild thumbs
+    /// cheaply from dense (call once after docks when not drawing).
+    pub fn release_thumbs_deferral(&mut self) -> bool {
+        if !self.thumbs_deferred || self.is_drawing {
+            return false;
+        }
+        self.thumbs_deferred = false;
+        true
     }
 
     /// Force navigator rebuild (undo/redo, structure changes).
@@ -1947,6 +2594,62 @@ impl CanvasState {
             self.last_canvas_rect.size(),
             self.rotation_deg,
         )
+    }
+
+    fn pointer_over_ui(&self, screen: egui::Pos2) -> bool {
+        self.last_viewport.is_positive() && !self.last_viewport.contains(screen)
+    }
+
+    fn block_nav(&mut self, now: f64) {
+        self.nav_block_until = self.nav_block_until.max(now + 1.35);
+    }
+
+    pub(crate) fn nav_locked(&self, now: f64) -> bool {
+        self.suppress_nav_until_release || now < self.nav_block_until
+    }
+
+    /// Seed Follow-stroke direction from idle pointer motion (before first dab).
+    fn track_hover_brush_aim(
+        &self,
+        ctx: &Context,
+        document: &mut Document,
+        raw: &egui::RawInput,
+    ) {
+        if !document.brush.follow_stroke && !document.tip_pose_visible() {
+            return;
+        }
+        let doc_w = document.width as f32;
+        let doc_h = document.height as f32;
+        let rect = self.last_canvas_rect;
+        if !rect.is_positive() {
+            return;
+        }
+        let mut changed = false;
+        for ev in &raw.events {
+            let pos = match ev {
+                egui::Event::PointerMoved(p) => Some(*p),
+                // Ignore MouseMoved: pointer_latest_pos() can rewind to a stale
+                // absolute sample and yank / freeze Follow-stroke heading.
+                _ => None,
+            };
+            let Some(pos) = pos else { continue };
+            let Some((x, y)) = crate::stroke_input::screen_to_doc(
+                pos,
+                rect,
+                doc_w,
+                doc_h,
+                self.rotation_deg,
+                document.view_flip_h,
+                false,
+            ) else {
+                continue;
+            };
+            changed |= document.update_brush_aim(x, y, self.zoom.max(0.05));
+        }
+        // Only wake when the tip actually turned — not on every mouse pixel.
+        if document.tip_pose_visible() && changed {
+            ctx.request_repaint();
+        }
     }
 
     /// True while *coarser* LOD is deferred (zoom gesture still live).
@@ -2040,6 +2743,14 @@ impl CanvasState {
             return true;
         }
         if let Some(sess) = self.sel_pixel_move.take() {
+            if sess.whole_layer {
+                if sess.lifted {
+                    document.cancel_layer_nudge(sess.layer_idx, &sess.before_tiles);
+                    self.mark_dirty();
+                    return true;
+                }
+                return false;
+            }
             if sess.lifted {
                 document.end_transform_sandwich();
                 document.release_transform_plates();
@@ -2070,6 +2781,221 @@ impl CanvasState {
         document.stroke.end();
     }
 
+    fn ingest_touch_events(&mut self, raw: &egui::RawInput, now: f64) {
+        let mut saw_touch = false;
+        let mut moved_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for ev in &raw.events {
+            let egui::Event::Touch {
+                id,
+                phase,
+                pos,
+                force,
+                ..
+            } = ev
+            else {
+                continue;
+            };
+            saw_touch = true;
+            self.last_touch_event_at = now;
+            if force.is_some() {
+                self.touch_pen_ids.insert(id.0);
+            }
+            match phase {
+                egui::TouchPhase::Start => {
+                    self.suppressed_touch_ids.remove(&id.0);
+                    self.touch_active.insert(id.0);
+                    let prev = self.touch_pos.insert(id.0, *pos);
+                    let jumped = match prev {
+                        Some(p) => (p - *pos).length() > 2.0,
+                        None => true,
+                    };
+                    if jumped {
+                        moved_ids.insert(id.0);
+                    }
+                }
+                egui::TouchPhase::Move => {
+                    if self.suppressed_touch_ids.contains(&id.0) {
+                        continue;
+                    }
+                    self.touch_active.insert(id.0);
+                    let prev = self.touch_pos.insert(id.0, *pos);
+                    let jumped = match prev {
+                        Some(p) => (p - *pos).length() > 2.0,
+                        None => true,
+                    };
+                    if jumped {
+                        moved_ids.insert(id.0);
+                    }
+                }
+                egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                    self.touch_active.remove(&id.0);
+                    self.touch_pos.remove(&id.0);
+                    self.touch_pen_ids.remove(&id.0);
+                    self.suppressed_touch_ids.remove(&id.0);
+                }
+            }
+        }
+        self.touch_moved_this_frame = moved_ids.len() as u8;
+
+        // Ghost contact (missed End) sits still while the stylus/cursor moves.
+        // That pair looks like two-finger pan and the canvas follows the cursor.
+        let n = self.clustered_touch_count() as u8;
+        let real_two_finger = self.touch_cfg.two_finger_pan
+            && n >= 2
+            && self.touch_moved_this_frame >= 2
+            && self.touch_pen_ids.is_empty();
+        if real_two_finger {
+            if !self.touch_nav_lock {
+                self.touch_gesture_t0 = now;
+                self.touch_gesture_travel = 0.0;
+                self.touch_centroid_prev = None;
+            }
+            self.touch_nav_lock = true;
+            if let Some(c) = self.touch_centroid() {
+                if let Some(prev) = self.touch_centroid_prev {
+                    let d = c - prev;
+                    self.touch_pending_pan += d;
+                    self.touch_gesture_travel += d.length();
+                }
+                self.touch_centroid_prev = Some(c);
+            }
+        } else {
+            self.touch_centroid_prev = None;
+            if self.touch_moved_this_frame < 2 {
+                self.touch_nav_lock = false;
+                self.touch_pending_pan = Vec2::ZERO;
+            }
+        }
+        if n > self.touch_gesture_peak {
+            self.touch_gesture_peak = n;
+        }
+        if self.touch_active.is_empty() {
+            self.touch_nav_lock = false;
+            self.touch_pos.clear();
+            self.touch_pen_ids.clear();
+            if !saw_touch && now - self.last_touch_event_at > 0.45 {
+                self.touch_gesture_peak = 0;
+                self.touch_gesture_travel = 0.0;
+            }
+        }
+        if !saw_touch && now - self.last_touch_event_at > 0.45 && !self.touch_active.is_empty() {
+            self.touch_active.clear();
+            self.touch_pos.clear();
+            self.touch_pen_ids.clear();
+            self.touch_nav_lock = false;
+            self.touch_centroid_prev = None;
+            self.suppressed_touch_ids.clear();
+            self.touch_moved_this_frame = 0;
+        }
+    }
+
+    /// Drop leftover canvas contacts when the user taps a panel. Keep only
+    /// touches that *started* this frame (the UI tap itself).
+    fn forget_stale_touches(&mut self, raw: &egui::RawInput) {
+        let mut started = std::collections::HashSet::new();
+        for ev in &raw.events {
+            if let egui::Event::Touch {
+                id,
+                phase: egui::TouchPhase::Start,
+                ..
+            } = ev
+            {
+                started.insert(id.0);
+            }
+        }
+        for id in self.touch_active.iter().copied() {
+            if !started.contains(&id) {
+                self.suppressed_touch_ids.insert(id);
+            }
+        }
+        self.touch_active.retain(|id| started.contains(id));
+        self.touch_pos.retain(|id, _| started.contains(id));
+        self.touch_pen_ids.retain(|id| started.contains(id));
+        self.touch_pending_pan = Vec2::ZERO;
+        self.touch_centroid_prev = None;
+        self.touch_nav_lock = false;
+        self.touch_moved_this_frame = 0;
+    }
+
+    /// Two contacts within this distance are the same pointer (pen + mouse
+    /// dual-report), not two fingers.
+    const TOUCH_DUP_PX: f32 = 48.0;
+
+    fn clustered_touch_count(&self) -> usize {
+        count_touch_clusters(self.touch_pos.values().copied(), Self::TOUCH_DUP_PX)
+    }
+
+    pub(crate) fn allow_touch_nav(&self, now: f64) -> bool {
+        !self.nav_locked(now)
+            && self.clustered_touch_count() >= 2
+            && self.touch_moved_this_frame >= 2
+            && self.touch_pen_ids.is_empty()
+    }
+
+    fn touch_centroid(&self) -> Option<Pos2> {
+        if self.touch_pos.len() < 2 {
+            return None;
+        }
+        let mut x = 0.0;
+        let mut y = 0.0;
+        let mut n = 0.0;
+        for p in self.touch_pos.values() {
+            x += p.x;
+            y += p.y;
+            n += 1.0;
+        }
+        Some(Pos2::new(x / n, y / n))
+    }
+
+    pub fn take_pending_touch_pan(&mut self) -> Vec2 {
+        let d = self.touch_pending_pan;
+        self.touch_pending_pan = Vec2::ZERO;
+        d
+    }
+
+    fn touch_blocks_paint(&self, _ctx: &Context) -> bool {
+        if !self.touch_cfg.two_finger_pan && !self.touch_cfg.palm_rejection {
+            return false;
+        }
+        // Only a real two-finger gesture (see ingest). A stuck stylus id plus
+        // the moving cursor is *not* two fingers — that used to pan the canvas.
+        self.touch_nav_lock
+    }
+
+    /// Two-finger pan started while finger 1 was already painting: restore pixels
+    /// instead of committing the scribble as a real stroke.
+    pub fn abort_paint_for_navigation(&mut self, document: &mut Document) {
+        if document.history.stroke_is_open() {
+            let _ = document.undo();
+        }
+        self.is_drawing = false;
+        self.last_point = None;
+        self.trajectory.reset();
+        self.motion.reset();
+        document.stabilizer.reset();
+        document.stroke.end();
+    }
+
+    /// Two-finger tap → undo; three-finger tap → redo. Call after fingers lift.
+    pub fn take_touch_tap_command(&mut self, now: f64) -> Option<TouchTapCmd> {
+        if self.touch_active.len() != 0 || self.touch_nav_lock {
+            return None;
+        }
+        let peak = self.touch_gesture_peak;
+        let travel = self.touch_gesture_travel;
+        let dt = now - self.touch_gesture_t0;
+        self.touch_gesture_peak = 0;
+        self.touch_gesture_travel = 0.0;
+        if peak < 2 || dt > 0.35 || travel > 28.0 {
+            return None;
+        }
+        if peak >= 3 {
+            Some(TouchTapCmd::Redo)
+        } else {
+            Some(TouchTapCmd::Undo)
+        }
+    }
+
     /// Zoom by `factor`, keeping the screen point under `pivot` fixed.
     ///
     /// Uses one rotation-aware formula for both on-canvas and off-canvas cursors
@@ -2083,7 +3009,8 @@ impl CanvasState {
         _doc_h: f32,
     ) {
         let old = self.zoom.max(0.05);
-        let new = (old * factor).clamp(0.05, 64.0);
+        let cap = zoom_max_for_doc(_doc_w, _doc_h);
+        let new = (old * factor).clamp(0.05, cap);
         if (new - old).abs() < 1e-6 {
             return;
         }
@@ -2140,7 +3067,8 @@ impl CanvasState {
         doc_w: f32,
         doc_h: f32,
     ) {
-        let target = (percent / 100.0).clamp(0.05, 64.0);
+        let cap = zoom_max_for_doc(doc_w, doc_h);
+        let target = (percent / 100.0).clamp(0.05, cap);
         let old = self.zoom.max(0.05);
         if old > 0.0 {
             self.zoom_toward(target / old, pivot, view_center, doc_w, doc_h);
@@ -2165,10 +3093,21 @@ impl CanvasState {
         self.nav_thumb = None;
         self.layer_thumbs.clear();
         self.mask_thumbs.clear();
+        // Defer 100+ layer thumbs until after first viewport paint (PSD open).
+        self.nav_pending = true;
+        self.thumbs_deferred = true;
         self.texture = None;
         self.display_mip_tex = None;
         self.display_mip = beautiful_core::DisplayMip::empty();
+        self.clear_display_tiles_cpu();
         self.display_lod = 1;
+        // Drop zoom-gesture coarsen hold — otherwise LOD stays stuck at 1 after
+        // crop/resize while the user is fitted zoomed-out (or soft forever).
+        self.coarsen_hold_until = None;
+        self.wheel_accum = 0.0;
+        self.zoom_screen_pivot = None;
+        self.zoom_dir_until = None;
+        self.last_display_geom = None;
         self.is_drawing = false;
         self.last_point = None;
         self.lmb_down = false;
@@ -2178,15 +3117,26 @@ impl CanvasState {
         self.line_anchor = None;
         self.shift_constrain_origin = None;
         self.suppress_paint_until_release = false;
+        self.suppress_nav_until_release = false;
+        self.nav_block_until = 0.0;
+        self.suppressed_touch_ids.clear();
+        self.touch_active.clear();
+        self.touch_pos.clear();
+        self.touch_pen_ids.clear();
+        self.touch_moved_this_frame = 0;
+        self.touch_nav_lock = false;
+        self.touch_pending_pan = Vec2::ZERO;
         self.gpu_invalidate = true;
         self.selection_mask_texture = None;
     }
 
     /// Drop GPU/egui display caches while parked (keep zoom/pan for restore).
+    /// Heavy — use only when discarding the canvas (Cold unload).
     pub fn park_for_inactive(&mut self) {
         self.texture = None;
         self.display_mip_tex = None;
         self.display_mip = beautiful_core::DisplayMip::empty();
+        self.clear_display_tiles_cpu();
         self.display_lod = 1;
         self.nav_thumb = None;
         self.nav_thumb_rev = u64::MAX;
@@ -2199,6 +3149,24 @@ impl CanvasState {
         self.is_drawing = false;
         self.lmb_down = false;
         self.stroke_input_done = false;
+    }
+
+    /// Warm park for sheet/canvas switch — keep GPU textures + display mip so
+    /// focus returns without a full reupload.
+    pub fn park_for_inactive_light(&mut self) {
+        self.is_drawing = false;
+        self.lmb_down = false;
+        self.stroke_input_done = false;
+        self.last_point = None;
+        self.trajectory.reset();
+        self.motion.reset();
+        self.line_anchor = None;
+        self.shift_constrain_origin = None;
+        self.suppress_paint_until_release = false;
+        self.suppress_nav_until_release = false;
+        self.nav_block_until = 0.0;
+        self.suppressed_touch_ids.clear();
+        // Keep texture / display_mip / nav — no gpu_invalidate.
     }
 
     /// Fit document in the last viewport (same as chrome "Fit").
@@ -2268,21 +3236,42 @@ impl CanvasState {
         }
     }
 
-    /// Visible document area as a DirtyRect (for viewport-clipped composite).
+    /// Long side of the workspace viewport in screen pixels (for screen-aware LOD).
+    pub fn view_screen_long_px(&self) -> f32 {
+        if self.last_viewport.is_positive() {
+            self.last_viewport.width().max(self.last_viewport.height())
+        } else {
+            0.0
+        }
+    }
+
+    /// Visible document area as a DirtyRect in **buffer** space.
+    /// `full_buffer`: Crop tool — view covers the whole pasteboard, not only the stage.
     pub fn view_dirty_rect(&self, document: &Document) -> beautiful_core::DirtyRect {
-        let r = self.visible_doc_rect(
-            document.width as f32,
-            document.height as f32,
-            document.view_flip_h,
-        );
+        self.view_dirty_rect_ex(document, false)
+    }
+
+    pub fn view_dirty_rect_ex(
+        &self,
+        document: &Document,
+        full_buffer: bool,
+    ) -> beautiful_core::DirtyRect {
+        let (cw, ch, ox, oy) = if full_buffer {
+            (document.width, document.height, 0.0, 0.0)
+        } else {
+            let (cw, ch) = document.canvas_size();
+            let (ox, oy) = document.canvas_origin();
+            (cw, ch, ox, oy)
+        };
+        let r = self.visible_doc_rect(cw as f32, ch as f32, document.view_flip_h);
         if !r.is_positive() {
             return beautiful_core::DirtyRect::empty();
         }
         beautiful_core::DirtyRect::from_egui_doc_rect(
-            r.min.x,
-            r.min.y,
-            r.max.x,
-            r.max.y,
+            r.min.x + ox,
+            r.min.y + oy,
+            r.max.x + ox,
+            r.max.y + oy,
             document.width,
             document.height,
         )
@@ -2296,6 +3285,178 @@ impl CanvasState {
         let local = egui::vec2(doc_x - doc_w * 0.5, doc_y - doc_h * 0.5) * self.zoom;
         let rot = egui::emath::Rot2::from_angle(self.rotation_deg.to_radians());
         self.pan = -(rot * local);
+    }
+
+    fn clear_display_tiles_cpu(&mut self) {
+        self.cpu_display_tiles.clear();
+        self.display_tiles.clear();
+        self.prev_tile_cover = beautiful_core::DirtyRect::empty();
+        self.tile_plate_lod = 1;
+    }
+
+    fn cpu_tiles_cover_ready(
+        &self,
+        cover: beautiful_core::DirtyRect,
+        doc_w: u32,
+        doc_h: u32,
+    ) -> bool {
+        if cover.is_empty() {
+            return false;
+        }
+        beautiful_core::DisplayTileCache::tiles_in_rect(cover, doc_w, doc_h)
+            .iter()
+            .all(|r| {
+                self.cpu_display_tiles
+                    .contains_key(&beautiful_core::display_tile_key(r))
+            })
+    }
+
+    fn sync_display_tiles_cpu(
+        &mut self,
+        ctx: &Context,
+        document: &mut Document,
+        plan: &beautiful_core::DisplayFramePlan,
+        sync: &beautiful_core::SyncResult,
+        cover: beautiful_core::DirtyRect,
+    ) {
+        let plate_lod = 1u32;
+        if self.tile_plate_lod != plate_lod {
+            self.clear_display_tiles_cpu();
+            self.tile_plate_lod = plate_lod;
+        }
+        let opts = crate::canvas::coords::texture_options_from_plan(plan);
+        let doc_w = document.width;
+        let doc_h = document.height;
+
+        if sync.full_upload {
+            self.clear_display_tiles_cpu();
+            self.tile_plate_lod = plate_lod;
+        }
+
+        // Full cover refresh only for full-sync invalidation.
+        // Pan/zoom exposure goes through gap tiles; forcing full cover on every
+        // exposure created heavy CPU churn and stale-looking interactivity.
+        let cache_flush = self.cpu_display_tiles.is_empty() && !cover.is_empty();
+        let force_full_cover = sync.full_upload || cache_flush;
+
+        let dirties: Vec<beautiful_core::DirtyRect> = if !sync.partials.is_empty() {
+            sync.partials.clone()
+        } else if let Some(r) = sync.partial {
+            vec![r]
+        } else {
+            Vec::new()
+        };
+
+        let mut to_upload: Vec<beautiful_core::DirtyRect> = Vec::new();
+        if force_full_cover {
+            to_upload = beautiful_core::DisplayTileCache::tiles_in_rect(cover, doc_w, doc_h);
+        } else if !dirties.is_empty() {
+            let mut union_dirty = beautiful_core::DirtyRect::empty();
+            for dirty in &dirties {
+                union_dirty.union(*dirty);
+            }
+            self.display_tiles
+                .invalidate_rect(union_dirty, doc_w, doc_h);
+            for dirty in &dirties {
+                for tile in beautiful_core::DisplayTileCache::tiles_in_rect(
+                    dirty.intersect(cover),
+                    doc_w,
+                    doc_h,
+                ) {
+                    to_upload.push(tile);
+                }
+            }
+        } else {
+            if !self.prev_tile_cover.is_empty() {
+                to_upload.extend(beautiful_core::DisplayTileCache::gap_tiles(
+                    self.prev_tile_cover,
+                    cover,
+                    doc_w,
+                    doc_h,
+                ));
+            }
+            for tile in beautiful_core::DisplayTileCache::tiles_in_rect(cover, doc_w, doc_h) {
+                let key = beautiful_core::display_tile_key(&tile);
+                if !self.cpu_display_tiles.contains_key(&key) {
+                    to_upload.push(tile);
+                }
+            }
+        }
+
+        self.prev_tile_cover = cover;
+
+        let keep_cover = cover.padded(
+            beautiful_core::DISPLAY_TILE_DOC.saturating_mul(2),
+            doc_w,
+            doc_h,
+        );
+        let keep: std::collections::HashSet<(i32, i32)> =
+            beautiful_core::DisplayTileCache::tiles_in_rect(keep_cover, doc_w, doc_h)
+                .iter()
+                .map(|r| beautiful_core::display_tile_key(r))
+                .collect();
+        self.cpu_display_tiles.retain(|k, _| keep.contains(k));
+
+        let mut seen = std::collections::HashSet::new();
+        to_upload.retain(|t| seen.insert(beautiful_core::display_tile_key(t)));
+
+        document
+            .composite
+            .ensure_for_view(cover, beautiful_core::DISPLAY_VIEW_PAD);
+
+        let needs_compose = if self.is_drawing && !dirties.is_empty() && !force_full_cover {
+            false
+        } else {
+            dirties.is_empty() || force_full_cover
+        };
+
+        if !to_upload.is_empty() && needs_compose {
+            let mut compose = beautiful_core::DirtyRect::empty();
+            for tile in &to_upload {
+                compose.union(*tile);
+            }
+            if !compose.is_empty() {
+                document.composite.mark_dirty(compose);
+                let view = self.view_dirty_rect(document);
+                let _ = document.sync_display_view(view, beautiful_core::DISPLAY_VIEW_PAD);
+            }
+        }
+
+        const MAX_CPU_TILE_UPLOAD_STROKE: usize = 24;
+        const MAX_CPU_TILE_UPLOAD_GAP: usize = 256;
+        let budget = if self.is_drawing && !force_full_cover && !dirties.is_empty() {
+            MAX_CPU_TILE_UPLOAD_STROKE
+        } else {
+            MAX_CPU_TILE_UPLOAD_GAP
+        };
+        let batch_len = to_upload.len().min(budget);
+        let batch: Vec<_> = to_upload.drain(..batch_len).collect();
+        for tile in batch {
+            if let Some((pixels, tw, th)) =
+                beautiful_core::extract_display_tile_pixels(document, tile, plate_lod)
+            {
+                let image = ColorImage::from_rgba_unmultiplied(
+                    [tw as usize, th as usize],
+                    &pixels,
+                );
+                let key = beautiful_core::display_tile_key(&tile);
+                let name = format!("cpu_tile_{}_{}", key.0, key.1);
+                match self.cpu_display_tiles.get_mut(&key) {
+                    Some(tex) if tex.size() == [tw as usize, th as usize] => {
+                        tex.set(image, opts);
+                    }
+                    _ => {
+                        self.cpu_display_tiles.insert(
+                            key,
+                            ctx.load_texture(name, image, opts),
+                        );
+                    }
+                }
+            }
+        }
+        if !to_upload.is_empty() {
+            self.dirty = true;
+        }
     }
 
     fn ensure_texture(&mut self, ctx: &Context, document: &mut Document) {
@@ -2314,255 +3475,116 @@ impl CanvasState {
             !self.coarsen_held(),
             view_probe,
             &self.display_mip,
+            self.gpu_tex_side,
+            self.view_screen_long_px(),
+            self.is_drawing,
         );
-        let lod = plan.lod;
-        let lod_changed = plan.lod_changed;
-        if lod_changed {
-            crate::action_log::log(
-                "lod",
-                &format!(
-                    "cpu zoom={:.4} doc={}x{} lod {} -> {} (cap={})",
-                    self.zoom,
-                    document.width,
-                    document.height,
-                    plan.raw_lod,
-                    lod,
-                    beautiful_core::MAX_GPU_TEX_SIDE
-                ),
-            );
-        }
-        let filter_changed =
-            texture_filter_bucket(self.zoom) != texture_filter_bucket(self.filter_zoom);
-
-        // Hot path: idle hover / cursor move — zero texture work.
-        let mip_ready = plan.mip_covers_view
-            && (self.display_lod <= 1 || self.display_mip_tex.is_some());
-        if !self.dirty && !filter_changed && !lod_changed && self.texture.is_some() && mip_ready {
+        let cover = plan.cover;
+        let tiles_ready = self.cpu_tiles_cover_ready(cover, document.width, document.height);
+        let filter_changed = self.present_linear_filter != plan.linear_filter;
+        if !self.dirty
+            && !filter_changed
+            && tiles_ready
+            && !document.composite.has_pending_work()
+        {
             return;
         }
 
-        let opts = canvas_texture_options(self.zoom);
+        self.present_linear_filter = plan.linear_filter;
         self.filter_zoom = self.zoom;
-        // LOD committed after present update below (same rule as GPU path).
-
-        if !self.dirty && !lod_changed {
-            // Only filter mode changed on existing full-res tex.
-            if lod <= 1 {
-                if let Some(pixels) = document.composite.dense_pixels() {
-                    if let Some(tex) = &mut self.texture {
-                        let image = ColorImage::from_rgba_unmultiplied(
-                            [document.width as usize, document.height as usize],
-                            pixels,
-                        );
-                        tex.set(image, opts);
-                    }
-                }
-            }
-            self.display_lod = lod;
-            return;
-        }
 
         let view = self.view_dirty_rect(document);
-        let cover = plan.cover;
         document.expose_view(view);
-        if lod_changed && lod <= 1 {
-            document.composite.invalidate_rect(cover);
-            document
-                .composite
-                .ensure_for_view(view, beautiful_core::DISPLAY_VIEW_PAD);
-        }
-        let sync = if beautiful_core::skip_projection_for_mip(
-            lod,
-            lod_changed,
-            false,
-            document.composite.has_pending_work(),
-        ) && !self.dirty
-        {
-            beautiful_core::SyncResult {
-                full_upload: false,
-                partial: None,
-                partials: Vec::new(),
-            }
-        } else {
-            // Soft/Hard above: omit from underlay only when Path B can restore Soft∪float.
-            let want_omit = self.should_omit_blend_above_for_underlay(document);
-            self.prepare_underlay_omit_transition(document, want_omit);
-            document.transform_omit_blend_above = want_omit;
-            document.sync_display_view(view, beautiful_core::DISPLAY_VIEW_PAD)
-        };
+        let want_omit = self.should_omit_blend_above_for_underlay(document);
+        self.prepare_underlay_omit_transition(document, want_omit);
+        document.transform_omit_blend_above = want_omit;
+        let sync = document.sync_display_view(view, beautiful_core::DISPLAY_VIEW_PAD);
         document.transform_omit_blend_above = false;
-        let name = "canvas_composite";
-        let roi = document.composite.is_roi();
 
-        if lod <= 1 {
-            // Full-resolution display path (zoom ≳ 75%).
-            if !roi && !document.composite.dense_pixels_ready() {
-                document
-                    .composite
-                    .ensure_for_view(view, beautiful_core::DISPLAY_VIEW_PAD);
-                let want_omit = self.should_omit_blend_above_for_underlay(document);
-                self.prepare_underlay_omit_transition(document, want_omit);
-                document.transform_omit_blend_above = want_omit;
-                let _ = document.sync_display_view(view, beautiful_core::DISPLAY_VIEW_PAD);
-                document.transform_omit_blend_above = false;
-            }
-
-            let upload_parts = |tex: &mut egui::TextureHandle, parts: &[DirtyRect]| {
-                for rect in parts {
-                    let w = rect.width() as usize;
-                    let h = rect.height() as usize;
-                    if w > 0 && h > 0 {
-                        let pixels = document.composite.extract(*rect);
-                        let image = ColorImage::from_rgba_unmultiplied([w, h], &pixels);
-                        tex.set_partial([rect.x0 as usize, rect.y0 as usize], image, opts);
-                    }
-                }
-            };
-
-            let seed_full = |this: &mut Self, ctx: &egui::Context| {
-                if let Some(pixels) = document.composite.dense_pixels() {
-                    let image = ColorImage::from_rgba_unmultiplied(
-                        [document.width as usize, document.height as usize],
-                        pixels,
-                    );
-                    match &mut this.texture {
-                        Some(tex) => tex.set(image, opts),
-                        None => this.texture = Some(ctx.load_texture(name, image, opts)),
-                    }
-                } else {
-                    let w = document.width as usize;
-                    let h = document.height as usize;
-                    let image = ColorImage::from_rgba_unmultiplied(
-                        [w, h],
-                        &vec![0u8; w.saturating_mul(h).saturating_mul(4)],
-                    );
-                    match &mut this.texture {
-                        Some(tex) => tex.set(image, opts),
-                        None => this.texture = Some(ctx.load_texture(name, image, opts)),
-                    }
-                }
-            };
-
-            if (sync.full_upload || self.texture.is_none() || lod_changed) && !roi {
-                seed_full(self, ctx);
-                let _ = document.composite.take_gpu_dirty();
-            } else if sync.full_upload || self.texture.is_none() || lod_changed {
-                seed_full(self, ctx);
-                let parts: Vec<DirtyRect> = if !sync.partials.is_empty() {
-                    sync.partials.clone()
-                } else if let Some(r) = sync.partial {
-                    vec![r]
-                } else if let Some(r) = document.composite.roi_rect() {
-                    vec![r]
-                } else {
-                    Vec::new()
-                };
-                if let Some(tex) = &mut self.texture {
-                    upload_parts(tex, &parts);
-                }
-                let _ = document.composite.take_gpu_dirty();
-            } else if !sync.partials.is_empty() {
-                let tex_ok = self.texture.as_ref().is_some_and(|t| {
-                    t.size() == [document.width as usize, document.height as usize]
-                });
-                if !tex_ok {
-                    seed_full(self, ctx);
-                }
-                if let Some(tex) = &mut self.texture {
-                    upload_parts(tex, &sync.partials);
-                }
-                let _ = document.composite.take_gpu_dirty();
-            } else if let Some(rect) = sync.partial {
-                let tex_ok = self.texture.as_ref().is_some_and(|t| {
-                    t.size() == [document.width as usize, document.height as usize]
-                });
-                if !tex_ok {
-                    seed_full(self, ctx);
-                }
-                if let Some(tex) = &mut self.texture {
-                    upload_parts(tex, &[rect]);
-                }
-                let _ = document.composite.take_gpu_dirty();
-            }
-        } else {
-            // Zoomed-out: shared hybrid mip plan (same as canvas_gpu).
-            let mip_opts = TextureOptions {
-                magnification: TextureFilter::Linear,
-                minification: TextureFilter::Linear,
-                ..TextureOptions::LINEAR
-            };
-            let mip_ok = beautiful_core::mip_size_matches(
-                &self.display_mip,
-                document.width,
-                document.height,
-                lod,
-            );
-            let present_ok = self.display_mip_tex.is_some() && mip_ok;
-            let covers = self.display_mip.covers_doc(cover);
-            let action = beautiful_core::plan_mip_action(
-                lod_changed,
-                mip_ok,
-                present_ok,
-                false,
-                &sync,
-                covers,
-            );
-            let _ = beautiful_core::apply_mip_action(
-                &mut self.display_mip,
-                document,
-                lod,
-                cover,
-                action,
-            );
-            let image = ColorImage::from_rgba_unmultiplied(
-                [
-                    self.display_mip.width as usize,
-                    self.display_mip.height as usize,
-                ],
-                &self.display_mip.pixels,
-            );
-            match &mut self.display_mip_tex {
-                Some(tex) => {
-                    if tex.size()
-                        != [
-                            self.display_mip.width as usize,
-                            self.display_mip.height as usize,
-                        ]
-                    {
-                        *tex = ctx.load_texture("canvas_mip", image, mip_opts);
-                    } else {
-                        tex.set(image, mip_opts);
-                    }
-                }
-                None => {
-                    self.display_mip_tex = Some(ctx.load_texture("canvas_mip", image, mip_opts));
-                }
-            }
+        self.sync_display_tiles_cpu(ctx, document, &plan, &sync, cover);
+        self.display_lod = 1;
+        self.tile_plate_lod = 1;
+        if sync.full_upload || sync.partial.is_some() || !sync.partials.is_empty() {
             let _ = document.composite.take_gpu_dirty();
-            if self.texture.is_none() {
-                if let Some(pixels) = document.composite.dense_pixels() {
-                    let image = ColorImage::from_rgba_unmultiplied(
-                        [document.width as usize, document.height as usize],
-                        pixels,
-                    );
-                    self.texture = Some(ctx.load_texture(name, image, opts));
-                }
-            }
         }
-
-        self.display_lod = lod.max(1);
         self.dirty = false;
     }
 
-    /// Texture shown on the main canvas (mip when zoomed out).
+    /// Texture shown on the main canvas (mip when zoomed out; None when display tiles paint).
     pub fn display_texture_id(&self) -> Option<egui::TextureId> {
         if self.display_lod > 1 {
-            self.display_mip_tex
-                .as_ref()
-                .map(|t| t.id())
-                .or_else(|| self.texture.as_ref().map(|t| t.id()))
+            // Never fall back to full-res plate at lod>1 — wrong texel density
+            // (soapy / "LOD broken") after crop until mip tex exists.
+            self.display_mip_tex.as_ref().map(|t| t.id())
         } else {
             self.texture.as_ref().map(|t| t.id())
+        }
+    }
+
+    pub fn paint_cpu_display_tiles(
+        &self,
+        painter: &egui::Painter,
+        canvas_center: egui::Pos2,
+        display_w: f32,
+        display_h: f32,
+        rotation_deg: f32,
+        flip_h: bool,
+        document: &Document,
+        cover: beautiful_core::DirtyRect,
+    ) {
+        self.paint_cpu_display_tiles_ex(
+            painter,
+            canvas_center,
+            display_w,
+            display_h,
+            rotation_deg,
+            flip_h,
+            document,
+            cover,
+            false,
+        )
+    }
+
+    pub fn paint_cpu_display_tiles_ex(
+        &self,
+        painter: &egui::Painter,
+        canvas_center: egui::Pos2,
+        display_w: f32,
+        display_h: f32,
+        rotation_deg: f32,
+        flip_h: bool,
+        document: &Document,
+        cover: beautiful_core::DirtyRect,
+        full_buffer: bool,
+    ) {
+        let (stage_ox, stage_oy, stage_w, stage_h) = if full_buffer {
+            (0.0, 0.0, document.width as f32, document.height as f32)
+        } else {
+            let (ox, oy) = document.canvas_origin();
+            let (w, h) = document.canvas_size();
+            (ox, oy, w as f32, h as f32)
+        };
+        for tile in beautiful_core::DisplayTileCache::tiles_in_rect(
+            cover,
+            document.width,
+            document.height,
+        ) {
+            let key = beautiful_core::display_tile_key(&tile);
+            if let Some(tex) = self.cpu_display_tiles.get(&key) {
+                crate::canvas::coords::paint_rotated_doc_tile(
+                    painter,
+                    tex.id(),
+                    canvas_center,
+                    egui::vec2(display_w, display_h),
+                    rotation_deg,
+                    flip_h,
+                    stage_ox,
+                    stage_oy,
+                    stage_w,
+                    stage_h,
+                    tile,
+                );
+            }
         }
     }
 
@@ -2577,13 +3599,17 @@ impl CanvasState {
         {
             return self.nav_thumb.as_ref().map(|t| t.id());
         }
-        // Defer only while the gesture is mid-flight — never while nav_pending after undo.
-        if !self.nav_pending
+        // Defer while painting / stroke-release hitch window. `nav_pending` alone
+        // must NOT force a same-frame rebuild — that walked every layer inside
+        // pipe.ui (~99% UI / 30% CPU on LMB up). `invalidate_nav` clears deferral.
+        if self.nav_thumb.is_some()
             && (self.is_drawing
                 || self.thumbs_deferred
                 || self.opacity_dragging
                 || self.gradient_editing()
                 || self.transform_editing()
+                || self.text_edit.xform_dragging()
+                || document.text_editing.is_some()
                 || kruler_editing(self)
                 || self.sel_pixel_move.is_some())
         {
@@ -2591,9 +3617,11 @@ impl CanvasState {
         }
         crate::perf_scope!(crate::perf::Category::Nav, "nav.ensure_thumb");
         const MAX_EDGE: u32 = 384;
-        // After undo/structure change, dense/mip may still be dirty/stale until canvas
-        // sync — rebuild from layers so the navigator matches the restored pixels.
-        let composite_stale = self.nav_pending || document.composite.has_cpu_dirty();
+        let stage = document.stage_dirty_rect();
+        let (stage_w, stage_h) = document.canvas_size();
+        // Only real CPU dirty means dense/mip are unusable. `nav_pending` just
+        // means "please refresh" — after a stroke dense is already warm.
+        let composite_stale = document.composite.has_cpu_dirty();
         let (w, h, pixels) = if !composite_stale
             && self.display_lod > 1
             && self.display_mip.width > 0
@@ -2601,45 +3629,107 @@ impl CanvasState {
             && !self.display_mip.pixels.is_empty()
         {
             // Scale already-composited mip — cheap after eye/opacity, no layer walk.
-            beautiful_core::build_navigator_thumb(
-                &self.display_mip.pixels,
-                self.display_mip.width,
-                self.display_mip.height,
-                MAX_EDGE,
-            )
-        } else if !composite_stale {
-            if let Some(dense) = document.composite.dense_pixels() {
-                beautiful_core::build_navigator_thumb_box(
-                    dense,
-                    document.width,
-                    document.height,
+            // Mip covers full buffer; box-crop to stage when pasteboard exists.
+            if document.has_pasteboard() {
+                let (ox, oy) = document.canvas_origin();
+                let factor = self.display_lod.max(1);
+                let mx0 = (ox as u32 / factor).min(self.display_mip.width.saturating_sub(1));
+                let my0 = (oy as u32 / factor).min(self.display_mip.height.saturating_sub(1));
+                let mw = ((stage_w + factor - 1) / factor)
+                    .min(self.display_mip.width.saturating_sub(mx0))
+                    .max(1);
+                let mh = ((stage_h + factor - 1) / factor)
+                    .min(self.display_mip.height.saturating_sub(my0))
+                    .max(1);
+                let mut cropped =
+                    vec![0u8; (mw as usize).saturating_mul(mh as usize).saturating_mul(4)];
+                let src_stride = self.display_mip.width as usize * 4;
+                for y in 0..mh as usize {
+                    let src = ((my0 as usize + y) * src_stride) + (mx0 as usize * 4);
+                    let dst = y * (mw as usize) * 4;
+                    let n = (mw as usize) * 4;
+                    if src + n <= self.display_mip.pixels.len() && dst + n <= cropped.len() {
+                        cropped[dst..dst + n]
+                            .copy_from_slice(&self.display_mip.pixels[src..src + n]);
+                    }
+                }
+                beautiful_core::build_navigator_thumb(&cropped, mw, mh, MAX_EDGE)
+            } else {
+                beautiful_core::build_navigator_thumb(
+                    &self.display_mip.pixels,
+                    self.display_mip.width,
+                    self.display_mip.height,
                     MAX_EDGE,
                 )
+            }
+        } else if !composite_stale {
+            if let Some(dense) = document.composite.dense_pixels() {
+                if document.has_pasteboard() {
+                    let (ox, oy) = document.canvas_origin();
+                    let ox = ox as u32;
+                    let oy = oy as u32;
+                    let mut packed =
+                        vec![0u8; (stage_w as usize).saturating_mul(stage_h as usize).saturating_mul(4)];
+                    let src_stride = document.width as usize * 4;
+                    for y in 0..stage_h as usize {
+                        let src = ((oy as usize + y) * src_stride) + (ox as usize * 4);
+                        let dst = y * (stage_w as usize) * 4;
+                        let n = (stage_w as usize) * 4;
+                        if src + n <= dense.len() && dst + n <= packed.len() {
+                            packed[dst..dst + n].copy_from_slice(&dense[src..src + n]);
+                        }
+                    }
+                    beautiful_core::build_navigator_thumb_box(
+                        &packed,
+                        stage_w,
+                        stage_h,
+                        MAX_EDGE,
+                    )
+                } else {
+                    beautiful_core::build_navigator_thumb_box(
+                        dense,
+                        document.width,
+                        document.height,
+                        MAX_EDGE,
+                    )
+                }
             } else {
-                beautiful_core::build_navigator_thumb_from_layers(
+                beautiful_core::build_navigator_thumb_from_layers_roi(
                     document.background,
                     &document.layers,
                     document.floating_blit(),
                     document.width,
                     document.height,
+                    stage,
                     MAX_EDGE,
                 )
             }
         } else {
-            beautiful_core::build_navigator_thumb_from_layers(
+            beautiful_core::build_navigator_thumb_from_layers_roi(
                 document.background,
                 &document.layers,
                 document.floating_blit(),
                 document.width,
                 document.height,
+                stage,
                 MAX_EDGE,
             )
         };
         let image = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
+        let pixel_art = document.width.max(document.height) <= 512;
+        let filter = if pixel_art {
+            TextureFilter::Nearest
+        } else {
+            TextureFilter::Linear
+        };
         let opts = TextureOptions {
-            magnification: TextureFilter::Linear,
-            minification: TextureFilter::Linear,
-            ..TextureOptions::LINEAR
+            magnification: filter,
+            minification: filter,
+            ..if pixel_art {
+                TextureOptions::NEAREST
+            } else {
+                TextureOptions::LINEAR
+            }
         };
         match &mut self.nav_thumb {
             Some(tex) => tex.set(image, opts),
@@ -2667,18 +3757,31 @@ impl CanvasState {
         let rev = document.content_revision;
         let pending = self.layer_thumb_pending == Some(layer_idx);
         if let Some((cached_rev, tex)) = self.layer_thumbs.get(&layer_idx) {
-            if self.is_drawing || self.thumbs_deferred || self.gradient_editing() {
+            if self.is_drawing
+                || self.thumbs_deferred
+                || self.gradient_editing()
+                || self.text_edit.xform_dragging()
+                || document.text_editing.is_some()
+            {
                 return Some(tex.id());
             }
             if *cached_rev == rev && !pending {
                 return Some(tex.id());
             }
-        } else if self.is_drawing || self.thumbs_deferred || self.gradient_editing() {
+        } else if self.is_drawing
+            || self.thumbs_deferred
+            || self.gradient_editing()
+            || self.text_edit.xform_dragging()
+            || document.text_editing.is_some()
+        {
             return None;
         }
 
-        let (w, h, pixels) =
-            beautiful_core::build_navigator_thumb_from_tiles(&layer.tiles, max_edge.max(32));
+        let (w, h, pixels) = beautiful_core::build_navigator_thumb_from_tiles_roi(
+            &layer.tiles,
+            document.stage_dirty_rect(),
+            max_edge.max(32),
+        );
         let image = ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels);
         let opts = TextureOptions {
             magnification: TextureFilter::Linear,
@@ -2727,13 +3830,23 @@ impl CanvasState {
         }
         let rev = document.content_revision;
         if let Some((cached_rev, tex)) = self.mask_thumbs.get(&layer_idx) {
-            if self.is_drawing || self.thumbs_deferred || self.gradient_editing() {
+            if self.is_drawing
+                || self.thumbs_deferred
+                || self.gradient_editing()
+                || self.text_edit.xform_dragging()
+                || document.text_editing.is_some()
+            {
                 return Some(tex.id());
             }
             if *cached_rev == rev {
                 return Some(tex.id());
             }
-        } else if self.is_drawing || self.thumbs_deferred || self.gradient_editing() {
+        } else if self.is_drawing
+            || self.thumbs_deferred
+            || self.gradient_editing()
+            || self.text_edit.xform_dragging()
+            || document.text_editing.is_some()
+        {
             return None;
         }
 
@@ -2808,22 +3921,36 @@ impl CanvasState {
         self.display_lod.max(1)
     }
 
+    /// Drop throttled opacity state when the active layer changes so a layer
+    /// click cannot flush a stale drag into `touch_active_layer_display`.
+    pub fn clear_opacity_drag_if_layer(&mut self, layer_idx: usize) {
+        if self.opacity_layer != Some(layer_idx) {
+            self.opacity_layer = Some(layer_idx);
+            self.opacity_dragging = false;
+            self.opacity_touch_pending = false;
+        }
+    }
+
     /// Throttled regional invalidate for opacity slider.
     /// Live preview ~10 fps while dragging; full sync + nav on release.
     pub fn touch_opacity_throttled(&mut self, document: &mut Document, now: f64, force: bool) {
         const MIN_DT: f64 = 1.0 / 10.0;
+        self.opacity_layer = Some(document.active_layer);
         if force {
             self.opacity_dragging = false;
             self.opacity_touch_pending = false;
             document.touch_active_layer_display();
+            self.note_display_footprint_stale(document);
             self.opacity_touch_at = now;
             self.nav_pending = true;
+            // Sandwich returns gpu_dirty — keep display tiles; epoch wipe was the lag.
             self.mark_dirty();
             return;
         }
         self.opacity_dragging = true;
         if now - self.opacity_touch_at >= MIN_DT {
             document.touch_active_layer_display();
+            self.note_display_footprint_stale(document);
             self.opacity_touch_at = now;
             self.opacity_touch_pending = false;
             self.mark_dirty();
@@ -2831,6 +3958,79 @@ impl CanvasState {
             // Keep latest opacity in the document; apply on next throttle tick / release.
             self.opacity_touch_pending = true;
         }
+    }
+
+    /// Eye/opacity/gradient: overwrite on-screen now. Off-cover waits until that
+    /// region newly enters cover (pan / zoom-out ring) — never the whole view.
+    pub fn queue_visibility_gpu_refresh(
+        &mut self,
+        footprint: beautiful_core::DirtyRect,
+        cover: beautiful_core::DirtyRect,
+    ) {
+        if footprint.is_empty() {
+            return;
+        }
+        self.visibility_stale.union(footprint);
+        // On-screen pixels are written by sandwich/sync extract. Forcing
+        // gpu_tile_invalidate here ran a second full-stack compose of every
+        // 512 plate (eye CPU scaled with occupancy on screen). Off-cover stays
+        // in visibility_stale for pan / zoom-out.
+        if !cover.is_empty() {
+            self.visibility_refreshed.union(cover);
+        }
+        self.clear_visibility_stale_if_done();
+    }
+
+    /// Queue GPU overwrite only for stale pixels that just entered `cover`.
+    /// Zoom-in shrinks cover — no work. Zoom-out / pan adds a ring, not the view.
+    pub fn queue_newly_visible_stale(&mut self, cover: beautiful_core::DirtyRect) {
+        if self.visibility_stale.is_empty() || cover.is_empty() {
+            return;
+        }
+        if self.visibility_refreshed.contains_rect(cover) {
+            return;
+        }
+        if self.visibility_refreshed.is_empty() {
+            let hit = self.visibility_stale.intersect(cover);
+            if !hit.is_empty() {
+                self.gpu_tile_invalidate.union(hit);
+            }
+        } else {
+            for piece in cover.subtract(self.visibility_refreshed) {
+                if piece.is_empty() {
+                    continue;
+                }
+                let hit = piece.intersect(self.visibility_stale);
+                if !hit.is_empty() {
+                    self.gpu_tile_invalidate.union(hit);
+                }
+            }
+        }
+        self.visibility_refreshed.union(cover);
+        self.clear_visibility_stale_if_done();
+    }
+
+    fn clear_visibility_stale_if_done(&mut self) {
+        if self.visibility_stale.is_empty() {
+            return;
+        }
+        if self.visibility_refreshed.contains_rect(self.visibility_stale) {
+            self.visibility_stale = beautiful_core::DirtyRect::empty();
+            self.visibility_refreshed = beautiful_core::DirtyRect::empty();
+        }
+    }
+
+    fn note_display_footprint_stale(&mut self, document: &Document) {
+        let mut footprint = DirtyRect::empty();
+        if !document.composite.dirty.is_empty() {
+            footprint.union(document.composite.dirty);
+        }
+        for r in &document.composite.dirty_parts {
+            footprint.union(*r);
+        }
+        let view = self.view_dirty_rect(document);
+        let cover = view.padded(beautiful_core::DISPLAY_VIEW_PAD, document.width, document.height);
+        self.queue_visibility_gpu_refresh(footprint, cover);
     }
 
     /// Flush a throttled opacity change if the drag is still held past MIN_DT.
@@ -2842,9 +4042,56 @@ impl CanvasState {
         if now - self.opacity_touch_at >= MIN_DT {
             self.opacity_touch_pending = false;
             document.touch_active_layer_display();
+            self.note_display_footprint_stale(document);
             self.opacity_touch_at = now;
             self.mark_dirty();
         }
+    }
+}
+
+/// Snap pending composite dirty to 512 display plates so sync fills whole tiles
+/// once and GPU can extract without restacking.
+fn expand_pending_display_tiles(document: &mut Document) {
+    let dw = document.width;
+    let dh = document.height;
+    let mut rects: Vec<DirtyRect> = Vec::new();
+    if !document.composite.dirty.is_empty() {
+        rects.push(document.composite.dirty);
+    }
+    rects.extend(document.composite.dirty_parts.iter().copied());
+    if rects.is_empty() {
+        return;
+    }
+    let snapped = beautiful_core::snap_rects_to_display_tiles(rects, dw, dh);
+    document.composite.dirty = DirtyRect::empty();
+    document.composite.dirty_parts.clear();
+    if !snapped.is_empty() {
+        document.composite.mark_dirty_parts(snapped);
+    }
+}
+
+fn count_touch_clusters(positions: impl IntoIterator<Item = Pos2>, dup_px: f32) -> usize {
+    let mut pts: Vec<Pos2> = positions.into_iter().collect();
+    let thresh2 = dup_px * dup_px;
+    let mut n = 0;
+    while let Some(p) = pts.pop() {
+        n += 1;
+        pts.retain(|q| (*q - p).length_sq() > thresh2);
+    }
+    n
+}
+
+#[cfg(test)]
+mod stylus_nav_tests {
+    use super::*;
+
+    #[test]
+    fn coincident_touches_count_as_one() {
+        let a = Pos2::new(10.0, 10.0);
+        let b = Pos2::new(12.0, 11.0);
+        assert_eq!(count_touch_clusters([a, b], 24.0), 1);
+        let c = Pos2::new(80.0, 10.0);
+        assert_eq!(count_touch_clusters([a, c], 24.0), 2);
     }
 }
 
@@ -2852,11 +4099,13 @@ mod coords;
 mod overlays;
 mod selection_input;
 mod transform_free;
+mod transform_live;
 mod kruler;
 mod transform_warp;
-/// LOD: bilinear when zoomed out (hides pixel grid), nearest when zoomed in.
+mod gamepad_paint;
 mod types;
 mod view;
+/// LOD: bilinear when zoomed out (hides pixel grid), nearest when zoomed in.
 
 pub(crate) use coords::*;
 pub(crate) use overlays::*;

@@ -110,7 +110,7 @@ pub fn show(ctx: &egui::Context, open: &mut bool) {
                             if lod_on { "LOD / mip ON" } else { "LOD / mip" },
                         )
                         .on_hover_text(
-                            "cyan=cover ok · red=gap · amber=view · thin amber=pad · yellow=mip texels",
+                            "debug overlay only — present is display tiles (mip-as-present retired)",
                         )
                         .clicked()
                     {
@@ -269,6 +269,48 @@ pub fn show(ctx: &egui::Context, open: &mut bool) {
                             ui.end_row();
                         }
                     });
+
+                ui.add_space(6.0);
+                ui.heading("Display tiles");
+                ui.label(
+                    egui::RichText::new("present = tiles · mip-as-present retired")
+                        .small()
+                        .weak(),
+                );
+                if snap.present.is_null() {
+                    ui.weak("(no GPU inventory this frame)");
+                } else {
+                    let t = &snap.present;
+                    let ready = t.get("cover_ready").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let missing = t.get("missing_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let stale = t
+                        .get("stale_content_rev")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let rem = t.get("remainder").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let on_gpu = t.get("on_gpu").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let expected = t.get("cover_expected").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let cache = t.get("cache_total").and_then(|v| v.as_u64()).unwrap_or(on_gpu);
+                    let epoch_bad = t
+                        .get("epoch_mismatch")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let color = if ready {
+                        egui::Color32::from_rgb(120, 200, 120)
+                    } else if missing > 0 || stale > 0 || epoch_bad {
+                        egui::Color32::from_rgb(255, 140, 60)
+                    } else {
+                        egui::Color32::from_rgb(230, 200, 80)
+                    };
+                    ui.colored_label(
+                        color,
+                        format!(
+                            "{} · gpu {on_gpu}/{expected} · cache {cache} · miss {missing} · stale_rev {stale} · leftover {rem}{}",
+                            if ready { "cover ready" } else { "cover stale" },
+                            if epoch_bad { " · epoch mismatch" } else { "" },
+                        ),
+                    );
+                }
 
                 ui.add_space(4.0);
                 ui.heading("Counters");

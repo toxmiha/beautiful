@@ -5,24 +5,32 @@ pub const ZOOM_STEP: f32 = 1.18;
 /// egui `line_scroll_speed` points per mouse-wheel notch (~40), not Win32 WHEEL_DELTA 120.
 pub const WHEEL_NOTCH_POINTS: f32 = 40.0;
 
-pub(crate) fn canvas_texture_options(zoom: f32) -> TextureOptions {
-    match texture_filter_bucket(zoom) {
-        0 => TextureOptions {
-            magnification: TextureFilter::Linear,
-            minification: TextureFilter::Linear,
-            ..TextureOptions::LINEAR
-        },
-        1 => TextureOptions {
+pub(crate) fn texture_options_linear(linear: bool) -> TextureOptions {
+    if linear {
+        TextureOptions::LINEAR
+    } else {
+        TextureOptions {
             magnification: TextureFilter::Nearest,
             minification: TextureFilter::Linear,
             ..TextureOptions::NEAREST
-        },
+        }
+    }
+}
+
+pub(crate) fn texture_options_from_plan(plan: &beautiful_core::DisplayFramePlan) -> TextureOptions {
+    texture_options_linear(plan.linear_filter)
+}
+
+pub(crate) fn canvas_texture_options(zoom: f32, display_lod: u32) -> TextureOptions {
+    match texture_filter_bucket(zoom, display_lod) {
+        0 => TextureOptions::LINEAR,
+        1 => texture_options_linear(false),
         _ => TextureOptions::NEAREST,
     }
 }
 
-pub(crate) fn texture_filter_bucket(zoom: f32) -> u8 {
-    if zoom < 0.999 {
+pub(crate) fn texture_filter_bucket(zoom: f32, display_lod: u32) -> u8 {
+    if zoom < 0.999 || display_lod > 1 {
         0
     } else if zoom < 2.0 {
         1
@@ -76,6 +84,47 @@ pub(crate) fn screen_to_doc_space(
     crate::stroke_input::screen_to_doc_unbounded(pos, rect, doc_w, doc_h, rotation_deg, flip_h)
 }
 
+/// Screen → buffer pixels using the logical canvas (stage) size, then stage origin.
+pub(crate) fn screen_to_buffer(
+    document: &Document,
+    pos: egui::Pos2,
+    rect: egui::Rect,
+    rotation_deg: f32,
+    unbounded: bool,
+) -> Option<(f32, f32)> {
+    let (cw, ch) = document.canvas_size();
+    let flip_h = document.view_flip_h;
+    let mapped = if unbounded {
+        screen_to_doc_space(pos, rect, cw as f32, ch as f32, rotation_deg, flip_h)?
+    } else {
+        screen_to_canvas(pos, rect, cw as f32, ch as f32, rotation_deg, flip_h)?
+    };
+    Some(document.view_to_buffer(mapped.0, mapped.1))
+}
+
+/// Buffer point → screen via logical canvas (stage) mapping.
+pub(crate) fn buffer_to_screen(
+    document: &Document,
+    center: egui::Pos2,
+    display_size: Vec2,
+    rotation_deg: f32,
+    bx: f32,
+    by: f32,
+) -> egui::Pos2 {
+    let (vx, vy) = document.buffer_to_view(bx, by);
+    let (cw, ch) = document.canvas_size();
+    doc_to_screen(
+        center,
+        display_size,
+        rotation_deg,
+        vx,
+        vy,
+        cw as f32,
+        ch as f32,
+        document.view_flip_h,
+    )
+}
+
 pub(crate) fn doc_to_screen(
     center: egui::Pos2,
     display_size: Vec2,
@@ -95,6 +144,51 @@ pub(crate) fn doc_to_screen(
     );
     let rot = egui::emath::Rot2::from_angle(rotation_deg.to_radians());
     center + rot * local
+}
+
+pub(crate) fn paint_rotated_doc_tile(
+    painter: &egui::Painter,
+    texture: egui::TextureId,
+    canvas_center: egui::Pos2,
+    canvas_size: Vec2,
+    rotation_deg: f32,
+    flip_h: bool,
+    stage_ox: f32,
+    stage_oy: f32,
+    stage_w: f32,
+    stage_h: f32,
+    tile_doc: beautiful_core::DirtyRect,
+) {
+    let rot = egui::emath::Rot2::from_angle(rotation_deg.to_radians());
+    let half = canvas_size * 0.5;
+    let doc_corners = [
+        (tile_doc.x0 as f32, tile_doc.y0 as f32),
+        (tile_doc.x1 as f32, tile_doc.y0 as f32),
+        (tile_doc.x1 as f32, tile_doc.y1 as f32),
+        (tile_doc.x0 as f32, tile_doc.y1 as f32),
+    ];
+    // Mirror via corner positions (same as GPU tiles); keep UV identity.
+    let uv = [
+        egui::pos2(0.0, 0.0),
+        egui::pos2(1.0, 0.0),
+        egui::pos2(1.0, 1.0),
+        egui::pos2(0.0, 1.0),
+    ];
+    let mut mesh = egui::Mesh::with_texture(texture);
+    for (i, (doc_x, doc_y)) in doc_corners.iter().enumerate() {
+        let mut vx = (doc_x - stage_ox) / stage_w.max(1e-4) * canvas_size.x;
+        let vy = (doc_y - stage_oy) / stage_h.max(1e-4) * canvas_size.y;
+        if flip_h {
+            vx = canvas_size.x - vx;
+        }
+        let local = egui::vec2(vx - half.x, vy - half.y);
+        mesh.colored_vertex(canvas_center + rot * local, egui::Color32::WHITE);
+        let last = mesh.vertices.len() - 1;
+        mesh.vertices[last].uv = uv[i];
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 pub(crate) fn paint_rotated_image(

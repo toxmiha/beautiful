@@ -1,25 +1,20 @@
-//! Discord Rich Presence — background IPC, non-blocking for the UI thread.
+//! Discord Rich Presence — local IPC only (named pipe / Discord desktop).
 //!
-//! Application ID is baked into the binary (like game RPC). End users never type it.
-//! Client Secret is not used for Rich Presence — never store or log it.
+//! No canvas thumbnails, no HTTP, no curl, no third-party hosts.
+//! Application ID is baked in. Client Secret is never used.
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use discord_rich_presence::{activity, DiscordIpc, DiscordIpcClient};
 
 /// Official Beautiful Discord Application ID (public — not a secret).
-/// Client Secret is never used for Rich Presence and must not appear in the app or logs.
 pub const BEAUTIFUL_DISCORD_CLIENT_ID: &str = "1533882048182222968";
 
 /// Discord Developer Portal → Rich Presence → Art Assets key for the app logo.
-/// Upload a square image named exactly `logo` so presence shows without temp hosts.
 pub const DISCORD_ASSET_LOGO: &str = "logo";
 
 /// Asset / presence payload for one push.
@@ -27,10 +22,6 @@ pub const DISCORD_ASSET_LOGO: &str = "logo";
 pub struct ActivityUpdate {
     pub details: String,
     pub state: String,
-    /// When true, prefer canvas preview as large image (falls back to logo).
-    pub show_preview: bool,
-    /// JPEG bytes of a small canvas thumb (RGBA already encoded as JPEG).
-    pub preview_jpeg: Option<Vec<u8>>,
 }
 
 /// Snapshot for Preferences status line.
@@ -114,9 +105,6 @@ impl Drop for DiscordRpc {
     fn drop(&mut self) {
         self.shutting_down.store(true, Ordering::SeqCst);
         let _ = self.tx.send(Cmd::Shutdown);
-        // JoinHandle::drop joins the worker. Litterbox curl can take seconds, so a
-        // mid-upload exit would freeze quit. Detach — process teardown reaps the
-        // thread; Discord presence clears best-effort in the background.
         if let Some(h) = self.join.take() {
             std::mem::forget(h);
         }
@@ -133,7 +121,6 @@ fn stop_requested(stop: &AtomicBool) -> bool {
 
 fn clear_and_close(client: &mut Option<DiscordIpcClient>) {
     if let Some(mut c) = client.take() {
-        // Prefer close over clear_activity — both are local IPC; close is enough for exit.
         let _ = c.close();
     }
 }
@@ -144,14 +131,10 @@ fn worker(rx: mpsc::Receiver<Cmd>, status: Arc<AtomicU8>, stop: Arc<AtomicBool>)
     let mut last = ActivityUpdate {
         details: "Beautiful".into(),
         state: "Idle".into(),
-        show_preview: false,
-        preview_jpeg: None,
     };
     let mut last_push = Instant::now() - Duration::from_secs(60);
     let mut last_reconnect = Instant::now() - Duration::from_secs(60);
     let mut need_push = false;
-    let logo_url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let preview_url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let start_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -191,31 +174,7 @@ fn worker(rx: mpsc::Receiver<Cmd>, status: Arc<AtomicU8>, stop: Arc<AtomicBool>)
                         set_status(&status, RpcUiStatus::Off);
                         break;
                     }
-                    let preview_changed = match (&upd.preview_jpeg, &last.preview_jpeg) {
-                        (Some(a), Some(b)) => a != b,
-                        (Some(_), None) | (None, Some(_)) => true,
-                        (None, None) => false,
-                    };
-                    if upd.details != last.details
-                        || upd.state != last.state
-                        || upd.show_preview != last.show_preview
-                        || preview_changed
-                    {
-                        if let Some(jpeg) = upd.preview_jpeg.clone() {
-                            match upload_preview_jpeg(&jpeg, &stop) {
-                                Ok(url) => {
-                                    if let Ok(mut g) = preview_url.lock() {
-                                        *g = Some(url);
-                                    }
-                                }
-                                Err(_) => {
-                                    // Keep previous preview URL; never log payload/credentials.
-                                    crate::action_log::log("discord", "preview upload failed");
-                                }
-                            }
-                        } else if let Ok(mut g) = preview_url.lock() {
-                            *g = None;
-                        }
+                    if upd.details != last.details || upd.state != last.state {
                         last = upd;
                         need_push = true;
                         last_push = Instant::now() - Duration::from_secs(60);
@@ -244,20 +203,6 @@ fn worker(rx: mpsc::Receiver<Cmd>, status: Arc<AtomicU8>, stop: Arc<AtomicBool>)
                         clear_and_close(&mut client);
                         set_status(&status, RpcUiStatus::Off);
                         return;
-                    }
-                    if let Some(jpeg) = upd.preview_jpeg.clone() {
-                        match upload_preview_jpeg(&jpeg, &stop) {
-                            Ok(url) => {
-                                if let Ok(mut g) = preview_url.lock() {
-                                    *g = Some(url);
-                                }
-                            }
-                            Err(_) => {
-                                crate::action_log::log("discord", "preview upload failed");
-                            }
-                        }
-                    } else if let Ok(mut g) = preview_url.lock() {
-                        *g = None;
                     }
                     last = upd;
                     need_push = true;
@@ -289,18 +234,6 @@ fn worker(rx: mpsc::Receiver<Cmd>, status: Arc<AtomicU8>, stop: Arc<AtomicBool>)
             match c.connect() {
                 Ok(()) => {
                     crate::action_log::log("discord", "RPC connected");
-                    // Optional: warm a hosted logo URL. Prefer Portal Art Asset `logo`.
-                    if !stop_requested(&stop)
-                        && logo_url.lock().ok().and_then(|g| g.clone()).is_none()
-                    {
-                        if let Ok(png) = make_logo_png() {
-                            if let Ok(url) = upload_bytes_host(&png, "beautiful_logo.png", &stop) {
-                                if let Ok(mut g) = logo_url.lock() {
-                                    *g = Some(url);
-                                }
-                            }
-                        }
-                    }
                     if stop_requested(&stop) {
                         let _ = c.close();
                         set_status(&status, RpcUiStatus::Off);
@@ -330,39 +263,16 @@ fn worker(rx: mpsc::Receiver<Cmd>, status: Arc<AtomicU8>, stop: Arc<AtomicBool>)
             continue;
         }
 
-        let hosted_logo = logo_url.lock().ok().and_then(|g| g.clone());
-        let preview = preview_url.lock().ok().and_then(|g| g.clone());
-
-        // Prefer Discord Art Asset key `logo` (works without temp hosts). Fall back to
-        // hosted PNG URL. Canvas preview uses temporary https URL when enabled.
-        let (large, small) = if last.show_preview {
-            match (preview, hosted_logo.clone()) {
-                (Some(p), _) => (Some(p), Some(DISCORD_ASSET_LOGO.to_owned())),
-                (None, Some(l)) => (Some(l), None),
-                (None, None) => (Some(DISCORD_ASSET_LOGO.to_owned()), None),
-            }
-        } else if let Some(l) = hosted_logo {
-            (Some(l), None)
-        } else {
-            (Some(DISCORD_ASSET_LOGO.to_owned()), None)
-        };
-
-        let mut act = activity::Activity::new()
+        let act = activity::Activity::new()
             .activity_type(activity::ActivityType::Playing)
             .details(last.details.as_str())
             .state(last.state.as_str())
-            .timestamps(activity::Timestamps::new().start(start_unix));
-
-        if large.is_some() || small.is_some() {
-            let mut assets = activity::Assets::new().large_text("Beautiful");
-            if let Some(ref l) = large {
-                assets = assets.large_image(l.as_str());
-            }
-            if let Some(ref s) = small {
-                assets = assets.small_image(s.as_str()).small_text("Beautiful");
-            }
-            act = act.assets(assets);
-        }
+            .timestamps(activity::Timestamps::new().start(start_unix))
+            .assets(
+                activity::Assets::new()
+                    .large_image(DISCORD_ASSET_LOGO)
+                    .large_text("Beautiful"),
+            );
 
         match c.set_activity(act) {
             Ok(()) => {
@@ -379,170 +289,4 @@ fn worker(rx: mpsc::Receiver<Cmd>, status: Arc<AtomicU8>, stop: Arc<AtomicBool>)
             }
         }
     }
-}
-
-fn temp_dir() -> PathBuf {
-    std::env::temp_dir().join("beautiful_discord_rpc")
-}
-
-fn upload_preview_jpeg(bytes: &[u8], stop: &AtomicBool) -> Result<String, String> {
-    upload_bytes_host(bytes, "preview.jpg", stop)
-}
-
-fn upload_bytes_host(bytes: &[u8], filename: &str, stop: &AtomicBool) -> Result<String, String> {
-    if stop_requested(stop) {
-        return Err("shutdown".into());
-    }
-    let dir = temp_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(filename);
-    {
-        let mut f = std::fs::File::create(&path).map_err(|e| e.to_string())?;
-        f.write_all(bytes).map_err(|e| e.to_string())?;
-    }
-    // Try litterbox (temp), then catbox (persistent). Never log URLs with query secrets.
-    match upload_file_litterbox(&path, stop) {
-        Ok(url) => Ok(url),
-        Err(_) => upload_file_catbox(&path, stop),
-    }
-}
-
-fn upload_file_litterbox(path: &Path, stop: &AtomicBool) -> Result<String, String> {
-    curl_multipart_upload(
-        path,
-        stop,
-        "https://litterbox.catbox.moe/resources/internals/api.php",
-        &[("reqtype", "fileupload"), ("time", "24h")],
-    )
-}
-
-fn upload_file_catbox(path: &Path, stop: &AtomicBool) -> Result<String, String> {
-    curl_multipart_upload(
-        path,
-        stop,
-        "https://catbox.moe/user/api.php",
-        &[("reqtype", "fileupload")],
-    )
-}
-
-fn curl_multipart_upload(
-    path: &Path,
-    stop: &AtomicBool,
-    url: &str,
-    fields: &[(&str, &str)],
-) -> Result<String, String> {
-    if stop_requested(stop) {
-        return Err("shutdown".into());
-    }
-    let file_arg = format!("fileToUpload=@{}", path.display());
-    let mut cmd = Command::new("curl");
-    crate::os_win::hide_console(&mut cmd);
-    cmd.args(["-sS", "--max-time", "12"]);
-    for (k, v) in fields {
-        cmd.arg("-F");
-        cmd.arg(format!("{k}={v}"));
-    }
-    cmd.arg("-F");
-    cmd.arg(&file_arg);
-    cmd.arg(url);
-    let out = cmd.output().map_err(|e| format!("curl: {e}"))?;
-    if stop_requested(stop) {
-        return Err("shutdown".into());
-    }
-    if !out.status.success() {
-        return Err(format!("curl exit {}", out.status));
-    }
-    let body = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    if !(body.starts_with("https://") || body.starts_with("http://")) {
-        return Err("unexpected upload response".into());
-    }
-    Ok(body)
-}
-
-/// Simple 256×256 dark tile with orange “B” — used as large logo / small corner mark.
-fn make_logo_png() -> Result<Vec<u8>, String> {
-    const S: u32 = 256;
-    let mut rgba = vec![0u8; (S * S * 4) as usize];
-    for y in 0..S {
-        for x in 0..S {
-            let i = ((y * S + x) * 4) as usize;
-            // Dark charcoal
-            rgba[i] = 28;
-            rgba[i + 1] = 28;
-            rgba[i + 2] = 32;
-            rgba[i + 3] = 255;
-        }
-    }
-    // Orange rounded square
-    let accent = [255u8, 140, 66];
-    for y in 40..216 {
-        for x in 40..216 {
-            let dx = (x as i32 - 128).unsigned_abs();
-            let dy = (y as i32 - 128).unsigned_abs();
-            if dx > 78 && dy > 78 {
-                continue; // rough corner cut
-            }
-            let i = ((y * S + x) * 4) as usize;
-            rgba[i] = accent[0];
-            rgba[i + 1] = accent[1];
-            rgba[i + 2] = accent[2];
-        }
-    }
-    // Carve a simple “B” by punching vertical bars (dark)
-    for y in 70..186 {
-        for x in 90..110 {
-            let i = ((y * S + x) * 4) as usize;
-            rgba[i] = 28;
-            rgba[i + 1] = 28;
-            rgba[i + 2] = 32;
-        }
-    }
-    for y in 70..100 {
-        for x in 110..160 {
-            let i = ((y * S + x) * 4) as usize;
-            rgba[i] = 28;
-            rgba[i + 1] = 28;
-            rgba[i + 2] = 32;
-        }
-    }
-    for y in 120..150 {
-        for x in 110..155 {
-            let i = ((y * S + x) * 4) as usize;
-            rgba[i] = 28;
-            rgba[i + 1] = 28;
-            rgba[i + 2] = 32;
-        }
-    }
-    for y in 156..186 {
-        for x in 110..165 {
-            let i = ((y * S + x) * 4) as usize;
-            rgba[i] = 28;
-            rgba[i + 1] = 28;
-            rgba[i + 2] = 32;
-        }
-    }
-
-    let mut png = Vec::new();
-    let mut cursor = std::io::Cursor::new(&mut png);
-    let encoder = image::codecs::png::PngEncoder::new(&mut cursor);
-    use image::ImageEncoder;
-    encoder
-        .write_image(&rgba, S, S, image::ExtendedColorType::Rgba8)
-        .map_err(|e| e.to_string())?;
-    Ok(png)
-}
-
-/// Encode RGBA thumb to JPEG for Discord preview uploads.
-pub fn encode_preview_jpeg(rgba: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
-    if w == 0 || h == 0 || rgba.len() < (w as usize * h as usize * 4) {
-        return None;
-    }
-    let img = image::RgbaImage::from_raw(w, h, rgba.to_vec())?;
-    let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
-    let mut out = Vec::new();
-    let mut cursor = std::io::Cursor::new(&mut out);
-    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, 75);
-    enc.encode(rgb.as_raw(), w, h, image::ExtendedColorType::Rgb8)
-        .ok()?;
-    Some(out)
 }

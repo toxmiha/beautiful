@@ -33,3 +33,16 @@ impl CancelToken {
         self.cancelled.load(Ordering::Relaxed)
     }
 }
+
+/// Independent tile bakes on the Rayon pool. The UI thread joins — this is
+/// not a background compositor (eye must land this frame). Wall time drops
+/// with core count; occupancy no longer serializes one 512 flatten after another.
+pub fn par_map<T, R, F>(items: Vec<T>, f: F) -> Vec<R>
+where
+    T: Send,
+    R: Send,
+    F: Fn(T) -> R + Sync + Send,
+{
+    use rayon::prelude::*;
+    items.into_par_iter().map(f).collect()
+}

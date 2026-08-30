@@ -29,29 +29,27 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build release
-        run: cargo build --release -p beautiful-app
+      - name: Bundled CPython (libpython .so sidecar)
+        run: bash tools/ensure-python-linux.sh
 
-      - name: Pack Beautiful-Alpha/linux
+      - name: Build release
         run: |
-          mkdir -p dist/Beautiful-Alpha/linux
-          cp target/release/beautiful dist/Beautiful-Alpha/linux/
-          chmod +x dist/Beautiful-Alpha/linux/beautiful
-          cat > dist/Beautiful-Alpha/linux/run-beautiful.sh <<'EOF'
-          #!/usr/bin/env bash
-          DIR="$(cd "$(dirname "$0")" && pwd)"
-          cd "$DIR"
-          export WGPU_BACKEND="${WGPU_BACKEND:-vulkan}"
-          exec "$DIR/beautiful" "$@"
-          EOF
-          chmod +x dist/Beautiful-Alpha/linux/run-beautiful.sh
-          cat > dist/Beautiful-Alpha/linux/README.txt <<'EOF'
-          Beautiful — Linux x86_64 / Steam Deck (SteamOS)
-          Run: ./run-beautiful.sh (needs Vulkan/Mesa)
-          EOF
+          export PYO3_PYTHON="$PWD/vendor/python-linux/bin/python3"
+          cargo build --release -p beautiful-app
+
+      - name: Pack folder (ELF + libpython)
+        run: |
+          mkdir -p dist/Beautiful-Linux
+          cp target/release/beautiful dist/Beautiful-Linux/beautiful
+          chmod +x dist/Beautiful-Linux/beautiful
+          bash tools/ensure-python-linux.sh dist/Beautiful-Linux
+          rm -f dist/beautiful-linux.7z
+          ( cd dist/Beautiful-Linux && 7z a -t7z ../beautiful-linux.7z . )
 
       - uses: actions/upload-artifact@v4
         with:
           name: beautiful-linux-x64
-          path: dist/Beautiful-Alpha/linux/
+          path: |
+            dist/Beautiful-Linux/
+            dist/beautiful-linux.7z
           if-no-files-found: error

@@ -3,9 +3,9 @@ members = ["crates/beautiful-core", "crates/beautiful-app"]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.8"
+version = "0.4.9"
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-or-later"
 authors = ["beautiful contributors"]
 
 [workspace.dependencies]
@@ -34,4 +34,8 @@ serde = { version = "1", features = ["derive"] }
 [patch.crates-io]
 egui-winit = { path = "vendor/egui-winit" }
 eframe = { path = "vendor/eframe" }
+
+# Smaller ship binary: Rhai is gone; CPython stays a sidecar .dll / .so.
+[profile.release]
+strip = true
 

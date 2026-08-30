@@ -1,12 +1,8 @@
-//! Shared display LOD + hybrid mip planning for CPU and GPU present paths.
-//!
-//! Keeps policy in one place so egui-CPU and wgpu-GPU cannot diverge on
-//! coverage / seed / coarsen rules.
+//! Shared display present planning for CPU and GPU tile paths.
 
 use crate::composite::{DirtyRect, SyncResult};
-use crate::display_lod::{
-    lod_factor_for_document, resolve_display_lod, DisplayMip,
-};
+use crate::display_plate::{plan_viewport_plate, viewport_plate_linear_filter, ViewportPlatePlan};
+use crate::display_lod::DisplayMip;
 use crate::Document;
 
 /// Padded document view used for projection expose and hybrid mip fill.
@@ -22,37 +18,40 @@ pub struct DisplayFramePlan {
     pub cover: DirtyRect,
     /// True when current mip (at `raw_lod`) already covers `cover`.
     pub mip_covers_view: bool,
+    /// Viewport cover plan (always tiles).
+    pub viewport_plate: ViewportPlatePlan,
+    /// Always true — kept for call-site compatibility during cutover.
+    pub use_viewport_plate: bool,
 }
 
-/// Plan zoom → LOD and padded cover for this frame.
+/// Plan zoom filter + padded cover for this frame (always display tiles).
 pub fn plan_display_frame(
     zoom: f32,
-    display_lod: u32,
+    _display_lod: u32,
     doc_w: u32,
     doc_h: u32,
-    allow_coarsen: bool,
+    _allow_coarsen: bool,
     view: DirtyRect,
-    display_mip: &DisplayMip,
+    _display_mip: &DisplayMip,
+    gpu_tex_side: u32,
+    _view_screen_long_px: f32,
+    _stroke_active: bool,
 ) -> DisplayFramePlan {
-    let raw_lod = display_lod.max(1);
-    let want = lod_factor_for_document(zoom, raw_lod, doc_w, doc_h);
-    let lod = resolve_display_lod(raw_lod, want, allow_coarsen);
     let cover = view.padded(DISPLAY_VIEW_PAD, doc_w, doc_h);
-    let mip_covers_view = if raw_lod <= 1 {
-        true
-    } else {
-        display_mip.factor == raw_lod && display_mip.covers_doc(cover)
-    };
-    // Minify always linear; also linear when showing/upsampling a coarse plate
-    // (Nearest + LOD>1 on zoom-in = crunchy "shakal").
-    let linear_filter = zoom < 0.999 || raw_lod > 1 || want < raw_lod;
+    // Unified present: always display tiles (legacy full-doc plate + DisplayMip removed).
+    let mut viewport_plate = plan_viewport_plate(doc_w, doc_h, cover, gpu_tex_side);
+    viewport_plate.plate_lod = 1;
+    viewport_plate.tex_w = viewport_plate.doc_rect.width().max(1);
+    viewport_plate.tex_h = viewport_plate.doc_rect.height().max(1);
     DisplayFramePlan {
-        raw_lod,
-        lod,
-        lod_changed: lod != raw_lod,
-        linear_filter,
+        raw_lod: 1,
+        lod: 1,
+        lod_changed: false,
+        linear_filter: viewport_plate_linear_filter(zoom, 1),
         cover,
-        mip_covers_view,
+        mip_covers_view: viewport_plate.is_active(),
+        viewport_plate,
+        use_viewport_plate: true,
     }
 }
 
@@ -119,6 +118,8 @@ pub fn plan_mip_action(
             // coverage (avoid 200ms+ recomposite) but Seed still forces a cover
             // upload via upload_cover_even_if_empty_fill.
             MipAction::Seed {
+                // Always clear when mip/doc dims disagree; keep coverage only when
+                // reuploading an already-sized plate to a fresh GPU texture.
                 clear_coverage: lod_changed || !mip_size_ok,
             }
         }
@@ -220,6 +221,26 @@ pub struct ApplyMipResult {
     pub did_work: bool,
 }
 
+fn downsample_dense_cover(
+    display_mip: &mut DisplayMip,
+    document: &Document,
+    lod: u32,
+    cover: DirtyRect,
+) -> Option<DirtyRect> {
+    if let Some(pixels) = document.composite.dense_pixels() {
+        display_mip.ensure_size(document.width, document.height, lod);
+        display_mip.update_dirty(pixels, document.width, document.height, lod, cover);
+        return Some(cover);
+    }
+    let packed = document.composite.extract(cover);
+    if !packed.is_empty() {
+        display_mip.ensure_size(document.width, document.height, lod);
+        display_mip.update_from_packed_rect(&packed, cover, lod);
+        return Some(cover);
+    }
+    None
+}
+
 fn fill_view(
     display_mip: &mut DisplayMip,
     document: &Document,
@@ -228,19 +249,33 @@ fn fill_view(
 ) -> DirtyRect {
     // Prefer downsample from projection when sandwich already wrote the plate.
     if document.transform_sandwich_active() {
-        if let Some(pixels) = document.composite.dense_pixels() {
-            display_mip.ensure_size(document.width, document.height, lod);
-            display_mip.update_dirty(pixels, document.width, document.height, lod, cover);
-            return cover;
-        }
-        let packed = document.composite.extract(cover);
-        if !packed.is_empty() {
-            display_mip.ensure_size(document.width, document.height, lod);
-            display_mip.update_from_packed_rect(&packed, cover, lod);
-            return cover;
+        if let Some(filled) = downsample_dense_cover(display_mip, document, lod, cover) {
+            return filled;
         }
         // No projection pixels yet — skip layer rebuild (would ghost + melt CPU).
         return DirtyRect::empty();
+    }
+    // Live text: underlay omits the editing layer. LOD mips must not composite
+    // the frozen dest cache (zoom-out showed the pre-edit picture).
+    if document.text_overlay_idx.is_some() {
+        if let Some(filled) = downsample_dense_cover(display_mip, document, lod, cover) {
+            return filled;
+        }
+        let idx = document.text_overlay_idx.unwrap();
+        let omit: Vec<usize> = (idx..document.layers.len())
+            .filter(|&i| document.layers.get(i).is_some_and(|l| l.visible))
+            .collect();
+        let _omit = crate::OmitAboveGuard::install(omit);
+        let floating = document.floating_blit();
+        return display_mip.ensure_view_from_layers(
+            document.background,
+            &document.layers,
+            floating,
+            document.width,
+            document.height,
+            lod,
+            cover,
+        );
     }
     let floating = document.floating_blit();
     display_mip.ensure_view_from_layers(
@@ -271,11 +306,18 @@ pub fn update_mip_partial(
         display_mip.update_from_packed_rect(&packed, rect, lod);
         return;
     }
-    // During Free Transform sandwich, never rebuild mip from full layer stack —
+    // During Transform sandwich, never rebuild mip from full layer stack —
     // that bypassed plates and caused ghost + 200–350ms composite (F12).
     if document.transform_sandwich_active() {
         return;
     }
+    // Same for live text: layer mip would stamp the stale dest cache.
+    let _omit = document.text_overlay_idx.map(|idx| {
+        let omit: Vec<usize> = (idx..document.layers.len())
+            .filter(|&i| document.layers.get(i).is_some_and(|l| l.visible))
+            .collect();
+        crate::OmitAboveGuard::install(omit)
+    });
     let floating = document.floating_blit();
     display_mip.update_dirty_from_layers(
         document.background,
@@ -299,7 +341,10 @@ pub fn mip_dims(doc_w: u32, doc_h: u32, lod: u32) -> (u32, u32) {
 
 pub fn mip_size_matches(display_mip: &DisplayMip, doc_w: u32, doc_h: u32, lod: u32) -> bool {
     let (w, h) = mip_dims(doc_w, doc_h, lod);
-    display_mip.factor == lod && display_mip.width == w && display_mip.height == h
+    display_mip.factor == lod
+        && display_mip.width == w
+        && display_mip.height == h
+        && display_mip.cov_doc_matches(doc_w, doc_h)
 }
 
 #[cfg(test)]
@@ -335,6 +380,44 @@ mod tests {
         };
         let a = plan_mip_action(false, true, true, false, &sync, false);
         assert!(matches!(a, MipAction::FillGap));
+    }
+
+    #[test]
+    fn linear_filter_nearest_only_for_true_11() {
+        let mip = DisplayMip::empty();
+        let view = DirtyRect {
+            x0: 0,
+            y0: 0,
+            x1: 100,
+            y1: 100,
+        };
+        let sharp = plan_display_frame(1.0, 1, 2400, 400, true, view, &mip, 4096, 900.0, false);
+        assert!(!sharp.linear_filter);
+        // Zoom IN on full-res plate must stay Nearest (not milky Linear mag).
+        let zoom_in = plan_display_frame(1.5, 1, 1920, 1080, true, view, &mip, 4096, 900.0, false);
+        assert!(!zoom_in.linear_filter);
+        let zoom_out = plan_display_frame(0.5, 1, 1920, 1080, true, view, &mip, 4096, 900.0, false);
+        assert!(zoom_out.linear_filter);
+        // Huge / small docs share tile present — plate_lod stays 1; Nearest at 1:1.
+        let vdp = plan_display_frame(1.0, 2, 6000, 4000, true, view, &mip, 4096, 900.0, false);
+        assert!(vdp.use_viewport_plate);
+        assert_eq!(vdp.viewport_plate.plate_lod, 1);
+        assert!(!vdp.linear_filter);
+        let huge_view = DirtyRect {
+            x0: 0,
+            y0: 0,
+            x1: 8000,
+            y1: 4000,
+        };
+        let vdp_fit = plan_display_frame(
+            0.4, 2, 8000, 4000, true, huge_view, &mip, 4096, 900.0, false,
+        );
+        assert!(vdp_fit.use_viewport_plate);
+        assert_eq!(vdp_fit.viewport_plate.plate_lod, 1);
+        assert!(vdp_fit.linear_filter);
+        let stroke_tiles = plan_display_frame(1.0, 4, 2400, 400, false, view, &mip, 4096, 900.0, true);
+        assert_eq!(stroke_tiles.lod, 1);
+        assert!(stroke_tiles.use_viewport_plate);
     }
 
     #[test]

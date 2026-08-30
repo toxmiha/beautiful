@@ -2,13 +2,15 @@
 
 use beautiful_core::{Document, Rgba};
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
 use crate::canvas::CanvasState;
 use crate::file::{FileState, COLLECTION_ALL, COLLECTION_RECENT};
 use crate::settings::AppSettings;
 use crate::theme;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SizeUnit {
     #[default]
     Pixels,
@@ -35,7 +37,8 @@ impl SizeUnit {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ResUnit {
     #[default]
     Ppi,
@@ -51,14 +54,16 @@ impl ResUnit {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Orientation {
     #[default]
     Landscape,
     Portrait,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BgPreset {
     #[default]
     White,
@@ -136,7 +141,7 @@ pub struct NewCanvasDialog {
 
 impl Default for NewCanvasDialog {
     fn default() -> Self {
-        Self {
+        let mut s = Self {
             name: "Новый холст".to_owned(),
             width: 2000.0,
             height: 1500.0,
@@ -151,18 +156,80 @@ impl Default for NewCanvasDialog {
             tags: Vec::new(),
             tag_draft: String::new(),
             tag_color: egui::Color32::from_rgb(255, 140, 66),
-        }
+        };
+        s.load_prefs();
+        s
     }
+}
+
+#[derive(Serialize, Deserialize)]
+struct NewCanvasPrefs {
+    width: f32,
+    height: f32,
+    size_unit: SizeUnit,
+    resolution: f32,
+    res_unit: ResUnit,
+    orientation: Orientation,
+    bg: BgPreset,
+    bg_custom: [u8; 3],
+}
+
+fn new_canvas_prefs_path() -> Option<std::path::PathBuf> {
+    AppSettings::app_dir().map(|d| d.join("new_canvas.json"))
 }
 
 impl NewCanvasDialog {
     pub fn prepare_open(&mut self, preferred_collection: &str) {
-        *self = Self::default();
+        self.load_prefs();
+        self.name = "Новый холст".to_owned();
+        self.tag_draft.clear();
         if preferred_collection != COLLECTION_RECENT
             && preferred_collection != COLLECTION_ALL
             && !preferred_collection.is_empty()
         {
             self.collection = preferred_collection.to_owned();
+        }
+    }
+
+    fn load_prefs(&mut self) {
+        let Some(path) = new_canvas_prefs_path() else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let Ok(p) = serde_json::from_slice::<NewCanvasPrefs>(&bytes) else {
+            return;
+        };
+        self.width = p.width;
+        self.height = p.height;
+        self.size_unit = p.size_unit;
+        self.resolution = p.resolution;
+        self.res_unit = p.res_unit;
+        self.orientation = p.orientation;
+        self.bg = p.bg;
+        self.bg_custom = egui::Color32::from_rgb(p.bg_custom[0], p.bg_custom[1], p.bg_custom[2]);
+    }
+
+    pub fn save_prefs(&self) {
+        let Some(path) = new_canvas_prefs_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let p = NewCanvasPrefs {
+            width: self.width,
+            height: self.height,
+            size_unit: self.size_unit,
+            resolution: self.resolution,
+            res_unit: self.res_unit,
+            orientation: self.orientation,
+            bg: self.bg,
+            bg_custom: [self.bg_custom.r(), self.bg_custom.g(), self.bg_custom.b()],
+        };
+        if let Ok(bytes) = serde_json::to_vec_pretty(&p) {
+            let _ = std::fs::write(path, bytes);
         }
     }
 
@@ -244,7 +311,7 @@ pub fn show_new_canvas_dialog(
 
     // Center once via default_pos — do NOT use .anchor() (it pins every frame).
     let center = ctx.content_rect().center();
-    egui::Window::new("Новый холст")
+    egui::Window::new(crate::i18n::t("Новый холст"))
         .collapsible(false)
         .resizable(true)
         .movable(true)
@@ -272,7 +339,7 @@ pub fn show_new_canvas_dialog(
                     ui.add(
                         egui::TextEdit::singleline(&mut dlg.name)
                             .desired_width(300.0)
-                            .hint_text("Название файла")
+                            .hint_text(crate::i18n::t("Название файла"))
                             .text_color(theme::text()),
                     );
                     ui.add_space(8.0);
@@ -552,6 +619,25 @@ pub fn show_new_canvas_dialog(
                             }
                         }
                     });
+                    ui.add_space(4.0);
+                    ui.label(theme::label_dim("Pixel art"));
+                    ui.horizontal_wrapped(|ui| {
+                        for (w, h, name) in [
+                            (64_f32, 64.0, "64²"),
+                            (128.0, 128.0, "128²"),
+                            (160.0, 144.0, "160×144"),
+                            (256.0, 256.0, "256²"),
+                            (320.0, 180.0, "320×180"),
+                            (512.0, 512.0, "512²"),
+                        ] {
+                            if theme::menu_btn(ui, theme::label(name)).clicked() {
+                                dlg.size_unit = SizeUnit::Pixels;
+                                dlg.width = w;
+                                dlg.height = h;
+                                dlg.sync_orientation_from_size();
+                            }
+                        }
+                    });
                 });
 
                 ui.add_space(12.0);
@@ -618,7 +704,7 @@ pub fn show_new_canvas_dialog(
                             cancel = true;
                         }
                         let create_btn = egui::Button::new(
-                            egui::RichText::new("  Создать  ")
+                            egui::RichText::new(format!("  {}  ", crate::i18n::t("Создать")))
                                 .color(theme::text_on_accent())
                                 .strong(),
                         )
@@ -645,9 +731,11 @@ pub fn show_new_canvas_dialog(
         file.ensure_collection(&name);
     }
     if cancel {
+        file.new_canvas.save_prefs();
         file.show_new_dialog = false;
     }
     if create {
+        file.new_canvas.save_prefs();
         file.create_from_dialog(document, canvas, settings);
     }
 }
@@ -660,7 +748,7 @@ fn dark_combo(
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
     egui::ComboBox::from_id_salt(id)
-        .selected_text(theme::dark_combo_label(format!("▾ {selected}")))
+        .selected_text(theme::dark_combo_label(format!("▾ {}", crate::i18n::t(selected))))
         .width(width)
         .show_ui(ui, |ui| {
             theme::apply_opaque_chrome(ui);
@@ -670,6 +758,7 @@ fn dark_combo(
 }
 
 fn combo_item(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+    let text = crate::i18n::t(text);
     ui.add(
         egui::Button::new(
             egui::RichText::new(if selected {

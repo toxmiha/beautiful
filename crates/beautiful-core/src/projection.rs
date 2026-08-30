@@ -224,14 +224,15 @@ impl Projection {
     /// backfill). Counting it would spin `request_repaint` forever.
     pub fn has_pending_work(&self) -> bool {
         if self.is_roi() {
-            self.dense.force_full
-                || !self.dense.dirty.is_empty()
-                || !self.dense.dirty_parts.is_empty()
-                || !self.dense.gpu_dirty.is_empty()
-                || !self.dense.gpu_dirty_parts.is_empty()
+            self.dense.has_live_pending_work()
         } else {
             self.dense.has_pending_work()
         }
+    }
+
+    /// Viewport / GPU path only — excludes Dense offscreen backfill.
+    pub fn has_live_pending_work(&self) -> bool {
+        self.dense.has_live_pending_work()
     }
 
     /// Drop Roi outside-view backlog (legacy sticky sessions / visibility fast).
@@ -244,6 +245,10 @@ impl Projection {
     /// Eye / opacity: only reblend what is on screen now.
     /// Off-screen dirty is deferred (Dense) or dropped (Roi) so weak PCs don't
     /// pay a full-layer composite on every visibility toggle.
+    ///
+    /// Keeps sparse `dirty_parts` when cheaper than one AABB — folder eye used to
+    /// union every descendant into one rect, then this collapsed parts again →
+    /// full-viewport stack composite on the first click.
     pub fn confine_pending_to_view(&mut self, view: DirtyRect) {
         let mut view = view;
         view.clamp_to(self.dense.width, self.dense.height);
@@ -251,13 +256,13 @@ impl Projection {
             return;
         }
 
-        let mut keep = DirtyRect::empty();
+        let mut keep_parts: Vec<DirtyRect> = Vec::new();
         let mut defer: Vec<DirtyRect> = Vec::new();
 
         if !self.dense.dirty.is_empty() {
             let hit = self.dense.dirty.intersect(view);
             if !hit.is_empty() {
-                keep.union(hit);
+                keep_parts.push(hit);
             }
             if !self.is_roi() {
                 for piece in self.dense.dirty.subtract(view) {
@@ -273,7 +278,7 @@ impl Projection {
         for r in parts {
             let hit = r.intersect(view);
             if !hit.is_empty() {
-                keep.union(hit);
+                keep_parts.push(hit);
             }
             if !self.is_roi() {
                 for piece in r.subtract(view) {
@@ -284,15 +289,29 @@ impl Projection {
             }
         }
 
-        if !keep.is_empty() {
-            self.dense.dirty = keep;
+        if !keep_parts.is_empty() {
+            let parts_area: u64 = keep_parts
+                .iter()
+                .map(|r| (r.width() as u64).saturating_mul(r.height() as u64))
+                .sum();
+            let aabb = DirtyRect::union_all(keep_parts.iter().copied());
+            let aabb_area = (aabb.width() as u64).saturating_mul(aabb.height() as u64);
+            if keep_parts.len() > 1 && parts_area.saturating_mul(2) < aabb_area {
+                self.dense.dirty = DirtyRect::empty();
+                self.dense.dirty_parts = keep_parts;
+            } else {
+                self.dense.dirty = aabb;
+                self.dense.dirty_parts.clear();
+            }
         }
         if !self.is_roi() && !defer.is_empty() {
             self.dense.offscreen_dirty.extend(defer);
         }
         // force_full on eye would re-pay the whole document — never keep it for
         // a viewport-confined visibility update.
-        if self.dense.force_full && !self.dense.dirty.is_empty() {
+        if self.dense.force_full
+            && (!self.dense.dirty.is_empty() || !self.dense.dirty_parts.is_empty())
+        {
             self.dense.force_full = false;
         }
     }
@@ -648,22 +667,11 @@ impl Projection {
         if !self.dense.gpu_dirty.is_empty() {
             let rect = self.dense.gpu_dirty;
             self.dense.gpu_dirty = DirtyRect::empty();
-            let was_full = rect.x0 == 0
-                && rect.y0 == 0
-                && rect.x1 == self.dense.width
-                && rect.y1 == self.dense.height;
-            return if was_full {
-                SyncResult {
-                    full_upload: true,
-                    partial: None,
-                    partials: Vec::new(),
-                }
-            } else {
-                SyncResult {
-                    full_upload: false,
-                    partial: Some(rect),
-                    partials: Vec::new(),
-                }
+            // Same contract as CompositeCache: full-doc gpu_dirty ≠ drop GPU keys.
+            return SyncResult {
+                full_upload: false,
+                partial: if rect.is_empty() { None } else { Some(rect) },
+                partials: Vec::new(),
             };
         }
         SyncResult {

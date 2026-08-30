@@ -49,6 +49,8 @@ pub enum BrushShape {
     SoftEdge,
     Square,
     Slash,
+    /// 1-pixel-wide annulus (pixel-art «окружность»).
+    Ring,
 }
 
 impl BrushShape {
@@ -58,6 +60,15 @@ impl BrushShape {
             Self::SoftEdge => "Soft Circle",
             Self::Square => "Square",
             Self::Slash => "Slash",
+            Self::Ring => "Ring",
+        }
+    }
+
+    pub fn pixel_label(self) -> &'static str {
+        match self {
+            Self::SimpleCircle | Self::SoftEdge => "Circle",
+            Self::Square | Self::Slash => "Square",
+            Self::Ring => "Ring",
         }
     }
 
@@ -68,6 +79,10 @@ impl BrushShape {
             Self::Square,
             Self::Slash,
         ]
+    }
+
+    pub fn pixel_art_all() -> &'static [Self] {
+        &[Self::SimpleCircle, Self::Square, Self::Ring]
     }
 }
 
@@ -211,7 +226,7 @@ pub struct BrushSettings {
     pub spacing: f32,
 
     // --- Phase 2 placement (DabPlanner) ---
-    /// Radial scatter from path as fraction of diameter (0–1).
+    /// Across-stroke scatter as fraction of diameter (0–1; 1 ≈ ±1 diameter).
     #[serde(default)]
     pub scatter: f32,
     /// Extra particles per spacing step (1–4).
@@ -261,6 +276,9 @@ pub struct BrushSettings {
     // --- Tip / shape sheet ---
     #[serde(default)]
     pub shape: BrushShape,
+    /// Binary nearest-neighbor stamp (Pixel Brush tool). Not inferred from Square.
+    #[serde(default)]
+    pub pixel_art: bool,
     /// Ellipse roundness 0.05–1 (1 = circle). Wired in v2.
     #[serde(default = "default_one")]
     pub roundness: f32,
@@ -310,6 +328,18 @@ pub struct BrushSettings {
     /// Sample texture in tip-local space (moves with dab) instead of canvas lock.
     #[serde(default)]
     pub texture_move_with_stroke: bool,
+    /// Bitmap tip path (empty = circular LUT). PNG in shapes/.
+    #[serde(default)]
+    pub shape_path: String,
+    /// Bitmap paper path (empty = procedural `texture` enum).
+    #[serde(default)]
+    pub paper_path: String,
+    /// RGB pigment path (empty = solid `color`). Fill/text/gradient/outline/adj.
+    #[serde(default)]
+    pub pattern_path: String,
+    /// Pattern tile size in document pixels per texel.
+    #[serde(default = "default_one")]
+    pub pattern_scale: f32,
 }
 
 fn default_one() -> f32 {
@@ -379,6 +409,7 @@ impl BrushSettings {
             color_jitter: 0.0,
             wet_rate: 1.0,
             shape: BrushShape::SimpleCircle,
+            pixel_art: false,
             roundness: 1.0,
             angle: 0.0,
             follow_stroke: true,
@@ -397,6 +428,10 @@ impl BrushSettings {
             texture_invert_transparency: false,
             texture_angle: 0.0,
             texture_move_with_stroke: false,
+            shape_path: String::new(),
+            paper_path: String::new(),
+            pattern_path: String::new(),
+            pattern_scale: 1.0,
         }
     }
 
@@ -440,6 +475,7 @@ impl BrushSettings {
             color_jitter: 0.0,
             wet_rate: 1.0,
             shape: BrushShape::SimpleCircle,
+            pixel_art: false,
             roundness: 1.0,
             angle: 0.0,
             follow_stroke: true,
@@ -458,6 +494,10 @@ impl BrushSettings {
             texture_invert_transparency: false,
             texture_angle: 0.0,
             texture_move_with_stroke: false,
+            shape_path: String::new(),
+            paper_path: String::new(),
+            pattern_path: String::new(),
+            pattern_scale: 1.0,
         }
     }
 
@@ -489,6 +529,7 @@ impl BrushSettings {
         // Engine ignores this for pixel-art (Bresenham); keep 1.0 for UI/docs.
         brush.spacing = 1.0;
         brush.shape = BrushShape::Square;
+        brush.pixel_art = true;
         brush.shape_sharpen = 1.0;
         brush.hair = 0.0;
         brush.randomize = 0.0;
@@ -573,6 +614,7 @@ impl BrushSettings {
             color_jitter: 0.0,
             wet_rate: 1.0,
             shape: BrushShape::SimpleCircle,
+            pixel_art: false,
             roundness: 1.0,
             angle: 0.0,
             follow_stroke: true,
@@ -591,6 +633,10 @@ impl BrushSettings {
             texture_invert_transparency: false,
             texture_angle: 0.0,
             texture_move_with_stroke: false,
+            shape_path: String::new(),
+            paper_path: String::new(),
+            pattern_path: String::new(),
+            pattern_scale: 1.0,
         }
     }
 
@@ -634,6 +680,7 @@ impl BrushSettings {
             color_jitter: 0.0,
             wet_rate: 1.0,
             shape: BrushShape::SimpleCircle,
+            pixel_art: false,
             roundness: 1.0,
             angle: 0.0,
             follow_stroke: true,
@@ -652,6 +699,10 @@ impl BrushSettings {
             texture_invert_transparency: false,
             texture_angle: 0.0,
             texture_move_with_stroke: false,
+            shape_path: String::new(),
+            paper_path: String::new(),
+            pattern_path: String::new(),
+            pattern_scale: 1.0,
         }
     }
 
@@ -672,10 +723,13 @@ impl BrushSettings {
         self.kind = kind;
     }
 
-    /// Hard square tip (pixel art): binary coverage, no AA fringe.
+    /// Pixel Brush tool: binary coverage, no AA fringe, snapped to the pixel grid.
     #[inline]
     pub fn is_pixel_art(&self) -> bool {
-        self.shape == BrushShape::Square && self.hardness >= 0.999
+        self.pixel_art
+            || (self.shape == BrushShape::Square
+                && self.hardness >= 0.999
+                && self.spacing >= 0.95)
     }
 
     pub fn effective_size(&self, pressure: f32) -> f32 {

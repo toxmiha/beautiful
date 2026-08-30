@@ -22,8 +22,10 @@ pub fn navigator_ui(
     canvas: &mut CanvasState,
     zoom_step: f32,
 ) {
-    let doc_w = document.width as f32;
-    let doc_h = document.height as f32;
+    let (doc_w, doc_h) = {
+        let (sw, sh) = document.canvas_size();
+        (sw as f32, sh as f32)
+    };
     if doc_w <= 0.0 || doc_h <= 0.0 {
         return;
     }
@@ -132,8 +134,9 @@ pub fn navigator_ui(
         ui.label(egui::RichText::new("Zoom").color(theme::text_dim()));
         let mut zoom_pct = canvas.zoom_percent();
         let before = zoom_pct;
+        let zoom_hi = crate::canvas::zoom_max_for_doc(doc_w, doc_h) * 100.0;
         let resp = ui.add(
-            egui::Slider::new(&mut zoom_pct, 5.0..=3200.0)
+            egui::Slider::new(&mut zoom_pct, 5.0..=zoom_hi)
                 .logarithmic(true)
                 .show_value(false)
                 .trailing_fill(true),

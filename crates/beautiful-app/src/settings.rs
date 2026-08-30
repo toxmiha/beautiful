@@ -48,7 +48,12 @@ pub struct FormatFlags {
     pub png: bool,
     pub jpeg: bool,
     pub bmp: bool,
+    pub tga: bool,
     pub webp: bool,
+    pub gif: bool,
+    pub tiff: bool,
+    pub ico: bool,
+    pub svg: bool,
 }
 
 impl Default for FormatFlags {
@@ -59,7 +64,12 @@ impl Default for FormatFlags {
             png: true,
             jpeg: true,
             bmp: true,
+            tga: true,
             webp: true,
+            gif: true,
+            tiff: true,
+            ico: true,
+            svg: true,
         }
     }
 }
@@ -76,34 +86,50 @@ impl FormatFlags {
 pub enum UiMaterial {
     /// Solid opaque chrome (no DWM blur).
     Solid,
+    /// Fluent Acrylic — frosted matte blur.
     #[default]
     Acrylic,
     /// Win11 Mica — wallpaper-tinted opaque backdrop.
     Mica,
     /// Glassmorphism — strong translucency + bright edge.
+    #[serde(alias = "liquid_glass")]
     Glass,
-    /// Legacy glass blur + glossy edge.
-    /// Serde alias keeps older settings.json values working.
+    /// Deprecated — loaded as [`Self::Glass`].
     #[serde(alias = "aero")]
     LegacyGlass,
-    /// Smoke — dimming translucent overlay chrome.
+    /// Deprecated — loaded as [`Self::Glass`].
     Smoke,
 }
 
 impl UiMaterial {
+    /// Materials offered in Preferences.
+    pub const CHOICES: &'static [UiMaterial] = &[
+        Self::Solid,
+        Self::Acrylic,
+        Self::Mica,
+        Self::Glass,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Solid => "Solid",
             Self::Acrylic => "Acrylic",
             Self::Mica => "Mica",
             Self::Glass => "Glassmorphism",
-            Self::LegacyGlass => "Legacy Glass",
-            Self::Smoke => "Smoke",
+            Self::LegacyGlass | Self::Smoke => "Glassmorphism",
         }
     }
 
     pub fn uses_dwm_backdrop(self) -> bool {
         !matches!(self, Self::Solid)
+    }
+
+    /// Collapse deprecated variants to current ones.
+    pub fn normalize(self) -> Self {
+        match self {
+            Self::LegacyGlass | Self::Smoke => Self::Glass,
+            other => other,
+        }
     }
 }
 
@@ -123,6 +149,140 @@ pub enum ThemeBrightness {
     Light,
 }
 
+/// Window / chrome shape preset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowStyle {
+    #[default]
+    Modern,
+    Flat,
+    Rounded,
+    Compact,
+}
+
+impl WindowStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Modern => "Modern",
+            Self::Flat => "Flat",
+            Self::Rounded => "Rounded",
+            Self::Compact => "Compact",
+        }
+    }
+
+    /// Suggested radii: (widget, window, menu).
+    pub fn radii(self) -> (f32, f32, f32) {
+        match self {
+            Self::Modern => (6.0, 12.0, 8.0),
+            Self::Flat => (0.0, 0.0, 0.0),
+            Self::Rounded => (12.0, 18.0, 14.0),
+            Self::Compact => (3.0, 6.0, 4.0),
+        }
+    }
+}
+
+/// Skin / chrome customization (not CSS — native egui visuals + overrides).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiSkin {
+    pub window_style: WindowStyle,
+    /// Widget / button corner radius (px).
+    pub widget_radius: f32,
+    pub window_radius: f32,
+    pub menu_radius: f32,
+    /// Body / button text size.
+    pub text_size: f32,
+    pub heading_size: f32,
+    /// Center label text inside buttons when possible.
+    pub button_text_center: bool,
+    /// Optional wallpaper under chrome (path to image). Empty = none.
+    pub chrome_bg_image: String,
+    pub chrome_bg_opacity: f32,
+    /// Per-surface tint overrides: panel, dock, menu, status, popup, canvas_desk, accent_secondary.
+    pub surface_colors: HashMap<String, [u8; 3]>,
+    /// Rename chrome parts: menu.file, menu.edit, … → custom title.
+    pub chrome_labels: HashMap<String, String>,
+}
+
+impl Default for UiSkin {
+    fn default() -> Self {
+        let (w, win, m) = WindowStyle::Modern.radii();
+        Self {
+            window_style: WindowStyle::Modern,
+            widget_radius: w,
+            window_radius: win,
+            menu_radius: m,
+            text_size: 13.0,
+            heading_size: 14.0,
+            button_text_center: false,
+            chrome_bg_image: String::new(),
+            chrome_bg_opacity: 0.35,
+            surface_colors: HashMap::new(),
+            chrome_labels: HashMap::new(),
+        }
+    }
+}
+
+impl UiSkin {
+    pub fn apply_window_style_preset(&mut self) {
+        let (w, win, m) = self.window_style.radii();
+        self.widget_radius = w;
+        self.window_radius = win;
+        self.menu_radius = m;
+    }
+
+    pub fn clamp(&mut self) {
+        self.widget_radius = self.widget_radius.clamp(0.0, 24.0);
+        self.window_radius = self.window_radius.clamp(0.0, 32.0);
+        self.menu_radius = self.menu_radius.clamp(0.0, 24.0);
+        self.text_size = self.text_size.clamp(10.0, 20.0);
+        self.heading_size = self.heading_size.clamp(11.0, 24.0);
+        self.chrome_bg_opacity = self.chrome_bg_opacity.clamp(0.0, 1.0);
+    }
+
+    pub fn surface_rgb(&self, key: &str) -> Option<[u8; 3]> {
+        self.surface_colors
+            .get(&key.to_ascii_lowercase())
+            .copied()
+    }
+
+    pub fn chrome_label<'a>(&'a self, key: &str, fallback: &'a str) -> &'a str {
+        self.chrome_labels
+            .get(key)
+            .map(|s| s.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(fallback)
+    }
+}
+
+/// GPU display plate cap. Does not change document pixels — only how large a
+/// texture is uploaded when zoomed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayPerformance {
+    /// 4K GPU plate — default.
+    #[default]
+    Normal,
+    /// 2K GPU plate — weaker GPU / less VRAM.
+    Low,
+}
+
+impl DisplayPerformance {
+    pub fn gpu_tex_side(self) -> u32 {
+        match self {
+            Self::Normal => beautiful_core::MAX_GPU_TEX_SIDE,
+            Self::Low => beautiful_core::GPU_TEX_SIDE_LOW,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal (4K)",
+            Self::Low => "Low performance (2K)",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -137,9 +297,25 @@ pub struct AppSettings {
     pub undo_max_steps: usize,
     /// Legacy flag — kept for old settings.json; prefer `material`.
     pub acrylic_enabled: bool,
-    /// 0.0 = subtle, 1.0 = strong DWM tint / blur amount.
+    /// How strongly the frosted desktop blur shows through panels (0 = almost solid, 1 = soft blur).
+    /// Windows DWM has a fixed blur radius — this controls how much of it you see (panel openness + tint).
     pub acrylic_strength: f32,
-    /// Backdrop material (Acrylic / Mica / Glass / Legacy Glass / Smoke / Solid).
+    /// Material color overlay amount (0 = clear blur, 1 = heavy app-color tint).
+    #[serde(default = "default_material_tint")]
+    pub material_tint: f32,
+    /// Bright edge / rim for Glassmorphism (0..1). Soft border for Acrylic.
+    #[serde(default = "default_material_edge")]
+    pub material_edge: f32,
+    /// Frosted milkiness (0 = clearer, 1 = chalky matte). Acrylic + Glassmorphism.
+    #[serde(default = "default_material_matte")]
+    pub material_matte: f32,
+    /// Plate lightness (0 = darker, 0.5 = neutral, 1 = brighter).
+    #[serde(default = "default_material_brightness")]
+    pub material_brightness: f32,
+    /// Soft shadow under panels (0 = flat, 1 = deep).
+    #[serde(default = "default_material_shadow")]
+    pub material_shadow: f32,
+    /// Backdrop material (Solid / Acrylic / Mica / Glassmorphism).
     #[serde(default)]
     pub material: UiMaterial,
     /// When false, dock/chrome panels use opaque fills (no see-through UI).
@@ -164,6 +340,18 @@ pub struct AppSettings {
     /// Interface typeface family name (e.g. "Segoe UI"). Empty = Segoe UI.
     #[serde(default)]
     pub ui_font: String,
+    /// Skin: rounding, text sizes, per-surface colors, chrome labels, wallpaper.
+    #[serde(default)]
+    pub ui_skin: UiSkin,
+    /// Favorite families for the Text tool font picker (shared with UI font picker).
+    #[serde(default)]
+    pub text_font_favorites: Vec<String>,
+    /// Family → tags (font picker RMB).
+    #[serde(default)]
+    pub text_font_tags: HashMap<String, Vec<String>>,
+    /// Known tag names for the font picker filter chips.
+    #[serde(default)]
+    pub text_font_tag_list: Vec<String>,
     /// Global UI chrome / panel / menu base color (solid mode + gradient midpoint).
     #[serde(default = "default_app_color")]
     pub app_color: [u8; 3],
@@ -209,17 +397,26 @@ pub struct AppSettings {
     pub mouse_ramp_distance: f32,
     pub formats_enabled: FormatFlags,
     pub keymap: Keymap,
-    /// Addon id → enabled.
+    /// Addon id → enabled. Missing key = disabled (nothing ships enabled).
     pub addons_enabled: HashMap<String, bool>,
-    /// Show FPS / Mem / Drive / LOD in the bottom status bar (also via F12 profiler).
+    /// Show the bottom status bar (FPS / Mem / Drive / LOD / zoom). Also via F12.
     #[serde(default)]
     pub show_status_metrics: bool,
     /// Zoom change per mouse-wheel notch, percent (e.g. 18 → ×1.18).
     #[serde(default = "default_zoom_step_percent")]
     pub zoom_step_percent: f32,
+    /// Arrow-key canvas pan speed in screen pixels per second.
+    #[serde(default = "default_pan_speed")]
+    pub pan_speed: f32,
+    /// Arrow-key canvas pan speed while Shift is held (px/s).
+    #[serde(default = "default_pan_speed_shift")]
+    pub pan_speed_shift: f32,
     /// Continuous trackpad-style zoom. Off = discrete notches (stabler pivot).
     #[serde(default)]
     pub zoom_smooth: bool,
+    /// GPU present plate cap. Low = 2K for weak PCs.
+    #[serde(default)]
+    pub display_performance: DisplayPerformance,
     /// Write recovery snapshots while editing.
     #[serde(default = "default_true")]
     pub autosave_enabled: bool,
@@ -238,9 +435,6 @@ pub struct AppSettings {
     /// What to show as the main Discord line.
     #[serde(default)]
     pub discord_title_mode: DiscordTitleMode,
-    /// Upload a small canvas thumb as the large Discord image (temporary public host).
-    #[serde(default = "default_true")]
-    pub discord_show_canvas_preview: bool,
     /// Last main-window inner size in points `[w, h]` (custom title-bar chrome).
     #[serde(default)]
     pub window_inner_size: Option<[f32; 2]>,
@@ -250,6 +444,9 @@ pub struct AppSettings {
     /// Whether the main window was maximized on last exit.
     #[serde(default)]
     pub window_maximized: bool,
+    /// UI language code: `ru`, `en`, or an add-on pack id.
+    #[serde(default = "default_ui_language")]
+    pub ui_language: String,
 }
 
 /// Main Discord Rich Presence title line.
@@ -280,9 +477,14 @@ impl Default for AppSettings {
             addons_dir: String::new(),
             resources_dir: String::new(),
             undo_max_steps: 50,
-            acrylic_enabled: crate::os_win::dwm_backdrop_supported(),
+            acrylic_enabled: crate::os_win::backdrop_supported(),
             acrylic_strength: 0.55,
-            material: if crate::os_win::dwm_backdrop_supported() {
+            material_tint: default_material_tint(),
+            material_edge: default_material_edge(),
+            material_matte: default_material_matte(),
+            material_brightness: default_material_brightness(),
+            material_shadow: default_material_shadow(),
+            material: if crate::os_win::backdrop_supported() {
                 UiMaterial::Acrylic
             } else {
                 UiMaterial::Solid
@@ -294,6 +496,10 @@ impl Default for AppSettings {
             color_fill: ColorFillMode::Solid,
             theme_brightness: ThemeBrightness::Dark,
             ui_font: String::new(),
+            ui_skin: UiSkin::default(),
+            text_font_favorites: Vec::new(),
+            text_font_tags: HashMap::new(),
+            text_font_tag_list: Vec::new(),
             app_color: default_app_color(),
             gradient_a: default_gradient_a(),
             gradient_b: default_gradient_b(),
@@ -315,23 +521,34 @@ impl Default for AppSettings {
             addons_enabled: HashMap::new(),
             show_status_metrics: false,
             zoom_step_percent: default_zoom_step_percent(),
+            pan_speed: default_pan_speed(),
+            pan_speed_shift: default_pan_speed_shift(),
             zoom_smooth: false,
+            display_performance: DisplayPerformance::Normal,
             autosave_enabled: true,
             autosave_interval_mins: default_autosave_mins(),
             autosave_keep_versions: default_autosave_keep(),
             discord_rpc_enabled: true,
             discord_client_id: String::new(),
             discord_title_mode: DiscordTitleMode::AppName,
-            discord_show_canvas_preview: true,
             window_inner_size: None,
             window_outer_pos: None,
             window_maximized: false,
+            ui_language: default_ui_language(),
         }
     }
 }
 
 fn default_zoom_step_percent() -> f32 {
     18.0
+}
+
+fn default_pan_speed() -> f32 {
+    380.0
+}
+
+fn default_pan_speed_shift() -> f32 {
+    900.0
 }
 
 fn default_pressure_preset() -> String {
@@ -363,11 +580,15 @@ fn default_autosave_mins() -> u32 {
 }
 
 fn default_autosave_keep() -> usize {
-    3
+    1
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_ui_language() -> String {
+    "ru".into()
 }
 
 fn default_app_color() -> [u8; 3] {
@@ -376,6 +597,26 @@ fn default_app_color() -> [u8; 3] {
 
 fn default_ui_opacity() -> f32 {
     0.85
+}
+
+fn default_material_tint() -> f32 {
+    0.55
+}
+
+fn default_material_edge() -> f32 {
+    0.45
+}
+
+fn default_material_matte() -> f32 {
+    0.55
+}
+
+fn default_material_brightness() -> f32 {
+    0.5
+}
+
+fn default_material_shadow() -> f32 {
+    0.5
 }
 
 fn default_ui_scale() -> f32 {
@@ -408,6 +649,7 @@ fn default_menu_colors() -> HashMap<String, [u8; 3]> {
         "filters",
         "view",
         "window",
+        "settings",
     ]
     .into_iter()
     .map(|k| (k.to_string(), base))
@@ -416,7 +658,29 @@ fn default_menu_colors() -> HashMap<String, [u8; 3]> {
 
 impl AppSettings {
     pub fn app_dir() -> Option<PathBuf> {
-        std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("Beautiful"))
+        // Windows only: APPDATA. On Linux/SteamOS Steam/Proton may export a
+        // volatile APPDATA; using it makes the save-root prompt return every launch.
+        #[cfg(windows)]
+        {
+            if let Some(dir) = std::env::var_os("APPDATA") {
+                return Some(PathBuf::from(dir).join("Beautiful"));
+            }
+        }
+        if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+            return Some(PathBuf::from(dir).join("Beautiful"));
+        }
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("Beautiful"))
+    }
+
+    /// Decode / thumbnail cache (not user art). Windows: LOCALAPPDATA; Linux: XDG_CACHE_HOME.
+    pub fn cache_dir() -> Option<PathBuf> {
+        if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
+            return Some(PathBuf::from(dir).join("Beautiful").join("cache"));
+        }
+        if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
+            return Some(PathBuf::from(dir).join("Beautiful"));
+        }
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache").join("Beautiful"))
     }
 
     pub fn settings_path() -> Option<PathBuf> {
@@ -457,27 +721,103 @@ impl AppSettings {
         if !s.acrylic_enabled && matches!(s.material, UiMaterial::Acrylic) {
             s.material = UiMaterial::Solid;
         }
+        s.material = s.material.normalize();
         // Win10: DWM materials make clicks/popups fall outside the window.
-        if s.material.uses_dwm_backdrop() && !crate::os_win::dwm_backdrop_supported() {
+        if s.material.uses_dwm_backdrop() && !crate::os_win::backdrop_supported() {
             s.material = UiMaterial::Solid;
         }
         s.acrylic_enabled = s.material.uses_dwm_backdrop();
         // Existing documents_dir means the user already has a save root.
+        if s.documents_dir.trim().is_empty() {
+            if let Some(d) = value.get("documents_dir").and_then(|v| v.as_str()) {
+                if !d.trim().is_empty() {
+                    s.documents_dir = d.to_string();
+                }
+            }
+        }
+        if s.documents_dir.trim().is_empty() {
+            if let Some(side) = Self::read_save_root_sidecar() {
+                s.documents_dir = side;
+            }
+        }
         if !s.documents_dir.trim().is_empty() {
+            s.save_root_decided = true;
+        }
+        if value.get("save_root_decided").and_then(|v| v.as_bool()) == Some(true) {
             s.save_root_decided = true;
         }
         s.keymap.ensure_complete();
         s.clamp();
+        // Recover save-root if the full struct failed to round-trip or sidecar exists.
+        if s.documents_dir.trim().is_empty() {
+            if let Some(d) = value.get("documents_dir").and_then(|v| v.as_str()) {
+                if !d.trim().is_empty() {
+                    s.documents_dir = d.to_string();
+                }
+            }
+        }
+        if s.documents_dir.trim().is_empty() {
+            if let Some(side) = Self::read_save_root_sidecar() {
+                s.documents_dir = side;
+            }
+        }
+        if !s.documents_dir.trim().is_empty() {
+            s.save_root_decided = true;
+        }
+        if value.get("save_root_decided").and_then(|v| v.as_bool()) == Some(true) {
+            s.save_root_decided = true;
+        }
         s
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::settings_path().ok_or_else(|| "APPDATA missing".to_string())?;
+        let path = Self::settings_path().ok_or_else(|| "config dir missing".to_string())?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, bytes).map_err(|e| e.to_string())
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            e.to_string()
+        })?;
+        self.write_save_root_sidecar();
+        Ok(())
+    }
+
+    fn save_root_sidecar_path() -> Option<PathBuf> {
+        Self::app_dir().map(|d| d.join("save_root_path.txt"))
+    }
+
+    fn read_save_root_sidecar() -> Option<String> {
+        let path = Self::save_root_sidecar_path()?;
+        let text = std::fs::read_to_string(path).ok()?;
+        let line = text.lines().next()?.trim();
+        if line.is_empty() {
+            None
+        } else {
+            Some(line.to_string())
+        }
+    }
+
+    fn write_save_root_sidecar(&self) {
+        let Some(path) = Self::save_root_sidecar_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let body = if self.documents_dir.trim().is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", self.documents_dir.trim())
+        };
+        let _ = std::fs::write(path, body);
     }
 
     pub fn reset_all(&mut self) {
@@ -488,6 +828,11 @@ impl AppSettings {
         let d = Self::default();
         self.acrylic_enabled = d.acrylic_enabled;
         self.acrylic_strength = d.acrylic_strength;
+        self.material_tint = d.material_tint;
+        self.material_edge = d.material_edge;
+        self.material_matte = d.material_matte;
+        self.material_brightness = d.material_brightness;
+        self.material_shadow = d.material_shadow;
         self.material = d.material;
         self.ui_transparency = d.ui_transparency;
         self.ui_opacity = d.ui_opacity;
@@ -496,6 +841,7 @@ impl AppSettings {
         self.color_fill = d.color_fill;
         self.theme_brightness = d.theme_brightness;
         self.ui_font = d.ui_font;
+        self.ui_skin = d.ui_skin;
         self.app_color = d.app_color;
         self.gradient_a = d.gradient_a;
         self.gradient_b = d.gradient_b;
@@ -506,7 +852,8 @@ impl AppSettings {
     }
 
     pub fn set_material(&mut self, material: UiMaterial) {
-        let material = if material.uses_dwm_backdrop() && !crate::os_win::dwm_backdrop_supported() {
+        let material = material.normalize();
+        let material = if material.uses_dwm_backdrop() && !crate::os_win::backdrop_supported() {
             UiMaterial::Solid
         } else {
             material
@@ -575,7 +922,7 @@ impl AppSettings {
             ]
         };
         for key in [
-            "file", "edit", "canvas", "selection", "filters", "view", "window",
+            "file", "edit", "canvas", "selection", "filters", "view", "window", "settings",
         ] {
             self.menu_colors.insert(key.to_string(), lifted);
         }
@@ -682,7 +1029,13 @@ impl AppSettings {
     pub fn clamp(&mut self) {
         self.undo_max_steps = self.undo_max_steps.clamp(10, 200);
         self.acrylic_strength = self.acrylic_strength.clamp(0.0, 1.0);
-        self.ui_opacity = self.ui_opacity.clamp(0.2, 1.0);
+        self.material_tint = self.material_tint.clamp(0.0, 1.0);
+        self.material_edge = self.material_edge.clamp(0.0, 1.0);
+        self.material_matte = self.material_matte.clamp(0.0, 1.0);
+        self.material_brightness = self.material_brightness.clamp(0.0, 1.0);
+        self.material_shadow = self.material_shadow.clamp(0.0, 1.0);
+        self.material = self.material.normalize();
+        self.ui_opacity = self.ui_opacity.clamp(0.15, 1.0);
         self.ui_scale = self.ui_scale.clamp(0.75, 2.0);
         self.gradient_angle_deg = self.gradient_angle_deg.rem_euclid(360.0);
         self.gradient_saturation = self.gradient_saturation.clamp(0.0, 2.0);
@@ -696,9 +1049,16 @@ impl AppSettings {
         self.mouse_velocity_smooth = self.mouse_velocity_smooth.clamp(0.05, 1.0);
         self.mouse_ramp_distance = self.mouse_ramp_distance.clamp(20.0, 2000.0);
         self.zoom_step_percent = self.zoom_step_percent.clamp(5.0, 50.0);
+        self.pan_speed = self.pan_speed.clamp(20.0, 4000.0);
+        self.pan_speed_shift = self.pan_speed_shift.clamp(20.0, 8000.0);
+        self.keymap.gamepad_feel.clamp();
         self.autosave_interval_mins = self.autosave_interval_mins.clamp(1, 60);
         self.autosave_keep_versions = self.autosave_keep_versions.clamp(1, 20);
         self.acrylic_enabled = self.material.uses_dwm_backdrop();
+        self.ui_skin.clamp();
+        if self.ui_language.trim().is_empty() {
+            self.ui_language = default_ui_language();
+        }
     }
 
     /// Multiplicative zoom factor for one wheel notch / ± button.

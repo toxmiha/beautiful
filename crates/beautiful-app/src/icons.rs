@@ -22,6 +22,8 @@ pub enum ToolIcon {
     Warp,
     Kruler,
     Crop,
+    Undo,
+    Redo,
     FlipH,
     FlipV,
     LayerUp,
@@ -57,6 +59,7 @@ pub enum ToolIcon {
     Link,
     Vignette,
     Glow,
+    Text,
 }
 
 pub fn paint(painter: &egui::Painter, rect: Rect, icon: ToolIcon, color: Color32) {
@@ -352,6 +355,33 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: ToolIcon, color: Color32
                 painter.line_segment([p, p + a * arm], thick);
                 painter.line_segment([p, p + b * arm], thick);
             }
+        }
+        ToolIcon::Undo => {
+            // Curved arrow CCW (left).
+            let r = s * 0.42;
+            let a0 = c + Vec2::new(s * 0.06 + r * 0.15, -r * 0.85);
+            let a1 = c + Vec2::new(s * 0.06 - r * 0.75, -r * 0.35);
+            let a2 = c + Vec2::new(s * 0.06 - r * 0.75, r * 0.45);
+            let a3 = c + Vec2::new(s * 0.06 + r * 0.1, r * 0.85);
+            painter.line_segment([a0, a1], thick);
+            painter.line_segment([a1, a2], thick);
+            painter.line_segment([a2, a3], thick);
+            let tip = a0;
+            painter.line_segment([tip, tip + Vec2::new(s * 0.22, s * 0.02)], thick);
+            painter.line_segment([tip, tip + Vec2::new(s * 0.02, s * 0.22)], thick);
+        }
+        ToolIcon::Redo => {
+            let r = s * 0.42;
+            let a0 = c + Vec2::new(-s * 0.06 - r * 0.15, -r * 0.85);
+            let a1 = c + Vec2::new(-s * 0.06 + r * 0.75, -r * 0.35);
+            let a2 = c + Vec2::new(-s * 0.06 + r * 0.75, r * 0.45);
+            let a3 = c + Vec2::new(-s * 0.06 - r * 0.1, r * 0.85);
+            painter.line_segment([a0, a1], thick);
+            painter.line_segment([a1, a2], thick);
+            painter.line_segment([a2, a3], thick);
+            let tip = a0;
+            painter.line_segment([tip, tip + Vec2::new(-s * 0.22, s * 0.02)], thick);
+            painter.line_segment([tip, tip + Vec2::new(-s * 0.02, s * 0.22)], thick);
         }
         ToolIcon::FlipH => {
             painter.line_segment([c + Vec2::new(0.0, -s * 0.46), c + Vec2::new(0.0, s * 0.46)], stroke);
@@ -671,6 +701,18 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: ToolIcon, color: Color32
                     Stroke::new(1.3_f32, color),
                 );
             }
+        }
+        ToolIcon::Text => {
+            // Simple "T" mark.
+            let top = c + Vec2::new(0.0, -s * 0.38);
+            painter.line_segment(
+                [top + Vec2::new(-s * 0.28, 0.0), top + Vec2::new(s * 0.28, 0.0)],
+                Stroke::new(2.0_f32, color),
+            );
+            painter.line_segment(
+                [top, c + Vec2::new(0.0, s * 0.4)],
+                Stroke::new(2.0_f32, color),
+            );
         }
     }
 }

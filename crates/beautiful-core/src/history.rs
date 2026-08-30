@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::composite::DirtyRect;
 use crate::layer::Layer;
 use crate::mask_tiles::AlphaTileMap;
-use crate::selection::{SelectionMask, SelectionRect};
+use crate::selection::{SelectionMask, SelectionOutline, SelectionRect};
 use crate::tiles::{TileArc, TileBuffer, TileKey};
 
 const DEFAULT_MAX_STEPS: usize = 50;
@@ -15,7 +15,7 @@ const DEFAULT_MAX_STEPS: usize = 50;
 pub struct SelectionSnap {
     pub rect: Option<SelectionRect>,
     pub mask: Option<SelectionMask>,
-    pub outline: Vec<(f32, f32)>,
+    pub outline: SelectionOutline,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +65,13 @@ pub enum HistoryEntry {
         before: SelectionSnap,
         after: SelectionSnap,
     },
+    /// Editable text IR (typing / move / style). Cache is rebuilt on restore.
+    Text {
+        layer_idx: usize,
+        before: crate::text::TextObject,
+        after: crate::text::TextObject,
+        dirty: DirtyRect,
+    },
     /// Layer mask tiles (mask paint stroke). `None` = "reveal all" / no mask.
     LayerMask {
         layer_idx: usize,
@@ -73,6 +80,11 @@ pub enum HistoryEntry {
         after: Option<AlphaTileMap>,
         after_enabled: bool,
         dirty: DirtyRect,
+    },
+    /// Visible stage / crop viewport (`[x,y,w,h]`; `None` = full buffer).
+    Stage {
+        before: Option<[u32; 4]>,
+        after: Option<[u32; 4]>,
     },
 }
 
@@ -83,6 +95,8 @@ pub struct HistoryEffect {
     pub selection: Option<SelectionSnap>,
     /// Layer whose pixels/mask were restored (for hidden-layer undo toast).
     pub affected_layer: Option<usize>,
+    /// When set, restore document stage to this value (`None` = full buffer).
+    pub stage: Option<Option<[u32; 4]>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,6 +172,246 @@ impl History {
         self.redo.clear();
     }
 
+    /// Keep undo/redo usable after pasteboard `expand_margins` (pixel origin shift).
+    /// Drops entries that cannot be remapped safely (structure snapshots).
+    pub fn pad_margins(&mut self, left: u32, top: u32, right: u32, bottom: u32) {
+        if left == 0 && top == 0 && right == 0 && bottom == 0 {
+            return;
+        }
+        let shift_rect = |r: &mut DirtyRect| {
+            r.x0 = r.x0.saturating_add(left);
+            r.y0 = r.y0.saturating_add(top);
+            r.x1 = r.x1.saturating_add(left);
+            r.y1 = r.y1.saturating_add(top);
+        };
+        let shift_sel = |s: &mut SelectionSnap| {
+            if let Some(r) = s.rect.as_mut() {
+                r.x0 += left as f32;
+                r.x1 += left as f32;
+                r.y0 += top as f32;
+                r.y1 += top as f32;
+            }
+            if let Some(m) = s.mask.as_mut() {
+                m.x += left as f32;
+                m.y += top as f32;
+            }
+            for path in &mut s.outline {
+                for p in path {
+                    p.0 += left as f32;
+                    p.1 += top as f32;
+                }
+            }
+        };
+
+        let mut keep_undo = Vec::with_capacity(self.undo.len());
+        for mut e in self.undo.drain(..) {
+            match &mut e {
+                HistoryEntry::Region { rect, .. } => {
+                    shift_rect(rect);
+                    keep_undo.push(e);
+                }
+                HistoryEntry::LayerTiles {
+                    before,
+                    after,
+                    dirty,
+                    undo_sel,
+                    redo_sel,
+                    ..
+                } => {
+                    before.pad_margins(left, top, right, bottom);
+                    after.pad_margins(left, top, right, bottom);
+                    shift_rect(dirty);
+                    if let Some(s) = undo_sel.as_mut() {
+                        shift_sel(s);
+                    }
+                    if let Some(s) = redo_sel.as_mut() {
+                        shift_sel(s);
+                    }
+                    keep_undo.push(e);
+                }
+                HistoryEntry::LayerTileDiff { .. } | HistoryEntry::Layers { .. } => {
+                    // Tile-key diffs / full stacks are not remapped — drop to avoid corrupt undo.
+                }
+                HistoryEntry::LayerInsert { .. } => {}
+                HistoryEntry::Selection { before, after } => {
+                    shift_sel(before);
+                    shift_sel(after);
+                    keep_undo.push(e);
+                }
+                HistoryEntry::Text { dirty, before, after, .. } => {
+                    shift_rect(dirty);
+                    before.x += left as f32;
+                    before.y += top as f32;
+                    after.x += left as f32;
+                    after.y += top as f32;
+                    keep_undo.push(e);
+                }
+                HistoryEntry::LayerMask {
+                    before,
+                    after,
+                    dirty,
+                    ..
+                } => {
+                    shift_rect(dirty);
+                    if let Some(m) = before.as_mut() {
+                        *m = m.cropped_to(-(left as i32), -(top as i32), m.width + left + right, m.height + top + bottom);
+                    }
+                    if let Some(m) = after.as_mut() {
+                        *m = m.cropped_to(-(left as i32), -(top as i32), m.width + left + right, m.height + top + bottom);
+                    }
+                    keep_undo.push(e);
+                }
+                HistoryEntry::Stage { before, after } => {
+                    let shift = |s: &mut Option<[u32; 4]>| {
+                        if let Some([x, y, w, h]) = s.as_mut() {
+                            *x = x.saturating_add(left);
+                            *y = y.saturating_add(top);
+                            let _ = (w, h);
+                        }
+                    };
+                    shift(before);
+                    shift(after);
+                    keep_undo.push(e);
+                }
+            }
+        }
+        self.undo = keep_undo;
+        // Redo after a geometry change is rarely valid — drop it.
+        self.redo.clear();
+
+        if let Some(before) = self.stroke_before.as_mut() {
+            before.pad_margins(left, top, right, bottom);
+            shift_rect(&mut self.stroke_dirty);
+        }
+        if let Some(Some(before)) = self.mask_stroke_before.as_mut() {
+            *before = before.cropped_to(
+                -(left as i32),
+                -(top as i32),
+                before.width + left + right,
+                before.height + top + bottom,
+            );
+            shift_rect(&mut self.mask_stroke_dirty);
+        }
+    }
+
+    /// Keep undo/redo usable after pasteboard `compact_pasteboard` (crop to stage).
+    pub fn crop_to_rect(&mut self, x0: u32, y0: u32, nw: u32, nh: u32) {
+        if x0 == 0 && y0 == 0 {
+            // Width/height-only shrink: still crop tile buffers that are larger.
+        }
+        let shift_rect = |r: &mut DirtyRect| {
+            r.x0 = r.x0.saturating_sub(x0).min(nw);
+            r.y0 = r.y0.saturating_sub(y0).min(nh);
+            r.x1 = r.x1.saturating_sub(x0).min(nw);
+            r.y1 = r.y1.saturating_sub(y0).min(nh);
+        };
+        let shift_sel = |s: &mut SelectionSnap| {
+            let ox = x0 as f32;
+            let oy = y0 as f32;
+            if let Some(r) = s.rect.as_mut() {
+                r.x0 -= ox;
+                r.x1 -= ox;
+                r.y0 -= oy;
+                r.y1 -= oy;
+            }
+            if let Some(m) = s.mask.as_mut() {
+                m.x -= ox;
+                m.y -= oy;
+            }
+            for path in &mut s.outline {
+                for p in path {
+                    p.0 -= ox;
+                    p.1 -= oy;
+                }
+            }
+        };
+
+        let mut keep_undo = Vec::with_capacity(self.undo.len());
+        for mut e in self.undo.drain(..) {
+            match &mut e {
+                HistoryEntry::Region { rect, .. } => {
+                    shift_rect(rect);
+                    if !rect.is_empty() {
+                        keep_undo.push(e);
+                    }
+                }
+                HistoryEntry::LayerTiles {
+                    before,
+                    after,
+                    dirty,
+                    undo_sel,
+                    redo_sel,
+                    ..
+                } => {
+                    before.crop_to_rect(x0, y0, nw, nh);
+                    after.crop_to_rect(x0, y0, nw, nh);
+                    shift_rect(dirty);
+                    if let Some(s) = undo_sel.as_mut() {
+                        shift_sel(s);
+                    }
+                    if let Some(s) = redo_sel.as_mut() {
+                        shift_sel(s);
+                    }
+                    keep_undo.push(e);
+                }
+                HistoryEntry::LayerTileDiff { .. } | HistoryEntry::Layers { .. } => {}
+                HistoryEntry::LayerInsert { .. } => {}
+                HistoryEntry::Selection { before, after } => {
+                    shift_sel(before);
+                    shift_sel(after);
+                    keep_undo.push(e);
+                }
+                HistoryEntry::Text { dirty, before, after, .. } => {
+                    shift_rect(dirty);
+                    before.x -= x0 as f32;
+                    before.y -= y0 as f32;
+                    after.x -= x0 as f32;
+                    after.y -= y0 as f32;
+                    keep_undo.push(e);
+                }
+                HistoryEntry::LayerMask {
+                    before,
+                    after,
+                    dirty,
+                    ..
+                } => {
+                    shift_rect(dirty);
+                    if let Some(m) = before.as_mut() {
+                        *m = m.cropped_to(x0 as i32, y0 as i32, nw, nh);
+                    }
+                    if let Some(m) = after.as_mut() {
+                        *m = m.cropped_to(x0 as i32, y0 as i32, nw, nh);
+                    }
+                    keep_undo.push(e);
+                }
+                HistoryEntry::Stage { before, after } => {
+                    let shift = |s: &mut Option<[u32; 4]>| {
+                        if let Some([x, y, w, h]) = s.as_mut() {
+                            *x = x.saturating_sub(x0);
+                            *y = y.saturating_sub(y0);
+                            *w = (*w).min(nw.saturating_sub(*x)).max(2);
+                            *h = (*h).min(nh.saturating_sub(*y)).max(2);
+                        }
+                    };
+                    shift(before);
+                    shift(after);
+                    keep_undo.push(e);
+                }
+            }
+        }
+        self.undo = keep_undo;
+        self.redo.clear();
+
+        if let Some(before) = self.stroke_before.as_mut() {
+            before.crop_to_rect(x0, y0, nw, nh);
+            shift_rect(&mut self.stroke_dirty);
+        }
+        if let Some(Some(before)) = self.mask_stroke_before.as_mut() {
+            *before = before.cropped_to(x0 as i32, y0 as i32, nw, nh);
+            shift_rect(&mut self.mask_stroke_dirty);
+        }
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
     }
@@ -191,6 +445,11 @@ impl History {
 
     pub fn stroke_dirty(&self) -> DirtyRect {
         self.stroke_dirty
+    }
+
+    /// Pre-stroke tile map (shared Arcs) while a gesture is open.
+    pub fn stroke_before_tiles(&self) -> Option<&TileBuffer> {
+        self.stroke_before.as_ref()
     }
 
     /// Begin stroke with a cheap shared Arc tile snapshot (COW).
@@ -434,6 +693,71 @@ impl History {
         self.push(HistoryEntry::Selection { before, after });
     }
 
+    pub fn push_stage(&mut self, before: Option<[u32; 4]>, after: Option<[u32; 4]>) {
+        if before == after {
+            return;
+        }
+        self.push(HistoryEntry::Stage { before, after });
+    }
+
+    pub fn push_text(
+        &mut self,
+        layer_idx: usize,
+        before: crate::text::TextObject,
+        after: crate::text::TextObject,
+        dirty: DirtyRect,
+    ) {
+        if let Some(HistoryEntry::Text {
+            layer_idx: li,
+            after: prev_after,
+            dirty: d,
+            ..
+        }) = self.undo.last_mut()
+        {
+            if *li == layer_idx {
+                *prev_after = after;
+                d.union(dirty);
+                return;
+            }
+        }
+        self.push(HistoryEntry::Text {
+            layer_idx,
+            before,
+            after,
+            dirty,
+        });
+    }
+
+    /// Same-layer typing: keep the original `before`, replace `after`.
+    pub fn extend_text_after(
+        &mut self,
+        layer_idx: usize,
+        after: crate::text::TextObject,
+        dirty: DirtyRect,
+    ) -> bool {
+        if let Some(HistoryEntry::Text {
+            layer_idx: li,
+            after: prev_after,
+            dirty: d,
+            ..
+        }) = self.undo.last_mut()
+        {
+            if *li == layer_idx {
+                *prev_after = after;
+                d.union(dirty);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn last_is_text_layer(&self, layer_idx: usize) -> bool {
+        matches!(
+            self.undo.last(),
+            Some(HistoryEntry::Text { layer_idx: li, .. }) if *li == layer_idx
+        )
+    }
+
     fn push(&mut self, entry: HistoryEntry) {
         self.redo.clear();
         self.undo.push(entry);
@@ -462,6 +786,7 @@ impl History {
                     dirty: HistoryDirty::Region(*rect),
                     selection: None,
                     affected_layer: Some(*layer_idx),
+                    stage: None,
                 }
             }
             HistoryEntry::LayerTiles {
@@ -479,6 +804,7 @@ impl History {
                     dirty: HistoryDirty::Region(*dirty),
                     selection: undo_sel.clone(),
                     affected_layer: Some(*layer_idx),
+                    stage: None,
                 }
             }
             HistoryEntry::LayerTileDiff {
@@ -496,6 +822,7 @@ impl History {
                     dirty: HistoryDirty::Region(*dirty),
                     selection: undo_sel.clone(),
                     affected_layer: Some(*layer_idx),
+                    stage: None,
                 }
             }
             HistoryEntry::LayerMask {
@@ -513,6 +840,7 @@ impl History {
                     dirty: HistoryDirty::Region(*dirty),
                     selection: None,
                     affected_layer: Some(*layer_idx),
+                    stage: None,
                 }
             }
             HistoryEntry::Layers {
@@ -526,6 +854,7 @@ impl History {
                     dirty: HistoryDirty::Full,
                     selection: None,
                     affected_layer: None,
+                    stage: None,
                 }
             }
             HistoryEntry::LayerInsert {
@@ -541,12 +870,39 @@ impl History {
                     dirty: HistoryDirty::Full,
                     selection: None,
                     affected_layer: None,
+                    stage: None,
                 }
             }
             HistoryEntry::Selection { before, .. } => HistoryEffect {
                 dirty: HistoryDirty::Full,
                 selection: Some(before.clone()),
                 affected_layer: None,
+                    stage: None,
+            },
+            HistoryEntry::Text {
+                layer_idx,
+                before,
+                dirty,
+                ..
+            } => {
+                if let Some(layer) = layers.get_mut(*layer_idx) {
+                    if let Some(payload) = layer.text.as_mut() {
+                        payload.object = before.clone();
+                        payload.touch();
+                    }
+                }
+                HistoryEffect {
+                    dirty: HistoryDirty::Region(*dirty),
+                    selection: None,
+                    affected_layer: Some(*layer_idx),
+                    stage: None,
+                }
+            },
+            HistoryEntry::Stage { before, .. } => HistoryEffect {
+                dirty: HistoryDirty::Full,
+                selection: None,
+                affected_layer: None,
+                stage: Some(*before),
             },
         };
         self.redo.push(entry);
@@ -573,6 +929,7 @@ impl History {
                     dirty: HistoryDirty::Region(*rect),
                     selection: None,
                     affected_layer: Some(*layer_idx),
+                    stage: None,
                 }
             }
             HistoryEntry::LayerTiles {
@@ -590,6 +947,7 @@ impl History {
                     dirty: HistoryDirty::Region(*dirty),
                     selection: redo_sel.clone(),
                     affected_layer: Some(*layer_idx),
+                    stage: None,
                 }
             }
             HistoryEntry::LayerTileDiff {
@@ -607,6 +965,7 @@ impl History {
                     dirty: HistoryDirty::Region(*dirty),
                     selection: redo_sel.clone(),
                     affected_layer: Some(*layer_idx),
+                    stage: None,
                 }
             }
             HistoryEntry::LayerMask {
@@ -624,6 +983,7 @@ impl History {
                     dirty: HistoryDirty::Region(*dirty),
                     selection: None,
                     affected_layer: Some(*layer_idx),
+                    stage: None,
                 }
             }
             HistoryEntry::Layers {
@@ -637,6 +997,7 @@ impl History {
                     dirty: HistoryDirty::Full,
                     selection: None,
                     affected_layer: None,
+                    stage: None,
                 }
             }
             HistoryEntry::LayerInsert {
@@ -652,12 +1013,39 @@ impl History {
                     dirty: HistoryDirty::Full,
                     selection: None,
                     affected_layer: None,
+                    stage: None,
                 }
             }
             HistoryEntry::Selection { after, .. } => HistoryEffect {
                 dirty: HistoryDirty::Full,
                 selection: Some(after.clone()),
                 affected_layer: None,
+                    stage: None,
+            },
+            HistoryEntry::Text {
+                layer_idx,
+                after,
+                dirty,
+                ..
+            } => {
+                if let Some(layer) = layers.get_mut(*layer_idx) {
+                    if let Some(payload) = layer.text.as_mut() {
+                        payload.object = after.clone();
+                        payload.touch();
+                    }
+                }
+                HistoryEffect {
+                    dirty: HistoryDirty::Region(*dirty),
+                    selection: None,
+                    affected_layer: Some(*layer_idx),
+                    stage: None,
+                }
+            },
+            HistoryEntry::Stage { after, .. } => HistoryEffect {
+                dirty: HistoryDirty::Full,
+                selection: None,
+                affected_layer: None,
+                stage: Some(*after),
             },
         };
         self.undo.push(entry);
@@ -666,7 +1054,11 @@ impl History {
 }
 
 fn snap_approx_bytes(s: &SelectionSnap) -> u64 {
-    let mut n = (s.outline.len() * std::mem::size_of::<(f32, f32)>()) as u64;
+    let mut n = s
+        .outline
+        .iter()
+        .map(|r| r.len() * std::mem::size_of::<(f32, f32)>())
+        .sum::<usize>() as u64;
     if let Some(m) = &s.mask {
         n = n.saturating_add(m.alpha.len() as u64);
     }
@@ -724,6 +1116,10 @@ fn entry_approx_bytes(e: &HistoryEntry) -> u64 {
         HistoryEntry::Selection { before, after } => {
             snap_approx_bytes(before).saturating_add(snap_approx_bytes(after))
         }
+        HistoryEntry::Text { before, after, .. } => {
+            (before.content.len() + after.content.len()) as u64
+        }
+        HistoryEntry::Stage { .. } => 32,
     }
 }
 

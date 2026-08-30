@@ -361,6 +361,128 @@ pub(crate) fn paint_lod_debug_overlay(
     paint_debug_hud(painter, stack, &label);
 }
 
+fn pixel_tip_covers(shape: beautiful_core::BrushShape, n: i32, lx: i32, ly: i32) -> bool {
+    if lx < 0 || ly < 0 || lx >= n || ly >= n {
+        return false;
+    }
+    match shape {
+        beautiful_core::BrushShape::Square | beautiful_core::BrushShape::Slash => true,
+        _ => {
+            let c = (n as f32 - 1.0) * 0.5;
+            let dx = lx as f32 - c;
+            let dy = ly as f32 - c;
+            let d2 = dx * dx + dy * dy;
+            let r = n as f32 * 0.5;
+            if d2 > r * r {
+                return false;
+            }
+            if matches!(shape, beautiful_core::BrushShape::Ring) && n > 2 {
+                let inner = (r - 1.0).max(0.0);
+                d2 >= inner * inner
+            } else {
+                true
+            }
+        }
+    }
+}
+
+fn paint_pixel_brush_cursor(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    canvas_rect: egui::Rect,
+    doc_w: f32,
+    doc_h: f32,
+    zoom: f32,
+    rotation_deg: f32,
+    flip_h: bool,
+    document: &Document,
+) {
+    let Some((dx, dy)) = screen_to_canvas(pos, canvas_rect, doc_w, doc_h, rotation_deg, flip_h)
+    else {
+        return;
+    };
+    let n = document.brush.size.round().max(1.0) as i32;
+    let px = dx.floor() as i32;
+    let py = dy.floor() as i32;
+    let x0 = px - n / 2;
+    let y0 = py - n / 2;
+    let center = canvas_rect.center();
+    let display_size = canvas_rect.size();
+    let map = |x: f32, y: f32| {
+        doc_to_screen(
+            center,
+            display_size,
+            rotation_deg,
+            x,
+            y,
+            doc_w,
+            doc_h,
+            flip_h,
+        )
+    };
+    let stroke_outer = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(220));
+    let stroke_halo = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90));
+    let cell = |ix: i32, iy: i32| {
+        [
+            map(ix as f32, iy as f32),
+            map(ix as f32 + 1.0, iy as f32),
+            map(ix as f32 + 1.0, iy as f32 + 1.0),
+            map(ix as f32, iy as f32 + 1.0),
+        ]
+    };
+    let stroke_quad = |pts: [egui::Pos2; 4]| {
+        for w in pts.windows(2) {
+            painter.line_segment([w[0], w[1]], stroke_halo);
+            painter.line_segment([w[0], w[1]], stroke_outer);
+        }
+        painter.line_segment([pts[3], pts[0]], stroke_halo);
+        painter.line_segment([pts[3], pts[0]], stroke_outer);
+    };
+
+    if n <= 32 && zoom >= 3.0 {
+        for ly in 0..n {
+            for lx in 0..n {
+                if pixel_tip_covers(document.brush.shape, n, lx, ly) {
+                    stroke_quad(cell(x0 + lx, y0 + ly));
+                }
+            }
+        }
+    } else {
+        match document.brush.shape {
+            beautiful_core::BrushShape::Ring => {
+                let cx = x0 as f32 + n as f32 * 0.5;
+                let cy = y0 as f32 + n as f32 * 0.5;
+                let c = map(cx, cy);
+                let r_out = (n as f32 * 0.5 * zoom).max(1.0);
+                let r_in = ((n as f32 * 0.5 - 1.0).max(0.0) * zoom).max(0.5);
+                painter.circle_stroke(c, r_out, stroke_halo);
+                painter.circle_stroke(c, r_out, stroke_outer);
+                if n > 2 {
+                    painter.circle_stroke(c, r_in, stroke_halo);
+                    painter.circle_stroke(c, r_in, stroke_outer);
+                }
+            }
+            beautiful_core::BrushShape::SimpleCircle | beautiful_core::BrushShape::SoftEdge => {
+                let cx = x0 as f32 + n as f32 * 0.5;
+                let cy = y0 as f32 + n as f32 * 0.5;
+                let c = map(cx, cy);
+                let r = (n as f32 * 0.5 * zoom).max(1.0);
+                painter.circle_stroke(c, r, stroke_halo);
+                painter.circle_stroke(c, r, stroke_outer);
+            }
+            _ => {
+                stroke_quad([
+                    map(x0 as f32, y0 as f32),
+                    map((x0 + n) as f32, y0 as f32),
+                    map((x0 + n) as f32, (y0 + n) as f32),
+                    map(x0 as f32, (y0 + n) as f32),
+                ]);
+            }
+        }
+    }
+    paint_brush_crosshair(painter, pos);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_brush_cursor(
     ctx: &Context,
@@ -371,10 +493,12 @@ pub(crate) fn paint_brush_cursor(
     doc_h: f32,
     zoom: f32,
     rotation_deg: f32,
+    flip_h: bool,
     document: &Document,
     tool: WorkspaceTool,
+    gamepad_pos: Option<egui::Pos2>,
 ) {
-    let show = matches!(
+    let paint_tool = matches!(
         tool,
         WorkspaceTool::Brush
             | WorkspaceTool::Pencil
@@ -383,24 +507,28 @@ pub(crate) fn paint_brush_cursor(
             | WorkspaceTool::Mixer
             | WorkspaceTool::Eraser
             | WorkspaceTool::Smudge
+            | WorkspaceTool::Blur
+            | WorkspaceTool::CloneBrush
             | WorkspaceTool::SelectionBrush
             | WorkspaceTool::SelectionEraser
-    ) && (response.hovered() || response.is_pointer_button_down_on())
+    );
+    let mouse_show = paint_tool
+        && (response.hovered() || response.is_pointer_button_down_on())
         && zoom > 0.0;
-
-    if !show {
+    let gp_show = paint_tool && gamepad_pos.is_some() && zoom > 0.0;
+    if !mouse_show && !gp_show {
         return;
     }
 
-    // Keep the system mouse cursor (user preference). Brush ring is a guide only.
     ctx.set_cursor_icon(egui::CursorIcon::Default);
 
     // Prefer the freshest pointer sample (raw move), not only widget hover cache.
-    let Some(pos) = ctx
-        .pointer_latest_pos()
-        .or_else(|| response.hover_pos())
-        .or_else(|| response.interact_pointer_pos())
-    else {
+    let pos = gamepad_pos.or_else(|| {
+        ctx.pointer_latest_pos()
+            .or_else(|| response.hover_pos())
+            .or_else(|| response.interact_pointer_pos())
+    });
+    let Some(pos) = pos else {
         return;
     };
 
@@ -410,25 +538,168 @@ pub(crate) fn paint_brush_cursor(
         egui::Id::new("brush_cursor_overlay"),
     ));
 
+    if document.brush.is_pixel_art() {
+        paint_pixel_brush_cursor(
+            &painter,
+            pos,
+            canvas_rect,
+            doc_w,
+            doc_h,
+            zoom,
+            rotation_deg,
+            flip_h,
+            document,
+        );
+        return;
+    }
+
     let brush = &document.brush;
     let radius_screen = (brush.size * 0.5 * zoom).max(1.0);
     let hardness = brush.hardness.clamp(0.0, 1.0);
     let inner = (radius_screen * hardness).max(0.0);
 
-    // Stroke-only outline: filled discs are expensive to tessellate every move.
     let stroke_outer = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(220));
-    let stroke_inner = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(160));
-    painter.circle_stroke(pos, radius_screen, stroke_outer);
-    // Dark halo for contrast on light canvas.
-    painter.circle_stroke(
-        pos,
-        radius_screen,
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90)),
-    );
-    if inner > 1.0 && (radius_screen - inner) > 0.75 {
-        painter.circle_stroke(pos, inner, stroke_inner);
+    let stroke_halo = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90));
+
+    let tip_angle = document.tip_pose_angle();
+    let roundness = match brush.shape {
+        beautiful_core::BrushShape::Slash => brush.roundness.clamp(0.05, 1.0).min(0.35),
+        _ => brush.roundness.clamp(0.05, 1.0),
+    };
+    let flip_x = brush.tip_flip_x;
+    let flip_y = brush.tip_flip_y;
+    let view = rotation_deg.to_radians();
+    let (vs, vc) = view.sin_cos();
+    let (s, c) = tip_angle.sin_cos();
+    let diameter = brush.size.max(1.0);
+    let to_screen = |u: f32, v: f32| -> egui::Pos2 {
+        // u,v in [-0.5, 0.5] tip space (x along major, y scaled by roundness).
+        let rx = u * diameter;
+        let ry = v * diameter * roundness;
+        let dxp = rx * c - ry * s;
+        let dyp = rx * s + ry * c;
+        let dx = if flip_x { -dxp } else { dxp };
+        let dy = if flip_y { -dyp } else { dyp };
+        let sx = (dx * vc - dy * vs) * zoom;
+        let sy = (dx * vs + dy * vc) * zoom;
+        pos + egui::vec2(sx, sy)
+    };
+    let stroke_poly = |pts: &[egui::Pos2]| {
+        if pts.len() < 2 {
+            return;
+        }
+        for w in pts.windows(2) {
+            painter.line_segment([w[0], w[1]], stroke_halo);
+            painter.line_segment([w[0], w[1]], stroke_outer);
+        }
+        painter.line_segment([*pts.last().unwrap(), pts[0]], stroke_halo);
+        painter.line_segment([*pts.last().unwrap(), pts[0]], stroke_outer);
+    };
+
+    let shape_path = brush.shape_path.trim();
+    if !shape_path.is_empty() {
+        let segs = beautiful_core::shape_outline(shape_path, brush.shape_invert);
+        if !segs.is_empty() {
+            let n = segs.len().min(28_000);
+            for &(a, b) in segs.iter().take(n) {
+                let p0 = to_screen(a.0 - 0.5, a.1 - 0.5);
+                let p1 = to_screen(b.0 - 0.5, b.1 - 0.5);
+                painter.line_segment([p0, p1], stroke_halo);
+                painter.line_segment([p0, p1], stroke_outer);
+            }
+            paint_brush_crosshair(&painter, pos);
+            let _ = (canvas_rect, doc_w, doc_h);
+            return;
+        }
     }
 
+    // Oriented generative tips (ellipse / slash / square) — not a plain circle.
+    let anisotropic = document.tip_pose_visible();
+    if anisotropic {
+        match brush.shape {
+            beautiful_core::BrushShape::Square => {
+                let half = 0.5_f32;
+                let corners = [
+                    to_screen(-half, -half),
+                    to_screen(half, -half),
+                    to_screen(half, half),
+                    to_screen(-half, half),
+                ];
+                stroke_poly(&corners);
+                if hardness < 0.999 && inner > 1.0 {
+                    let t = (inner / radius_screen).clamp(0.05, 1.0);
+                    let ih = half * t;
+                    let inner_c = [
+                        to_screen(-ih, -ih),
+                        to_screen(ih, -ih),
+                        to_screen(ih, ih),
+                        to_screen(-ih, ih),
+                    ];
+                    for w in inner_c.windows(2) {
+                        painter.line_segment(
+                            [w[0], w[1]],
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(160)),
+                        );
+                    }
+                    painter.line_segment(
+                        [inner_c[3], inner_c[0]],
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(160)),
+                    );
+                }
+            }
+            _ => {
+                // Ellipse (circle when roundness=1): dense polyline for smooth rotation.
+                const N: usize = 96;
+                let mut pts = Vec::with_capacity(N);
+                for i in 0..N {
+                    let a = (i as f32) * std::f32::consts::TAU / N as f32;
+                    pts.push(to_screen(0.5 * a.cos(), 0.5 * a.sin()));
+                }
+                stroke_poly(&pts);
+                if hardness < 0.999 && inner > 1.0 && (radius_screen - inner) > 0.75 {
+                    let t = (inner / radius_screen).clamp(0.05, 1.0);
+                    let mut ipts = Vec::with_capacity(N);
+                    for i in 0..N {
+                        let a = (i as f32) * std::f32::consts::TAU / N as f32;
+                        ipts.push(to_screen(0.5 * t * a.cos(), 0.5 * t * a.sin()));
+                    }
+                    for w in ipts.windows(2) {
+                        painter.line_segment(
+                            [w[0], w[1]],
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(160)),
+                        );
+                    }
+                    if let (Some(&a), Some(&b)) = (ipts.last(), ipts.first()) {
+                        painter.line_segment(
+                            [a, b],
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(160)),
+                        );
+                    }
+                }
+            }
+        }
+        paint_brush_crosshair(&painter, pos);
+        let _ = (canvas_rect, doc_w, doc_h);
+        return;
+    }
+
+    painter.circle_stroke(pos, radius_screen, stroke_outer);
+    painter.circle_stroke(pos, radius_screen, stroke_halo);
+    if inner > 1.0 && (radius_screen - inner) > 0.75 {
+        painter.circle_stroke(
+            pos,
+            inner,
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(160)),
+        );
+    }
+
+    paint_brush_crosshair(&painter, pos);
+
+    let _ = (canvas_rect, doc_w, doc_h);
+}
+
+#[inline]
+fn paint_brush_crosshair(painter: &egui::Painter, pos: egui::Pos2) {
     let ch = 3.0_f32;
     painter.line_segment(
         [pos + egui::vec2(-ch, 0.0), pos + egui::vec2(ch, 0.0)],
@@ -438,8 +709,83 @@ pub(crate) fn paint_brush_cursor(
         [pos + egui::vec2(0.0, -ch), pos + egui::vec2(0.0, ch)],
         egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
     );
+}
 
-    let _ = (canvas_rect, doc_w, doc_h, rotation_deg);
+/// Clone source preview: tip-masked source pixels under the brush + source crosshair.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_clone_brush_preview(
+    ctx: &Context,
+    response: &egui::Response,
+    canvas_center: egui::Pos2,
+    display_size: Vec2,
+    doc_w: f32,
+    doc_h: f32,
+    zoom: f32,
+    rotation_deg: f32,
+    flip_h: bool,
+    document: &Document,
+    state: &crate::canvas::CanvasState,
+) {
+    if zoom <= 0.0 {
+        return;
+    }
+
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("clone_source_preview"),
+    ));
+
+    if let Some((sx, sy)) = state.clone_source {
+        let sp = doc_to_screen(
+            canvas_center,
+            display_size,
+            rotation_deg,
+            sx,
+            sy,
+            doc_w,
+            doc_h,
+            flip_h,
+        );
+        let ch = 6.0_f32;
+        let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 120, 40));
+        painter.line_segment([sp + egui::vec2(-ch, 0.0), sp + egui::vec2(ch, 0.0)], stroke);
+        painter.line_segment([sp + egui::vec2(0.0, -ch), sp + egui::vec2(0.0, ch)], stroke);
+        painter.circle_stroke(
+            sp,
+            4.0,
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140)),
+        );
+    }
+
+    if !state.clone_show_preview {
+        return;
+    }
+    let Some(tex) = state.clone_preview_tex.as_ref() else {
+        return;
+    };
+    let Some(pos) = ctx
+        .pointer_latest_pos()
+        .or_else(|| response.hover_pos())
+        .or_else(|| response.interact_pointer_pos())
+    else {
+        return;
+    };
+    if !(response.hovered() || response.is_pointer_button_down_on()) {
+        return;
+    }
+
+    // Same formula as paint_brush_cursor — 1:1 with the ring, no bake stretch.
+    let radius_screen = (document.brush.size * 0.5 * zoom).max(1.0);
+    let side = (radius_screen * 2.0).max(2.0);
+    let rect = egui::Rect::from_center_size(pos, egui::vec2(side, side));
+    let opacity = state.clone_preview_opacity.clamp(0.05, 1.0);
+    let tint = egui::Color32::from_white_alpha((opacity * 255.0).round() as u8);
+    painter.image(
+        tex.id(),
+        rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        tint,
+    );
 }
 
 pub(crate) fn gradient_preview_colors(
@@ -472,6 +818,36 @@ pub(crate) fn gradient_preview_colors(
         std::mem::swap(&mut c0, &mut c1);
     }
     (c0, c1)
+}
+
+/// Snapshot the current selection as a GPU overlay clip (view / stage space).
+pub(crate) fn gradient_clip_from_document(
+    document: &beautiful_core::Document,
+) -> Option<crate::canvas_gpu::GradientClipMask> {
+    let mask = document.selection.mask.clone().or_else(|| {
+        document
+            .selection
+            .rect
+            .map(beautiful_core::SelectionMask::from_rect)
+    })?;
+    if mask.width == 0 || mask.height == 0 || mask.is_empty() {
+        return None;
+    }
+    let (ox, oy) = document.buffer_to_view(mask.x, mask.y);
+    let size = (mask.width as f32, mask.height as f32);
+    let hard = mask.alpha.iter().all(|&a| a == 255);
+    let alpha: std::sync::Arc<[u8]> = if hard {
+        std::sync::Arc::from([255u8].as_slice())
+    } else {
+        std::sync::Arc::from(mask.alpha.into_boxed_slice())
+    };
+    Some(crate::canvas_gpu::GradientClipMask {
+        origin: (ox, oy),
+        size,
+        width: if hard { 1 } else { mask.width },
+        height: if hard { 1 } else { mask.height },
+        alpha,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -582,9 +958,12 @@ pub(crate) fn paint_lasso_overlay(
     doc_w: f32,
     doc_h: f32,
     rotation_deg: f32,
+    flip_h: bool,
     points: &[(f32, f32)],
     time: f64,
     closed: bool,
+    stage_ox: f32,
+    stage_oy: f32,
 ) {
     if points.len() < 2 {
         return;
@@ -596,11 +975,11 @@ pub(crate) fn paint_lasso_overlay(
                 center,
                 display_size,
                 rotation_deg,
-                *x,
-                *y,
+                *x - stage_ox,
+                *y - stage_oy,
                 doc_w,
                 doc_h,
-                false,
+                flip_h,
             )
         })
         .collect();
@@ -624,6 +1003,40 @@ pub(crate) fn paint_lasso_overlay(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_selection_rings(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    display_size: Vec2,
+    doc_w: f32,
+    doc_h: f32,
+    rotation_deg: f32,
+    flip_h: bool,
+    rings: &[Vec<(f32, f32)>],
+    time: f64,
+    stage_ox: f32,
+    stage_oy: f32,
+) {
+    for ring in rings {
+        if ring.len() >= 2 {
+            paint_lasso_overlay(
+                painter,
+                center,
+                display_size,
+                doc_w,
+                doc_h,
+                rotation_deg,
+                flip_h,
+                ring,
+                time,
+                true,
+                stage_ox,
+                stage_oy,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_crop_overlay(
     painter: &egui::Painter,
     center: egui::Pos2,
@@ -631,94 +1044,34 @@ pub(crate) fn paint_crop_overlay(
     doc_w: f32,
     doc_h: f32,
     rotation_deg: f32,
+    flip_h: bool,
     rect: SelectionRect,
     time: f64,
 ) {
-    let canvas_corners = [
+    let map = |x: f32, y: f32| {
         doc_to_screen(
             center,
             display_size,
             rotation_deg,
-            0.0,
-            0.0,
+            x,
+            y,
             doc_w,
             doc_h,
-            false,
-        ),
-        doc_to_screen(
-            center,
-            display_size,
-            rotation_deg,
-            doc_w,
-            0.0,
-            doc_w,
-            doc_h,
-            false,
-        ),
-        doc_to_screen(
-            center,
-            display_size,
-            rotation_deg,
-            doc_w,
-            doc_h,
-            doc_w,
-            doc_h,
-            false,
-        ),
-        doc_to_screen(
-            center,
-            display_size,
-            rotation_deg,
-            0.0,
-            doc_h,
-            doc_w,
-            doc_h,
-            false,
-        ),
+            flip_h,
+        )
+    };
+    let canvas = [
+        map(0.0, 0.0),
+        map(doc_w, 0.0),
+        map(doc_w, doc_h),
+        map(0.0, doc_h),
     ];
     let crop = [
-        doc_to_screen(
-            center,
-            display_size,
-            rotation_deg,
-            rect.x0,
-            rect.y0,
-            doc_w,
-            doc_h,
-            false,
-        ),
-        doc_to_screen(
-            center,
-            display_size,
-            rotation_deg,
-            rect.x1,
-            rect.y0,
-            doc_w,
-            doc_h,
-            false,
-        ),
-        doc_to_screen(
-            center,
-            display_size,
-            rotation_deg,
-            rect.x1,
-            rect.y1,
-            doc_w,
-            doc_h,
-            false,
-        ),
-        doc_to_screen(
-            center,
-            display_size,
-            rotation_deg,
-            rect.x0,
-            rect.y1,
-            doc_w,
-            doc_h,
-            false,
-        ),
+        map(rect.x0, rect.y0),
+        map(rect.x1, rect.y0),
+        map(rect.x1, rect.y1),
+        map(rect.x0, rect.y1),
     ];
-    // Dim outside crop (axis-aligned approx via four side quads in screen space).
     let dim = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 110);
     let paint_quad = |pts: [egui::Pos2; 4]| {
         let mut mesh = egui::Mesh::default();
@@ -729,14 +1082,63 @@ pub(crate) fn paint_crop_overlay(
         mesh.add_triangle(0, 2, 3);
         painter.add(egui::Shape::mesh(mesh));
     };
-    // Top
-    paint_quad([canvas_corners[0], canvas_corners[1], crop[1], crop[0]]);
-    // Bottom
-    paint_quad([crop[3], crop[2], canvas_corners[2], canvas_corners[3]]);
-    // Left
-    paint_quad([canvas_corners[0], crop[0], crop[3], canvas_corners[3]]);
-    // Right
-    paint_quad([crop[1], canvas_corners[1], canvas_corners[2], crop[2]]);
+
+    // Classic shade: four side quads from the *canvas* corners into the crop.
+    // Overlaps at the four corners stack α — that's the "from the corners" look.
+    // Clamp crop onto the plate so expand-past-edge doesn't invert the quads.
+    let ix0 = rect.x0.clamp(0.0, doc_w);
+    let iy0 = rect.y0.clamp(0.0, doc_h);
+    let ix1 = rect.x1.clamp(0.0, doc_w);
+    let iy1 = rect.y1.clamp(0.0, doc_h);
+    if ix1 - ix0 > 1.0 && iy1 - iy0 > 1.0 {
+        let on = [
+            map(ix0, iy0),
+            map(ix1, iy0),
+            map(ix1, iy1),
+            map(ix0, iy1),
+        ];
+        paint_quad([canvas[0], canvas[1], on[1], on[0]]);
+        paint_quad([on[3], on[2], canvas[2], canvas[3]]);
+        paint_quad([canvas[0], on[0], on[3], canvas[3]]);
+        paint_quad([on[1], canvas[1], canvas[2], on[2]]);
+    }
+
+    // Expand past canvas: also shade the viewport outside the full crop so the
+    // keep-region stays readable while handles remain drawable off-plate.
+    let expands = rect.x0 < 0.0 || rect.y0 < 0.0 || rect.x1 > doc_w || rect.y1 > doc_h;
+    if expands {
+        let canvas_rect = egui::Rect::from_center_size(center, display_size);
+        let mut ox0 = rect.x0.min(0.0);
+        let mut oy0 = rect.y0.min(0.0);
+        let mut ox1 = rect.x1.max(doc_w);
+        let mut oy1 = rect.y1.max(doc_h);
+        let clip = painter.clip_rect();
+        for p in [
+            clip.left_top(),
+            clip.right_top(),
+            clip.right_bottom(),
+            clip.left_bottom(),
+        ] {
+            if let Some((dx, dy)) =
+                screen_to_doc_space(p, canvas_rect, doc_w, doc_h, rotation_deg, flip_h)
+            {
+                ox0 = ox0.min(dx);
+                oy0 = oy0.min(dy);
+                ox1 = ox1.max(dx);
+                oy1 = oy1.max(dy);
+            }
+        }
+        let outer = [
+            map(ox0, oy0),
+            map(ox1, oy0),
+            map(ox1, oy1),
+            map(ox0, oy1),
+        ];
+        paint_quad([outer[0], outer[1], crop[1], crop[0]]);
+        paint_quad([crop[3], crop[2], outer[2], outer[3]]);
+        paint_quad([outer[0], crop[0], crop[3], outer[3]]);
+        paint_quad([crop[1], outer[1], outer[2], crop[2]]);
+    }
 
     paint_selection_overlay(
         painter,
@@ -745,15 +1147,40 @@ pub(crate) fn paint_crop_overlay(
         doc_w,
         doc_h,
         rotation_deg,
+        flip_h,
         rect,
         WorkspaceTool::Crop,
         time,
         false,
+        0.0,
+        0.0,
     );
-    for corner in crop {
-        painter.circle_filled(corner, 4.0, theme::ACCENT);
+    // Rule-of-thirds guide follows the crop, including rotated canvas views.
+    let guide = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150));
+    for t in [1.0 / 3.0, 2.0 / 3.0] {
+        painter.line_segment(
+            [map(rect.x0 + rect.width() * t, rect.y0), map(rect.x0 + rect.width() * t, rect.y1)],
+            guide,
+        );
+        painter.line_segment(
+            [map(rect.x0, rect.y0 + rect.height() * t), map(rect.x1, rect.y0 + rect.height() * t)],
+            guide,
+        );
+    }
+    let handles = [
+        crop[0],
+        egui::pos2((crop[0].x + crop[1].x) * 0.5, (crop[0].y + crop[1].y) * 0.5),
+        crop[1],
+        egui::pos2((crop[1].x + crop[2].x) * 0.5, (crop[1].y + crop[2].y) * 0.5),
+        crop[2],
+        egui::pos2((crop[2].x + crop[3].x) * 0.5, (crop[2].y + crop[3].y) * 0.5),
+        crop[3],
+        egui::pos2((crop[3].x + crop[0].x) * 0.5, (crop[3].y + crop[0].y) * 0.5),
+    ];
+    for handle in handles {
+        painter.circle_filled(handle, 4.0, theme::ACCENT);
         painter.circle_stroke(
-            corner,
+            handle,
             4.0,
             egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
         );
@@ -761,17 +1188,20 @@ pub(crate) fn paint_crop_overlay(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn paint_free_transform_overlay(
+pub(crate) fn paint_transform_overlay(
     painter: &egui::Painter,
     center: egui::Pos2,
     display_size: Vec2,
     doc_w: f32,
     doc_h: f32,
     canvas_rot: f32,
-    fx: &FreeXform,
+    flip_h: bool,
+    fx: &TransformPose,
     bw: u32,
     bh: u32,
     time: f64,
+    stage_ox: f32,
+    stage_oy: f32,
 ) {
     let (hw, hh) = fx.half_size(bw, bh);
     let corners_local = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)];
@@ -781,11 +1211,11 @@ pub(crate) fn paint_free_transform_overlay(
             center,
             display_size,
             canvas_rot,
-            dx,
-            dy,
+            dx - stage_ox,
+            dy - stage_oy,
             doc_w,
             doc_h,
-            false,
+            flip_h,
         )
     });
     let phase = (time * 28.0) as f32;
@@ -808,11 +1238,11 @@ pub(crate) fn paint_free_transform_overlay(
             center,
             display_size,
             canvas_rot,
-            dx,
-            dy,
+            dx - stage_ox,
+            dy - stage_oy,
             doc_w,
             doc_h,
-            false,
+            flip_h,
         );
         painter.rect_filled(
             egui::Rect::from_center_size(p, egui::vec2(8.0, 8.0)),
@@ -828,10 +1258,11 @@ pub(crate) fn paint_free_transform_overlay(
     }
 }
 
-/// Live Free Transform content: baseline texture mapped by free_xform (screen quad).
-/// Cost is constant — stretch/rotate do not resample document pixels.
+/// Live Transform content: baseline texture mapped by transform_pose (screen quad).
+/// Unused while live preview is viewport dest-pixel raster; kept for fallback.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn paint_free_transform_live_image(
+pub(crate) fn paint_transform_live_image(
     painter: &egui::Painter,
     texture: egui::TextureId,
     center: egui::Pos2,
@@ -839,7 +1270,8 @@ pub(crate) fn paint_free_transform_live_image(
     doc_w: f32,
     doc_h: f32,
     canvas_rot: f32,
-    fx: &FreeXform,
+    flip_h: bool,
+    fx: &TransformPose,
     bw: u32,
     bh: u32,
     opacity: f32,
@@ -874,7 +1306,7 @@ pub(crate) fn paint_free_transform_live_image(
             dy,
             doc_w,
             doc_h,
-            false,
+            flip_h,
         );
         mesh.colored_vertex(corner, tint);
         mesh.vertices.last_mut().expect("just added vertex").uv = uvs[i];
@@ -885,8 +1317,8 @@ pub(crate) fn paint_free_transform_live_image(
 }
 
 /// Industry-style live Mesh/Distort: baseline tex + tessellated warp surface.
-/// Vertices move with control points; UVs stay on the source image (no CPU raster).
-/// Density follows source pixel size (BezierSurface→Mesh ~px spacing), not a fixed poly count.
+/// Unused while live preview is viewport dest-pixel raster; kept for fallback.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_warp_live_mesh(
     painter: &egui::Painter,
@@ -968,10 +1400,13 @@ pub(crate) fn paint_selection_mask_overlay(
     doc_w: f32,
     doc_h: f32,
     rotation_deg: f32,
+    flip_h: bool,
     x: f32,
     y: f32,
     width: u32,
     height: u32,
+    stage_ox: f32,
+    stage_oy: f32,
 ) {
     paint_selection_mask_overlay_opacity(
         painter,
@@ -981,11 +1416,14 @@ pub(crate) fn paint_selection_mask_overlay(
         doc_w,
         doc_h,
         rotation_deg,
+        flip_h,
         x,
         y,
         width,
         height,
         1.0,
+        stage_ox,
+        stage_oy,
     );
 }
 
@@ -998,15 +1436,20 @@ pub(crate) fn paint_selection_mask_overlay_opacity(
     doc_w: f32,
     doc_h: f32,
     rotation_deg: f32,
+    flip_h: bool,
     x: f32,
     y: f32,
     width: u32,
     height: u32,
     opacity: f32,
+    stage_ox: f32,
+    stage_oy: f32,
 ) {
     if width == 0 || height == 0 {
         return;
     }
+    let x = x - stage_ox;
+    let y = y - stage_oy;
     let tint = {
         let a = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
         if a == 0 {
@@ -1023,7 +1466,7 @@ pub(crate) fn paint_selection_mask_overlay_opacity(
             y,
             doc_w,
             doc_h,
-            false,
+            flip_h,
         ),
         doc_to_screen(
             center,
@@ -1033,7 +1476,7 @@ pub(crate) fn paint_selection_mask_overlay_opacity(
             y,
             doc_w,
             doc_h,
-            false,
+            flip_h,
         ),
         doc_to_screen(
             center,
@@ -1043,7 +1486,7 @@ pub(crate) fn paint_selection_mask_overlay_opacity(
             y + height as f32,
             doc_w,
             doc_h,
-            false,
+            flip_h,
         ),
         doc_to_screen(
             center,
@@ -1053,9 +1496,56 @@ pub(crate) fn paint_selection_mask_overlay_opacity(
             y + height as f32,
             doc_w,
             doc_h,
-            false,
+            flip_h,
         ),
     ];
+    let mut mesh = egui::Mesh::with_texture(texture);
+    for (corner, uv) in corners.into_iter().zip([
+        egui::pos2(0.0, 0.0),
+        egui::pos2(1.0, 0.0),
+        egui::pos2(1.0, 1.0),
+        egui::pos2(0.0, 1.0),
+    ]) {
+        mesh.colored_vertex(corner, tint);
+        mesh.vertices.last_mut().expect("just added vertex").uv = uv;
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_doc_quad_textured(
+    painter: &egui::Painter,
+    texture: egui::TextureId,
+    center: egui::Pos2,
+    display_size: Vec2,
+    canvas_rot: f32,
+    flip_h: bool,
+    doc_w: f32,
+    doc_h: f32,
+    corners_doc: [(f32, f32); 4],
+    opacity: f32,
+) {
+    let tint = {
+        let a = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        if a == 0 {
+            return;
+        }
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, a)
+    };
+    let corners = corners_doc.map(|(x, y)| {
+        doc_to_screen(
+            center,
+            display_size,
+            canvas_rot,
+            x,
+            y,
+            doc_w,
+            doc_h,
+            flip_h,
+        )
+    });
     let mut mesh = egui::Mesh::with_texture(texture);
     for (corner, uv) in corners.into_iter().zip([
         egui::pos2(0.0, 0.0),
@@ -1079,11 +1569,20 @@ pub(crate) fn paint_selection_overlay(
     doc_w: f32,
     doc_h: f32,
     rotation_deg: f32,
+    flip_h: bool,
     rect: SelectionRect,
     tool: WorkspaceTool,
     time: f64,
     paint_fill: bool,
+    stage_ox: f32,
+    stage_oy: f32,
 ) {
+    let rect = SelectionRect {
+        x0: rect.x0 - stage_ox,
+        y0: rect.y0 - stage_oy,
+        x1: rect.x1 - stage_ox,
+        y1: rect.y1 - stage_oy,
+    };
     let corners = [
         doc_to_screen(
             center,
@@ -1093,7 +1592,7 @@ pub(crate) fn paint_selection_overlay(
             rect.y0,
             doc_w,
             doc_h,
-            false,
+            flip_h,
         ),
         doc_to_screen(
             center,
@@ -1103,7 +1602,7 @@ pub(crate) fn paint_selection_overlay(
             rect.y0,
             doc_w,
             doc_h,
-            false,
+            flip_h,
         ),
         doc_to_screen(
             center,
@@ -1113,7 +1612,7 @@ pub(crate) fn paint_selection_overlay(
             rect.y1,
             doc_w,
             doc_h,
-            false,
+            flip_h,
         ),
         doc_to_screen(
             center,
@@ -1123,12 +1622,12 @@ pub(crate) fn paint_selection_overlay(
             rect.y1,
             doc_w,
             doc_h,
-            false,
+            flip_h,
         ),
     ];
 
     if paint_fill {
-        // Rectangular marquee selections may use a uniform Quick Mask fill.
+        // Rectangular selections may use a uniform tinted mask fill.
         let mut fill = egui::Mesh::default();
         let fill_color = egui::Color32::from_rgba_unmultiplied(255, 140, 66, 28);
         for c in corners {
